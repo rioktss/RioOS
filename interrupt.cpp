@@ -21,6 +21,11 @@
 #define TIMER_IRQ 30U
 #define IRQ_SPURIOUS_BASE 1020U
 #define GIC_GROUP1_ENABLED 2U
+/* Bit0 = EnableGrp0 / Enable, bit1 = EnableGrp1. Writing both is correct in
+   every GICv2 view: single-state (QEMU virt default), secure and non-secure
+   (the reserved bit is ignored). Writing only bit1 would leave the CPU
+   interface disabled in a non-secure view. */
+#define GIC_ENABLE_ALL 3U
 
 static volatile uint32_t* const GICD_CTLR_REG =
     (volatile uint32_t*)(GICD_BASE + GICD_CTLR);
@@ -54,6 +59,12 @@ static volatile uint32_t* const GICC_EOIR_REG =
 
 static volatile uint64_t irq_total = 0;
 static volatile uint32_t last_irq = 0xFFFFFFFFU;
+static volatile uint64_t irq_timer = 0;
+static volatile uint64_t irq_spurious = 0;
+static volatile uint64_t irq_unhandled = 0;
+static volatile uint64_t irq_nested = 0;
+static volatile uint32_t irq_depth = 0;
+static volatile uint32_t irq_max_depth = 0;
 
 static void print_hex64(uint64_t value)
 {
@@ -90,10 +101,10 @@ void interrupt_init()
 
     /* Accept all Group 1 priorities and enable only Group 1 at the CPU. */
     *GICC_PMR_REG = 0xFFU;
-    *GICC_CTLR_REG = GIC_GROUP1_ENABLED;
+    *GICC_CTLR_REG = GIC_ENABLE_ALL;
 
-    /* Enable Group 1 at the distributor; the PPI stays disabled until start. */
-    *GICD_CTLR_REG = GIC_GROUP1_ENABLED;
+    /* Enable the distributor; the PPI stays disabled until start. */
+    *GICD_CTLR_REG = GIC_ENABLE_ALL;
 
     asm volatile(
         "dsb sy\n"
@@ -146,9 +157,24 @@ extern "C" void interrupt_dispatch(ExceptionFrame* frame)
     uint32_t iar = *GICC_IAR_REG;
     uint32_t irq = iar & 0x3FFU;
 
-    /* 1020..1023 are GICv2 spurious/reserved interrupt IDs. */
+    /* 1020..1023 are GICv2 spurious/reserved interrupt IDs: count them,
+       but never write EOIR for them. */
     if (irq >= IRQ_SPURIOUS_BASE)
+    {
+        ++irq_spurious;
         return;
+    }
+
+    /* IRQs stay masked while we are in the handler, so depth must be 1.
+       Track it so a future change that unmasks early is caught. */
+    uint32_t depth = irq_depth + 1U;
+    irq_depth = depth;
+
+    if (depth > 1U)
+        ++irq_nested;
+
+    if (depth > irq_max_depth)
+        irq_max_depth = depth;
 
     irq_total++;
     last_irq = irq;
@@ -156,15 +182,25 @@ extern "C" void interrupt_dispatch(ExceptionFrame* frame)
     switch (irq)
     {
         case TIMER_IRQ:
+            ++irq_timer;
             timer_interrupt_handler();
             break;
 
         default:
-            uart_puts("Unhandled IRQ: ");
-            print_hex64((uint64_t)irq);
-            uart_puts("\r\n");
+            ++irq_unhandled;
+
+            /* Avoid flooding the UART if an unknown line keeps asserting:
+               report only the first few occurrences. */
+            if (irq_unhandled <= 8ULL)
+            {
+                uart_puts("Unhandled IRQ: ");
+                print_hex64((uint64_t)irq);
+                uart_puts("\r\n");
+            }
             break;
     }
+
+    irq_depth = depth - 1U;
 
     /* Complete the exact interrupt acknowledged by IAR. */
     *GICC_EOIR_REG = iar;
@@ -173,6 +209,45 @@ extern "C" void interrupt_dispatch(ExceptionFrame* frame)
         "dsb sy\n"
         "isb\n"
         ::: "memory");
+}
+
+void interrupt_get_stats(InterruptStats* out)
+{
+    if (out == 0)
+        return;
+
+    out->total = irq_total;
+    out->timer = irq_timer;
+    out->spurious = irq_spurious;
+    out->unhandled = irq_unhandled;
+    out->nested = irq_nested;
+    out->last_irq = last_irq;
+    out->max_depth = irq_max_depth;
+}
+
+int interrupt_cpu_irq_enabled()
+{
+    uint64_t daif;
+
+    asm volatile("mrs %0, daif" : "=r"(daif) : : "memory");
+
+    return (daif & 0x80ULL) == 0;
+}
+
+void interrupt_timer_line_enable()
+{
+    *GICD_ICPENDR0_REG = (1U << TIMER_IRQ);
+    *GICD_ISENABLER0_REG = (1U << TIMER_IRQ);
+
+    asm volatile("dsb sy\nisb\n" ::: "memory");
+}
+
+void interrupt_timer_line_disable()
+{
+    *GICD_ICENABLER0_REG = (1U << TIMER_IRQ);
+    *GICD_ICPENDR0_REG = (1U << TIMER_IRQ);
+
+    asm volatile("dsb sy\nisb\n" ::: "memory");
 }
 
 extern "C" void interrupt_exception(

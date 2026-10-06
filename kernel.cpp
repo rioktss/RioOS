@@ -70,7 +70,7 @@ extern "C" void kernel_main()
     uart_puts("[14] Initializing syscall...\r\n");
     syscall_init();
 
-    uart_puts("[15] Timer IRQ prepared, but preemption is disabled for now.\r\n");
+    uart_puts("[15] Timer IRQ prepared (off by default; use 'irq' to test stages B-D).\r\n");
 
 uart_puts(
     "\r\n"

@@ -2,6 +2,7 @@
 #include "exception_frame.h"
 #include "syscall.h"
 #include "uart.h"
+#include "interrupt.h"
 
 extern "C" char exception_vectors_el1[];
 extern "C" void user_exit_return();
@@ -41,7 +42,8 @@ extern "C" void exception_sync_el1(void* raw)
     if (frame == 0) { stop_kernel(); return; }
     uint64_t ec = (frame->esr >> 26) & 0x3FULL;
     if (ec == 0x15ULL) { syscall_dispatch(frame, 0); return; }
-    uart_puts("\r\n*** KERNEL EXCEPTION ***\r\n");
+    /* Report ESR/ELR/FAR/SPSR so a kernel fault is never silent. */
+    interrupt_exception(frame->esr, frame->elr, frame->far, frame->spsr);
     stop_kernel();
 }
 
@@ -60,8 +62,14 @@ extern "C" void exception_sync_el0(void* raw)
 
 extern "C" void exception_irq_unhandled()
 {
-    uart_puts("\r\n*** IRQ ***\r\n");
-    uart_puts("IRQ is disabled in this release.\r\n");
+    uint64_t esr, elr, far, spsr;
+
     asm volatile("msr daifset, #0xf" ::: "memory");
-    while (1) asm volatile("wfe");
+    asm volatile("mrs %0, esr_el1" : "=r"(esr));
+    asm volatile("mrs %0, elr_el1" : "=r"(elr));
+    asm volatile("mrs %0, far_el1" : "=r"(far));
+    asm volatile("mrs %0, spsr_el1" : "=r"(spsr));
+
+    uart_puts("\r\n*** UNHANDLED FIQ/SError/AArch32 vector ***\r\n");
+    interrupt_exception(esr, elr, far, spsr);
 }

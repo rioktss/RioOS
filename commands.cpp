@@ -17,6 +17,7 @@
 #include "virtio_net.h"
 #include "netstack.h"
 #include "version.h"
+#include "interrupt.h"
 
 static void print_u64(
     uint64_t value
@@ -54,6 +55,197 @@ static void print_u64(
             buffer[pos]
         );
     }
+}
+
+static int parse_uint(const char* text, int fallback)
+{
+    if (text == 0 || text[0] < '0' || text[0] > '9')
+        return fallback;
+
+    int value = 0;
+
+    while (*text >= '0' && *text <= '9' && value < 100000)
+    {
+        value = value * 10 + (*text - '0');
+        ++text;
+    }
+
+    return value;
+}
+
+static void irq_quiesce()
+{
+    /* Safe state: timer off, PPI masked at the GIC, CPU IRQ masked. */
+    timer_stop();
+    interrupt_timer_line_disable();
+    interrupt_disable();
+    timer_set_sched_tick(1);
+}
+
+static void irq_print_status()
+{
+    InterruptStats st;
+    interrupt_get_stats(&st);
+
+    uint32_t mode = timer_mode();
+
+    uart_puts("IRQ status\r\n----------\r\n");
+    uart_puts("CPU IRQ        : ");
+    uart_puts(interrupt_cpu_irq_enabled() ? "unmasked" : "masked");
+    uart_puts("\r\nTimer mode     : ");
+    uart_puts(mode == TIMER_MODE_PERIODIC ? "periodic" :
+              mode == TIMER_MODE_ONESHOT  ? "one-shot" : "off");
+    uart_puts("\r\nTimer Hz       : "); print_u64(timer_current_hz());
+    uart_puts("\r\nTimer freq     : "); print_u64(timer_frequency());
+    uart_puts("\r\nIRQ total      : "); print_u64(st.total);
+    uart_puts("\r\nIRQ timer      : "); print_u64(st.timer);
+    uart_puts("\r\nIRQ spurious   : "); print_u64(st.spurious);
+    uart_puts("\r\nIRQ unhandled  : "); print_u64(st.unhandled);
+    uart_puts("\r\nIRQ nested     : "); print_u64(st.nested);
+    uart_puts("\r\nIRQ max depth  : "); print_u64(st.max_depth);
+    uart_puts("\r\nTimer stray    : "); print_u64(timer_stray_count());
+    uart_puts("\r\nOne-shot fired : "); print_u64(timer_oneshot_fired());
+    uart_puts("\r\nSched ticks    : "); print_u64(scheduler_ticks());
+    uart_puts("\r\n");
+}
+
+/* Stage B: one IRQ, handler runs, timer disabled, EOI, back to shell. */
+static int irq_stage_oneshot()
+{
+    irq_quiesce();
+
+    uint64_t before = timer_oneshot_fired();
+
+    interrupt_timer_line_enable();
+    timer_start_oneshot_ms(50);
+    interrupt_enable();
+
+    uint64_t start = timer_millis();
+
+    while (timer_oneshot_fired() == before && timer_millis() - start < 500ULL)
+    {
+    }
+
+    int ok = timer_oneshot_fired() == before + 1ULL &&
+             timer_mode() == TIMER_MODE_OFF;
+
+    irq_quiesce();
+    return ok;
+}
+
+/* Stage C/D: periodic IRQ for ~200 ms; expects a sane number of ticks. */
+static int irq_stage_periodic(int hz, int with_sched_tick, int keep_running)
+{
+    irq_quiesce();
+
+    uint64_t irq_before = timer_irq_count();
+    uint64_t sched_before = scheduler_ticks();
+
+    timer_set_sched_tick(with_sched_tick);
+    interrupt_timer_line_enable();
+    timer_start_periodic((uint32_t)hz);
+    interrupt_enable();
+
+    uint64_t start = timer_millis();
+
+    while (timer_millis() - start < 200ULL)
+    {
+    }
+
+    uint64_t irqs = timer_irq_count() - irq_before;
+    uint64_t ticks = scheduler_ticks() - sched_before;
+    uint64_t expected = (uint64_t)hz / 5ULL;
+
+    /* Accept 50%..200% of the nominal count; a storm would be far above. */
+    int ok = irqs >= expected / 2ULL && irqs <= expected * 2ULL + 2ULL;
+
+    if (with_sched_tick)
+        ok = ok && ticks == irqs;
+    else
+        ok = ok && ticks == 0ULL;
+
+    if (!keep_running)
+        irq_quiesce();
+
+    return ok;
+}
+
+static void command_irq(const char* argument)
+{
+    if (argument == 0 || argument[0] == 0 || str_equal(argument, "status"))
+    {
+        irq_print_status();
+        return;
+    }
+
+    if (str_equal(argument, "off"))
+    {
+        irq_quiesce();
+        uart_puts("Timer IRQ disabled; CPU IRQ masked.\r\n");
+        return;
+    }
+
+    if (str_equal(argument, "oneshot"))
+    {
+        uart_puts(irq_stage_oneshot()
+            ? "[PASS] stage B: timer one-shot IRQ\r\n"
+            : "[FAIL] stage B: timer one-shot IRQ\r\n");
+        return;
+    }
+
+    if (argument[0] == 's' && argument[1] == 't' && argument[2] == 'a' &&
+        argument[3] == 'g' && argument[4] == 'e' &&
+        (argument[5] == 'c' || argument[5] == 'd') &&
+        (argument[6] == 0 || argument[6] == ' '))
+    {
+        int with_tick = argument[5] == 'd';
+        const char* hz_text = argument[6] == ' ' ? argument + 7 : 0;
+
+        while (hz_text != 0 && *hz_text == ' ')
+            ++hz_text;
+
+        int hz = parse_uint(hz_text, 100);
+
+        if (hz < 1) hz = 1;
+        if (hz > 1000) hz = 1000;
+
+        /* Left running so the shell can be used while the timer ticks. */
+        int ok = irq_stage_periodic(hz, with_tick, 1);
+
+        uart_puts(ok ? "[PASS] " : "[FAIL] ");
+        uart_puts(with_tick ? "stage D: periodic IRQ + scheduler tick"
+                            : "stage C: periodic IRQ without scheduler");
+        uart_puts(" (timer left running; use 'irq off' to stop)\r\n");
+        return;
+    }
+
+    if (str_equal(argument, "selftest"))
+    {
+        int pass = 0;
+        int total = 0;
+
+        ++total; if (irq_stage_oneshot()) { uart_puts("[PASS] timer one-shot IRQ\r\n"); ++pass; }
+        else uart_puts("[FAIL] timer one-shot IRQ\r\n");
+
+        ++total; if (irq_stage_periodic(100, 0, 0)) { uart_puts("[PASS] timer periodic IRQ (no scheduler)\r\n"); ++pass; }
+        else uart_puts("[FAIL] timer periodic IRQ (no scheduler)\r\n");
+
+        ++total; if (irq_stage_periodic(100, 1, 0)) { uart_puts("[PASS] timer periodic IRQ + scheduler tick\r\n"); ++pass; }
+        else uart_puts("[FAIL] timer periodic IRQ + scheduler tick\r\n");
+
+        InterruptStats st;
+        interrupt_get_stats(&st);
+
+        ++total; if (st.nested == 0ULL && st.unhandled == 0ULL && st.max_depth <= 1U)
+        { uart_puts("[PASS] IRQ no nesting / no unhandled\r\n"); ++pass; }
+        else uart_puts("[FAIL] IRQ no nesting / no unhandled\r\n");
+
+        uart_puts("IRQ self-test: "); print_u64((uint64_t)pass);
+        uart_puts("/"); print_u64((uint64_t)total); uart_puts(" passed\r\n");
+        return;
+    }
+
+    uart_puts("Usage: irq [status|off|oneshot|stagec [hz]|staged [hz]|selftest]\r\n");
 }
 
 static void command_help()
@@ -94,6 +286,7 @@ static void command_help()
         "  net                  Show network status\r\n"
         "  ping <ip>            Send ICMP echo request\r\n"
         "  selftest             Run kernel integration checks\r\n"
+        "  irq [status|off|oneshot|stagec|staged|selftest] [hz]  Timer IRQ bring-up\r\n"
     );
 }
 
@@ -776,6 +969,7 @@ void execute_command(
     if (str_equal(command, "net")) { command_net(); return; }
     if (str_equal(command, "ping")) { command_ping(argument); return; }
     if (str_equal(command, "selftest")) { command_selftest(); return; }
+    if (str_equal(command, "irq")) { command_irq(argument); return; }
 
     if (str_equal(command, "level"))
     {
