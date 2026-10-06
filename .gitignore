@@ -1,0 +1,29 @@
+# Build output - jangan pernah di-push
+build/
+*.o
+*.elf
+*.bin
+*.map
+
+# Generated tools
+.mykernel-tools/
+
+# Generated disk images
+storage/disk.img
+storage/*.img
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.swp
+*~
