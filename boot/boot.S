@@ -10,11 +10,9 @@
 .endm
 
 _start:
-    /* QEMU passes the DTB physical address in x0 at kernel entry. Save it
-       before it is clobbered below; it is written to boot_dtb_ptr once
-       BSS has been cleared (boot_dtb_ptr lives in BSS, so writing it any
-       earlier would just be zeroed out again). */
-    mov x27, x0
+    /* QEMU virt bare-metal ELF boots provide the generated DTB at the
+       start of RAM. Save that address before BSS is cleared. */
+    mov x27, #0x40000000
 
     /* QEMU virt PL011: direct 'B' tells us execution reached reset entry. */
     mov x9, #0x9000000

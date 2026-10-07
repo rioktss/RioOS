@@ -46,3 +46,10 @@ int uart_try_getc()
 
     return (int)(*UART_DR & 0xFFU);
 }
+
+// TAMBAHAN BARU - FIX SHELL HANG
+int uart_has_data()
+{
+    // FR bit 4 = RXFE (RX FIFO Empty). Kalau 0 = ada data
+    return ((*UART_FR) & (1U << 4)) == 0;
+}

@@ -1,9 +1,9 @@
 from pathlib import Path
-import struct, subprocess
+import shutil, struct, subprocess
 
 root=Path(__file__).resolve().parents[1]
 kernel=root/'build/kernel.elf'; disk=root/'storage/disk.img'; user=root/'build/user_init.elf'
-required=['drivers/virtio_mmio.cpp','drivers/virtio_net.cpp','net/netstack.cpp','process/user.cpp','process/elf.cpp','boot/exceptions.S','process/scheduler.cpp']
+required=['drivers/virtio_mmio.cpp','drivers/virtio_net.cpp','net/netstack.cpp','process/user.cpp','process/elf.cpp','boot/exceptions.S','process/scheduler.cpp','drivers/fb.cpp','drivers/font.cpp']
 for name in required: assert (root/name).is_file(), f'missing {name}'
 assert kernel.is_file() and kernel.stat().st_size>0
 assert user.is_file() and user.stat().st_size>0
@@ -35,8 +35,10 @@ for i,(a0,a1,_) in enumerate(load_ranges):
     for j,(b0,b1,_) in enumerate(load_ranges):
         if i<j:
             assert not (a0<b1 and b0<a1), 'overlapping PT_LOAD ranges'
-# vectors via nm
-data=subprocess.check_output(['nm','-n',str(kernel)],text=True)
+# vectors via nm / llvm-nm
+nm_tool = shutil.which('nm') or shutil.which('llvm-nm')
+assert nm_tool, 'nm/llvm-nm is required for release verification'
+data=subprocess.check_output([nm_tool,'-n',str(kernel)],text=True)
 syms={}
 for line in data.splitlines():
     q=line.split()
@@ -45,7 +47,7 @@ assert '__vectors_start' in syms and '__vectors_end' in syms
 assert syms['__vectors_start']%2048==0
 assert syms['__vectors_end']-syms['__vectors_start']==2048
 # no unresolved symbols
-u=subprocess.run(['nm','-u',str(kernel)],text=True,capture_output=True)
+u=subprocess.run([nm_tool,'-u',str(kernel)],text=True,capture_output=True)
 assert not u.stdout.strip(), 'unresolved symbols:\n'+u.stdout
 # superblock
 sb=disk.read_bytes()[:512]; vals=struct.unpack_from('<10I',sb,0); total=struct.unpack_from('<Q',sb,40)[0]

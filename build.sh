@@ -16,11 +16,11 @@ for arg in "$@"; do
 RioOS portable build system
 
 Usage:
-  ./build.sh              Build + tests only
-  ./build.sh --run        Build + tests + start QEMU
-  ./build.sh -v           Verbose compiler output
-  ./build.sh --clean      Remove generated build/host-test outputs
-  ./build.sh --clean --run
+ ./build.sh Build + tests only
+ ./build.sh --run Build + tests + start QEMU
+ ./build.sh -v Verbose compiler output
+ ./build.sh --clean Remove generated build/host-test outputs
+ ./build.sh --clean --run
 EOF
             exit 0
             ;;
@@ -28,12 +28,12 @@ EOF
     esac
 done
 
-log()  { printf '%s\n' "$*"; }
+log() { printf '%s\n' "$*"; }
 vlog() { [[ $VERBOSE -eq 1 ]] && printf '%s\n' "$*" || true; }
 step() { printf '[%s] %s\n' "$1" "$2"; }
 
 printf '\n==================================\n'
-printf '       RioOS Portable Build v2.0\n'
+printf ' RioOS Portable Build v2.0 + nano\n'
 printf '==================================\n\n'
 
 CLANG="${CLANG:-clang}"
@@ -61,7 +61,7 @@ PYTHON="$(find_python || true)"
 require_cmd() {
     command -v "$1" >/dev/null 2>&1 || {
         echo "ERROR: required command not found: $1" >&2
-        echo "       Set PATH or override the corresponding environment variable." >&2
+        echo " Set PATH or override the corresponding environment variable." >&2
         exit 1
     }
 }
@@ -80,7 +80,7 @@ HOST_TOOLS="${MYKERNEL_TOOLS_DIR:-$HOME/.mykernel-tools}"
 mkdir -p "$HOST_TOOLS"
 
 if [[ "$CLEAN" -eq 1 ]]; then
-    rm -f build/*.o build/kernel.elf build/user_init.elf
+    rm -f build/*.o build/kernel.elf build/user_init.elf build/nano.elf
     rm -f "$HOST_TOOLS"/fs_host_test
     rm -f "$HOST_TOOLS"/net_host_test
     rm -f "$HOST_TOOLS"/mem_host_test
@@ -115,13 +115,26 @@ ASMFLAGS=(
 MODULES=(
     uart memory string fs vfs process scheduler timer interrupt keyboard
     commands shell exceptions syscall user mmu virtio_mmio virtio_blk storage
+    fb font
     elf virtio_net netstack page_alloc fault diag kernel
 )
 
-step "1/9" "Bundling userspace"
+step "1/9" "Bundling userspace (init + nano)"
 "$CLANG" "${ASMFLAGS[@]}" -c userspace/user_init.S -o build/user_init.o
 "$LD" -T userspace/user_init.ld -nostdlib -z max-page-size=0x1000 \
     build/user_init.o -o build/user_init.elf
+
+# --- NANO APP ---
+if [[ -f userspace/nano.S ]]; then
+    "$CLANG" "${ASMFLAGS[@]}" -c userspace/nano.S -o build/nano.o
+    "$LD" -T userspace/user_init.ld -nostdlib -z max-page-size=0x1000 \
+        build/nano.o -o build/nano.elf
+    vlog " -> build/nano.elf ready"
+else
+    echo "WARN: userspace/nano.S not found, skipping nano build"
+    # bikin dummy biar mkfs gak error
+    cp build/user_init.elf build/nano.elf 2>/dev/null || true
+fi
 
 step "2/9" "Building host tools"
 "$CXX" -std=c++17 -O2 -Wall -Wextra -pedantic \
@@ -131,8 +144,14 @@ step "3/9" "Preparing disk image"
 if [[ ! -f storage/disk.img ]]; then
     dd if=/dev/zero of=storage/disk.img bs=512 count=32768 status=none
 fi
-"$HOST_TOOLS/mkfs_myfs" storage/disk.img build/user_init.elf >/dev/null
-vlog "  -> storage/disk.img ready (16 MiB)"
+
+# MULTI-APP SUPPORT: sekarang kirim 2 elf, mkfs yang baru akan loop
+if [[ -f build/nano.elf ]]; then
+    "$HOST_TOOLS/mkfs_myfs" storage/disk.img build/user_init.elf build/nano.elf >/dev/null
+else
+    "$HOST_TOOLS/mkfs_myfs" storage/disk.img build/user_init.elf >/dev/null
+fi
+vlog " -> storage/disk.img ready (16 MiB) with apps"
 
 step "4/9" "Compiling boot"
 "$CLANG" "${ASMFLAGS[@]}" -c boot/boot.S -o build/boot.o
@@ -142,7 +161,7 @@ step "4/9" "Compiling boot"
 step "5/9" "Compiling kernel (${#MODULES[@]} modules)"
 for f in "${MODULES[@]}"; do
     if [[ "$VERBOSE" -eq 1 ]]; then
-        echo "  -> $f.cpp"
+        echo " -> $f.cpp"
         "$CXX" "${CXXFLAGS[@]}" -c "$(src_of "$f")" -o "build/$f.o"
     else
         printf '.'
@@ -159,13 +178,14 @@ step "6/9" "Linking"
     build/commands.o build/shell.o build/exceptions.o build/syscall.o build/user.o build/mmu.o \
     build/virtio_mmio.o build/virtio_blk.o build/storage.o build/elf.o build/virtio_net.o \
     build/netstack.o build/page_alloc.o build/fault.o build/diag.o \
+    build/fb.o build/font.o \
     -o build/kernel.elf
 
 step "7/9" "Verifying ELF"
 if command -v "$READELF" >/dev/null 2>&1; then
     "$READELF" -h build/kernel.elf | grep -E 'Class:|Machine:|Entry point' || true
 else
-    vlog "  -> $READELF not found, skip"
+    vlog " -> $READELF not found, skip"
 fi
 
 step "8/9" "Running host tests"
@@ -194,19 +214,25 @@ step "8/9" "Running host tests"
     -o "$HOST_TOOLS/diag_host_test"
 "$HOST_TOOLS/diag_host_test"
 
+"$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -iquote include -DHOST_TEST \
+    tests/sched_host_test.cpp process/sched_policy.cpp \
+    -o "$HOST_TOOLS/sched_host_test"
+"$HOST_TOOLS/sched_host_test"
+
 step "9/9" "Release verification"
 "$PYTHON" tests/verify_release.py
 
 printf '\n==================================\n'
-printf '          BUILD SUCCESS (v2.0)\n'
+printf ' BUILD SUCCESS (v2.0 + nano)\n'
 printf '==================================\n\n'
-printf '  Kernel: build/kernel.elf (AArch64)\n'
-printf '  Disk  : storage/disk.img\n'
-printf '  Tests : FS PASS | NET PASS | MEM PASS | SYSCALL PASS | DIAG PASS\n\n'
+printf ' Kernel: build/kernel.elf (AArch64)\n'
+printf ' Disk : storage/disk.img\n'
+printf ' Apps : /bin/init.elf + /bin/nano.elf\n'
+printf ' Tests : FS PASS | NET PASS | MEM PASS | SCHED PASS | SYSCALL PASS | DIAG PASS\n\n'
 
 if [[ "$RUN_QEMU" -eq 1 ]]; then
     if command -v "${QEMU:-qemu-system-aarch64}" >/dev/null 2>&1; then
-        exec ./run.sh
+        exec./run.sh
     else
         echo "ERROR: QEMU not found. Build succeeded, but --run was requested." >&2
         exit 1

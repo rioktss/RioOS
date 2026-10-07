@@ -12,3 +12,9 @@ char keyboard_getc()
 {
     return uart_getc();
 }
+
+// TAMBAHAN BARU - ANTI HANG
+int keyboard_has_data()
+{
+    return uart_has_data();
+}

@@ -1,37 +1,37 @@
 #include "mmu.h"
 #include "uart.h"
 
-#define RAM_START           0x40000000ULL
-#define RAM_SIZE            (128ULL * 1024ULL * 1024ULL)
-#define L3_ENTRIES          512
-#define RAM_L3_TABLES       64
-#define MAX_USER_PAGES      ((MMU_USER_LIMIT - MMU_USER_BASE) / MMU_PAGE_SIZE)
+#define RAM_START 0x40000000ULL
+#define RAM_SIZE (128ULL * 1024ULL * 1024ULL)
+#define L3_ENTRIES 512
+#define RAM_L3_TABLES 64
+#define MAX_USER_PAGES ((MMU_USER_LIMIT - MMU_USER_BASE) / MMU_PAGE_SIZE)
 
-#define DESC_VALID           (1ULL << 0)
-#define DESC_TABLE           (1ULL << 1)
-#define DESC_AF              (1ULL << 10)
-#define DESC_SH_INNER        (3ULL << 8)
-#define DESC_SH_OUTER        (2ULL << 8)
-#define DESC_ATTR_DEVICE     (1ULL << 2)
-#define DESC_ATTR_NORMAL     (0ULL << 2)
-#define DESC_AP_EL1_RW       (0ULL << 6)
-#define DESC_AP_EL0_RW       (1ULL << 6)
-#define DESC_AP_EL1_RO       (2ULL << 6)
-#define DESC_AP_EL0_RO       (3ULL << 6)
-#define DESC_PXN             (1ULL << 53)
-#define DESC_UXN             (1ULL << 54)
+#define DESC_VALID (1ULL << 0)
+#define DESC_TABLE (1ULL << 1)
+#define DESC_AF (1ULL << 10)
+#define DESC_SH_INNER (3ULL << 8)
+#define DESC_SH_OUTER (2ULL << 8)
+#define DESC_ATTR_DEVICE (1ULL << 2)
+#define DESC_ATTR_NORMAL (0ULL << 2)
+#define DESC_AP_EL1_RW (0ULL << 6)
+#define DESC_AP_EL0_RW (1ULL << 6)
+#define DESC_AP_EL1_RO (2ULL << 6)
+#define DESC_AP_EL0_RO (3ULL << 6)
+#define DESC_PXN (1ULL << 53)
+#define DESC_UXN (1ULL << 54)
 
-#define MAIR_NORMAL_WBWA     0xFFULL
-#define MAIR_DEVICE_nGnRE    0x04ULL
-#define TCR_T0SZ_39BIT       25ULL
-#define TCR_IRGN0_WBWA       (1ULL << 8)
-#define TCR_ORGN0_WBWA       (1ULL << 10)
-#define TCR_SH0_INNER        (3ULL << 12)
-#define TCR_EPD1             (1ULL << 23)
-#define TCR_IPS_40BIT        (2ULL << 32)
-#define SCTLR_M              (1ULL << 0)
-#define SCTLR_C              (1ULL << 2)
-#define SCTLR_I              (1ULL << 12)
+#define MAIR_NORMAL_WBWA 0xFFULL
+#define MAIR_DEVICE_nGnRE 0x04ULL
+#define TCR_T0SZ_39BIT 25ULL
+#define TCR_IRGN0_WBWA (1ULL << 8)
+#define TCR_ORGN0_WBWA (1ULL << 10)
+#define TCR_SH0_INNER (3ULL << 12)
+#define TCR_EPD1 (1ULL << 23)
+#define TCR_IPS_40BIT (2ULL << 32)
+#define SCTLR_M (1ULL << 0)
+#define SCTLR_C (1ULL << 2)
+#define SCTLR_I (1ULL << 12)
 
 #define USER_R 1U
 #define USER_W 2U
@@ -106,14 +106,14 @@ static uint64_t device_rw_nx()
 
 static uint64_t user_flags(uint32_t mode)
 {
-    if ((mode & USER_X) != 0)
+    if ((mode & USER_X)!= 0)
     {
-        if ((mode & USER_W) != 0)
+        if ((mode & USER_W)!= 0)
             return DESC_ATTR_NORMAL | DESC_AP_EL0_RW | DESC_PXN;
         return DESC_ATTR_NORMAL | DESC_AP_EL0_RO | DESC_PXN;
     }
 
-    if ((mode & USER_W) != 0)
+    if ((mode & USER_W)!= 0)
         return DESC_ATTR_NORMAL | DESC_AP_EL0_RW | DESC_PXN | DESC_UXN;
 
     return DESC_ATTR_NORMAL | DESC_AP_EL0_RO | DESC_PXN | DESC_UXN;
@@ -142,15 +142,20 @@ static void map_devices()
 
     const uint64_t bases[] = {
         0x08000000ULL,
+        0x08200000ULL,
         0x09000000ULL,
-        0x0A000000ULL
+        0x09020000ULL,
+        0x0A000000ULL,
+        0x0A200000ULL,
+        0x0C000000ULL
     };
 
-    for (int i = 0; i < 3; ++i)
+    for (uint64_t i = 0; i < sizeof(bases)/sizeof(bases[0]); ++i)
     {
         uint64_t address = bases[i];
         uint64_t index = (address >> 21) & 0x1FFULL;
-        l2_low[index] = page_descriptor(address, device_rw_nx(), DESC_SH_OUTER);
+        if(l2_low[index]==0)
+            l2_low[index] = page_descriptor(address, device_rw_nx(), DESC_SH_OUTER);
     }
 }
 
@@ -190,9 +195,9 @@ static void set_ram_flags(uint64_t start, uint64_t end, uint64_t flags)
 
 static int valid_layout()
 {
-    if (((uint64_t)l1_table & 4095ULL) != 0)
+    if (((uint64_t)l1_table & 4095ULL)!= 0)
         return 0;
-    if (((uint64_t)exception_vectors_el1 & 2047ULL) != 0)
+    if (((uint64_t)exception_vectors_el1 & 2047ULL)!= 0)
         return 0;
     if ((uint64_t)__kernel_exec_start < RAM_START ||
         (uint64_t)__kernel_exec_end > RAM_START + RAM_SIZE ||
@@ -272,7 +277,7 @@ void mmu_init()
         uart_puts("MMU: enable failed; continuing in identity mode.\r\n");
 }
 
-int mmu_enabled() { return (read_sctlr() & SCTLR_M) != 0; }
+int mmu_enabled() { return (read_sctlr() & SCTLR_M)!= 0; }
 uint64_t mmu_read_sctlr() { return read_sctlr(); }
 uint64_t mmu_read_ttbr0() { return read_ttbr0(); }
 uint64_t mmu_read_tcr() { return read_tcr(); }
@@ -306,11 +311,11 @@ int mmu_user_prepare()
 
 int mmu_user_set_range(uint64_t start, uint64_t end, uint32_t flags)
 {
-    if (end <= start || (start & (MMU_PAGE_SIZE - 1ULL)) != 0)
+    if (end <= start || (start & (MMU_PAGE_SIZE - 1ULL))!= 0)
         return -1;
     if (end > MMU_USER_LIMIT || start < MMU_USER_BASE)
         return -1;
-    if ((flags & USER_W) != 0 && (flags & USER_X) != 0)
+    if ((flags & USER_W)!= 0 && (flags & USER_X)!= 0)
         return -1;
 
     uint64_t first = start;
@@ -364,11 +369,11 @@ int mmu_user_pointer_ok(uint64_t address, uint64_t length, int write)
         {
             uint64_t idx = (pos - MMU_USER_BASE) / MMU_PAGE_SIZE;
             uint8_t mode = user_page_modes[idx];
-            okay = (mode & USER_R) != 0 && (!write || (mode & USER_W) != 0);
+            okay = (mode & USER_R)!= 0 && (!write || (mode & USER_W)!= 0);
         }
         else if (pos >= MMU_USER_STACK_BASE && pos < MMU_USER_STACK_TOP)
         {
-            okay = !write || 1;
+            okay =!write || 1;
         }
         if (!okay)
             return 0;
@@ -382,12 +387,12 @@ uint64_t mmu_user_stack_top() { return MMU_USER_STACK_TOP; }
 void mmu_status()
 {
     uart_puts("MMU status\r\n----------\r\n");
-    uart_puts("Enabled : "); uart_puts(mmu_enabled() ? "yes\r\n" : "no\r\n");
-    uart_puts("TTBR0   : 0x");
+    uart_puts("Enabled : "); uart_puts(mmu_enabled()? "yes\r\n" : "no\r\n");
+    uart_puts("TTBR0 : 0x");
     uint64_t v = read_ttbr0();
     static const char h[] = "0123456789ABCDEF";
     for (int i = 15; i >= 0; --i) uart_putc(h[(v >> (i * 4)) & 0xF]);
     uart_puts("\r\n");
     uart_puts("User VA : 0x47000000 - 0x47800000\r\n");
-    uart_puts("Stack   : 0x47F00000 - 0x48000000\r\n");
+    uart_puts("Stack : 0x47F00000 - 0x48000000\r\n");
 }

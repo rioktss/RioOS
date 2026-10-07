@@ -75,8 +75,6 @@ static bool fill_file(FILE* f,Inode* ins,uint8_t* bm,int parent,const char* name
     int id=find_inode(ins,name,parent); if(id<0) id=alloc_inode(ins);
     if(id<0)return false; if(ins[id].used&&!replace)return true;
     uint32_t need=(uint32_t)((size+SECTOR-1)/SECTOR);
-
-    /* Reuse the current extent whenever possible; this makes repeated builds stable. */
     uint64_t old_first=ins[id].first_sector; uint32_t old_count=ins[id].sector_count;
     if(ins[id].used && old_count>=need && (!need || old_first>=DATA_START)){
         if(!write_host_file(f,old_first,need,data))return false;
@@ -84,21 +82,21 @@ static bool fill_file(FILE* f,Inode* ins,uint8_t* bm,int parent,const char* name
         Inode n=ins[id]; n.used=1;n.type=0;n.parent=parent;n.size=size;n.first_sector=need?old_first:0;n.sector_count=need;ins[id]=n;
         return true;
     }
-
     int first=alloc_run(bm,need);if(need&&first<0)return false;
     if(need&&!write_host_file(f,(uint64_t)first,need,data))return false;
     if(ins[id].used&&old_count)for(uint32_t s=0;s<old_count;s++)if(old_first+s<TOTAL_SECTORS)bit_set(bm,(uint32_t)old_first+s,false);
     Inode n{};n.used=1;n.type=0;n.parent=parent;n.size=size;n.first_sector=need?(uint64_t)first:0;n.sector_count=need;std::strncpy(n.name,name,NAME_SIZE-1);ins[id]=n;return true;
 }
-
 static bool ensure_dir(Inode* ins,int parent,const char* name){int id=find_inode(ins,name,parent);if(id>=0)return ins[id].type==1;id=alloc_inode(ins);if(id<0)return false;Inode n{};n.used=1;n.type=1;n.parent=parent;std::strncpy(n.name,name,NAME_SIZE-1);ins[id]=n;return true;}
+static const char* basename_of(const char* path){const char* p=strrchr(path,'/'); return p? p+1 : path;}
+
 int main(int argc,char**argv){
-    if(argc!=3){std::fprintf(stderr,"usage: mkfs_myfs <disk.img> <init.elf>\n");return 2;}
-    const char* img=argv[1];const char* elf=argv[2];
+    if(argc<3){std::fprintf(stderr,"usage: mkfs_myfs <disk.img> <elf1> [elf2...]\n");return 2;}
+    const char* img=argv[1];
     FILE* f=std::fopen(img,"rb+");
     if(!f)f=std::fopen(img,"wb+");
     if(!f){std::perror(img);return 1;}
-    if (std::fseek(f, (long)(TOTAL_SECTORS * SECTOR - 1ULL), SEEK_SET) != 0 ||
+    if (std::fseek(f, (long)(TOTAL_SECTORS * SECTOR - 1ULL), SEEK_SET)!= 0 ||
         std::fputc(0, f) == EOF) { std::fclose(f); return 1; }
     std::fflush(f);
     Super sb{}; bool valid=read_super(f,sb)&&valid_super(sb);
@@ -110,17 +108,29 @@ int main(int argc,char**argv){
         std::memset(ins,0,sizeof(ins));std::memset(bm,0,sizeof(bm));for(uint32_t s=0;s<DATA_START;s++)bit_set(bm,s,true);
         ins[0].used=1;ins[0].type=1;ins[0].parent=-1;std::strcpy(ins[0].name,"/");
     }
-
     int root=0;
     if(!ins[root].used||ins[root].type!=1){std::fprintf(stderr,"invalid root inode\n");std::fclose(f);return 1;}
     if(!ensure_dir(ins,root,"storage")||!ensure_dir(ins,root,"bin")){std::fprintf(stderr,"cannot create directories\n");std::fclose(f);return 1;}
     int storage=find_inode(ins,"storage",root);
     if(!ensure_dir(ins,storage,"home")){std::fprintf(stderr,"cannot create home directory\n");std::fclose(f);return 1;}
     int bin=find_inode(ins,"bin",root);
-    if(!fill_file(f,ins,bm,bin,"init.elf",elf,true)){std::fprintf(stderr,"cannot install init ELF\n");std::fclose(f);return 1;}
+
+    for(int i=2;i<argc;i++){
+        const char* host = argv[i];
+        const char* base = basename_of(host);
+        const char* guest = base;
+        if(std::strcmp(base,"user_init.elf")==0) guest="init.elf";
+        // biar build/nano.elf tetap jadi nano.elf
+        std::printf("Installing %s -> /bin/%s\n", host, guest);
+        if(!fill_file(f,ins,bm,bin,guest,host,true)){
+            std::fprintf(stderr,"cannot install %s\n", host);
+            std::fclose(f);
+            return 1;
+        }
+    }
 
     if(!save_inode_table(f,ins)||!save_bitmap(f,bm)){std::fprintf(stderr,"cannot write metadata\n");std::fclose(f);return 1;}
     std::fflush(f);std::fclose(f);
-    std::printf("persistent filesystem ready: %s\n",img);
+    std::printf("persistent filesystem ready: %s (%d apps)\n",img, argc-2);
     return 0;
 }

@@ -17,7 +17,9 @@ uint64_t boot_dtb_ptr = 0;
 #define FDT_END            9U
 #define MAX_FDT_SCAN      (1024U * 1024U)
 #define MMIO_DEVICE_MIN   0x0A000000ULL
-#define MMIO_DEVICE_MAX   0x0A200000ULL
+#define MMIO_DEVICE_COUNT 32ULL
+#define MMIO_DEVICE_STRIDE 0x200ULL
+#define MMIO_DEVICE_MAX   (MMIO_DEVICE_MIN + MMIO_DEVICE_COUNT * MMIO_DEVICE_STRIDE)
 #define V_DEVICE_ID       0x008U
 #define V_MAGIC           0x000U
 #define V_VERSION         0x004U
@@ -87,7 +89,7 @@ static int virtio_mmio_scan_fixed_window(uint32_t wanted_device_id,
                                           uint64_t* size,
                                           int* irq)
 {
-    for (uint64_t addr = MMIO_DEVICE_MIN; addr < MMIO_DEVICE_MAX; addr += 0x200ULL)
+    for (uint64_t addr = MMIO_DEVICE_MIN; addr < MMIO_DEVICE_MAX; addr += MMIO_DEVICE_STRIDE)
     {
         volatile uint32_t* regs = (volatile uint32_t*)addr;
         if (regs[V_MAGIC / 4] == VIRTIO_MAGIC &&
