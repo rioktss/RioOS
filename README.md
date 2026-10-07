@@ -73,3 +73,21 @@ Files were moved with `git mv` (history kept, nothing deleted). Object names in 
 - `tests/mem_host_test.cpp` covers both on the host (runs inside `build.sh`).
 - Existing `kmalloc` bump heap and `mmu_user_pointer_ok` are unchanged.
 - Not done yet: per-page permission split (W^X), user page tables per process, heap `kfree`.
+
+
+## P3 - Syscalls (in progress)
+
+New syscalls (real implementations, EL0 pointers validated with `mmu_user_pointer_ok`):
+
+| # | Name | Behaviour |
+|---|------|-----------|
+| 8 | `SYS_WRITE_BUF(buf,len)` | writes `len` bytes (<= 4096) to the console; -14 bad pointer, -22 too long |
+| 9 | `SYS_SLEEP_MS(ms)` | sleeps `ms` (<= 10000) |
+| 10 | `SYS_READ(buf,len)` | non-blocking console read into a *writable* user buffer, returns bytes read |
+| 11 | `SYS_TIME_MS` | milliseconds since boot |
+
+Fixed: `SYS_UNAME` previously only checked the destination for *read* access; it now requires write access.
+`include/user_api.h` gained `user_write/user_read/user_sleep_ms/user_time_ms` wrappers (old API unchanged).
+`tests/syscall_host_test.cpp` exercises the dispatcher with a fake user memory window.
+
+Deferred (need per-process contexts / fd table, planned with the P4 scheduler): fork, exec, wait, yield, open, close.

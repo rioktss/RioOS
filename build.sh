@@ -27,7 +27,7 @@ HOST_TOOLS="$HOME/.mykernel-tools"
 mkdir -p "$HOST_TOOLS"
 
 rm -f build/*.o build/kernel.elf build/user_init.elf
-rm -f "$HOST_TOOLS/fs_host_test" "$HOST_TOOLS/net_host_test" "$HOST_TOOLS/mem_host_test"
+rm -f "$HOST_TOOLS/fs_host_test" "$HOST_TOOLS/net_host_test" "$HOST_TOOLS/mem_host_test" "$HOST_TOOLS/syscall_host_test"
 
 # Map module name -> source path (P1 directory layout).
 src_of() {
@@ -115,6 +115,9 @@ step "8/9" "Running host tests"
 
 "$CXX" -std=c++17 -O2 -Wall -Wextra -pedantic -iquote include -DHOST_TEST tests/mem_host_test.cpp memory/page_alloc.cpp kernel/fault.cpp -o "$HOST_TOOLS/mem_host_test" > /dev/null
 "$HOST_TOOLS/mem_host_test"
+
+"$CXX" -std=c++17 -O2 -Wall -Wextra -pedantic -iquote include -DHOST_TEST tests/syscall_host_test.cpp kernel/syscall.cpp -o "$HOST_TOOLS/syscall_host_test" > /dev/null
+"$HOST_TOOLS/syscall_host_test"
 
 python3 tests/verify_release.py
 

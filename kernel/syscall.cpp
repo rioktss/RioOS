@@ -14,6 +14,7 @@ void syscall_init()
     uart_puts("Syscall interface initialized (EL1 + EL0).\r\n");
 }
 
+#ifndef HOST_TEST /* needs AArch64 register variables */
 uint64_t syscall_invoke(uint64_t number,uint64_t a0,uint64_t a1,uint64_t a2,uint64_t a3,uint64_t a4,uint64_t a5)
 {
     register uint64_t x0 asm("x0") = a0;
@@ -26,10 +27,16 @@ uint64_t syscall_invoke(uint64_t number,uint64_t a0,uint64_t a1,uint64_t a2,uint
     asm volatile("svc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x8) :: "memory");
     return x0;
 }
+#endif
 
 int syscall_user_pointer_ok(const void* pointer, uint64_t length)
 {
     return mmu_user_pointer_ok((uint64_t)pointer, length, 0);
+}
+
+int syscall_user_pointer_ok_write(const void* pointer, uint64_t length)
+{
+    return mmu_user_pointer_ok((uint64_t)pointer, length, 1);
 }
 
 void syscall_dispatch(ExceptionFrame* frame, int from_user)
@@ -119,7 +126,7 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
         {
             const char* out = "MyKernel " MYKERNEL_VERSION_STRING " ARM64";
             char* dst = (char*)frame->x[0];
-            if (dst == 0 || (from_user && !syscall_user_pointer_ok(dst, 32)))
+            if (dst == 0 || (from_user && !syscall_user_pointer_ok_write(dst, 32)))
             {
                 result = (uint64_t)-14;
                 break;
@@ -130,6 +137,78 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
             result = (uint64_t)i;
             break;
         }
+
+        case SYS_WRITE_BUF:
+        {
+            const char* buf = (const char*)frame->x[0];
+            uint64_t len = frame->x[1];
+
+            if (len == 0)
+            {
+                result = 0;
+                break;
+            }
+            if (len > SYSCALL_IO_MAX)
+            {
+                result = (uint64_t)-22;
+                break;
+            }
+            if (buf == 0 || (from_user && !syscall_user_pointer_ok(buf, len)))
+            {
+                result = (uint64_t)-14;
+                break;
+            }
+            for (uint64_t i = 0; i < len; ++i)
+                uart_putc(buf[i]);
+            result = len;
+            break;
+        }
+
+        case SYS_SLEEP_MS:
+            if (frame->x[0] > SYSCALL_SLEEP_MAX_MS)
+            {
+                result = (uint64_t)-22;
+                break;
+            }
+            timer_delay_ms(frame->x[0]);
+            result = 0;
+            break;
+
+        case SYS_READ:
+        {
+            char* buf = (char*)frame->x[0];
+            uint64_t len = frame->x[1];
+
+            if (len == 0)
+            {
+                result = 0;
+                break;
+            }
+            if (len > SYSCALL_IO_MAX)
+            {
+                result = (uint64_t)-22;
+                break;
+            }
+            if (buf == 0 || (from_user && !syscall_user_pointer_ok_write(buf, len)))
+            {
+                result = (uint64_t)-14;
+                break;
+            }
+            uint64_t got = 0;
+            while (got < len)
+            {
+                int c = uart_try_getc();
+                if (c < 0)
+                    break;
+                buf[got++] = (char)c;
+            }
+            result = got;
+            break;
+        }
+
+        case SYS_TIME_MS:
+            result = timer_millis();
+            break;
 
         default:
             result = (uint64_t)-38;

@@ -38,3 +38,11 @@ char uart_getc()
 
     return (char)(*UART_DR & 0xFF);
 }
+
+int uart_try_getc()
+{
+    if ((*UART_FR) & (1U << 4))
+        return -1;
+
+    return (int)(*UART_DR & 0xFFU);
+}
