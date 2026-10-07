@@ -58,9 +58,17 @@ void str_copy(
    compiler may emit calls to them for struct copies and large initialisers.
    Plain byte loops; -fno-builtin stops the compiler turning them back into
    calls to themselves. */
+/* Under clang, optnone also guarantees these loops are never rewritten into a
+   call to themselves (infinite recursion) by the loop-idiom pass. */
+#if defined(__clang__)
+#define MEMFN_ATTR __attribute__((optnone))
+#else
+#define MEMFN_ATTR
+#endif
+
 extern "C"
 {
-    void* memcpy(void* dst, const void* src, unsigned long n)
+    MEMFN_ATTR void* memcpy(void* dst, const void* src, unsigned long n)
     {
         unsigned char* d = (unsigned char*)dst;
         const unsigned char* s = (const unsigned char*)src;
@@ -71,7 +79,7 @@ extern "C"
         return dst;
     }
 
-    void* memmove(void* dst, const void* src, unsigned long n)
+    MEMFN_ATTR void* memmove(void* dst, const void* src, unsigned long n)
     {
         unsigned char* d = (unsigned char*)dst;
         const unsigned char* s = (const unsigned char*)src;
@@ -96,7 +104,7 @@ extern "C"
         return dst;
     }
 
-    void* memset(void* dst, int value, unsigned long n)
+    MEMFN_ATTR void* memset(void* dst, int value, unsigned long n)
     {
         unsigned char* d = (unsigned char*)dst;
 
@@ -106,7 +114,7 @@ extern "C"
         return dst;
     }
 
-    int memcmp(const void* a, const void* b, unsigned long n)
+    MEMFN_ATTR int memcmp(const void* a, const void* b, unsigned long n)
     {
         const unsigned char* x = (const unsigned char*)a;
         const unsigned char* y = (const unsigned char*)b;

@@ -167,8 +167,10 @@ void timer_interrupt_handler()
 
     if (mode == TIMER_MODE_PERIODIC && period_ticks != 0)
     {
-        /* Re-arm from the previous deadline (no drift). If we fell behind,
-           resynchronise to "now" so the line cannot stay asserted. */
+        /* Re-arm one period from "now". This always moves the 64-bit compare
+           value into the future, so the level-triggered line is de-asserted
+           before EOI and a late handler can never cause an IRQ storm (the
+           cost is a tiny drift, which is irrelevant for a scheduler tick). */
         uint64_t now = read_counter();
         uint64_t next = now + period_ticks;
 
