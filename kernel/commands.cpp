@@ -18,6 +18,8 @@
 #include "netstack.h"
 #include "version.h"
 #include "interrupt.h"
+#include "page_alloc.h"
+#include "fault.h"
 
 static void print_u64(
     uint64_t value
@@ -248,6 +250,59 @@ static void command_irq(const char* argument)
     uart_puts("Usage: irq [status|off|oneshot|stagec [hz]|staged [hz]|selftest]\r\n");
 }
 
+/* Allocate, verify zeroing, free, then check double-free is rejected. */
+static int pages_selftest()
+{
+    if (!page_alloc_ready())
+        return 0;
+
+    PageStats before;
+    page_alloc_get_stats(&before);
+
+    volatile uint8_t* a = (volatile uint8_t*)allocate_page();
+    volatile uint8_t* b = (volatile uint8_t*)allocate_page();
+
+    if (a == 0 || b == 0 || a == b ||
+        (((uint64_t)a | (uint64_t)b) & (PAGE_SIZE_BYTES - 1ULL)) != 0)
+        return 0;
+
+    for (uint64_t i = 0; i < PAGE_SIZE_BYTES; ++i)
+    {
+        if (a[i] != 0 || b[i] != 0)
+            return 0;
+    }
+
+    a[0] = 0x5A;
+
+    if (free_page((void*)a) != PAGE_FREE_OK ||
+        free_page((void*)a) != PAGE_FREE_DOUBLE ||
+        free_page((void*)b) != PAGE_FREE_OK)
+        return 0;
+
+    PageStats after;
+    page_alloc_get_stats(&after);
+
+    return after.free_pages == before.free_pages;
+}
+
+static void command_pages()
+{
+    PageStats st;
+    page_alloc_get_stats(&st);
+
+    uart_puts("Physical pages\r\n--------------\r\n");
+    uart_puts("Ready          : "); uart_puts(page_alloc_ready() ? "yes" : "no");
+    uart_puts("\r\nTotal pages    : "); print_u64(st.total_pages);
+    uart_puts("\r\nFree pages     : "); print_u64(st.free_pages);
+    uart_puts("\r\nAllocations    : "); print_u64(st.allocs);
+    uart_puts("\r\nFrees          : "); print_u64(st.frees);
+    uart_puts("\r\nFailed allocs  : "); print_u64(st.failed_allocs);
+    uart_puts("\r\nRejected frees : "); print_u64(st.rejected_frees);
+    uart_puts("\r\nUser faults    : "); print_u64(fault_user_count());
+    uart_puts("\r\nKernel faults  : "); print_u64(fault_kernel_count());
+    uart_puts("\r\n");
+}
+
 static void command_help()
 {
     uart_puts(
@@ -286,6 +341,7 @@ static void command_help()
         "  net                  Show network status\r\n"
         "  ping <ip>            Send ICMP echo request\r\n"
         "  selftest             Run kernel integration checks\r\n"
+        "  pages                Show physical page allocator\r\n"
         "  irq [status|off|oneshot|stagec|staged|selftest] [hz]  Timer IRQ bring-up\r\n"
     );
 }
@@ -786,6 +842,7 @@ static void command_selftest()
         if(ok){uart_puts("[PASS] persistent file I/O\r\n");++pass;} else uart_puts("[FAIL] persistent file I/O\r\n");
     }
     ++total; uint64_t sp=syscall_invoke(SYS_PING); if(sp==0x4D594B56ULL){uart_puts("[PASS] SVC/syscall\r\n");++pass;}else uart_puts("[FAIL] SVC/syscall\r\n");
+    ++total; if (pages_selftest()) {uart_puts("[PASS] page allocator\r\n");++pass;} else uart_puts("[FAIL] page allocator\r\n");
     ++total; int pid=process_create("selftest"); if(pid>=0){process_set_state(pid,PROCESS_READY);scheduler_add(pid);scheduler_remove(pid);process_destroy(pid);uart_puts("[PASS] process lifecycle\r\n");++pass;}else uart_puts("[FAIL] process lifecycle\r\n");
     ++total; uint64_t entry=0; if(elf_load("/bin/init.elf",&entry)==0 && entry!=0){uart_puts("[PASS] ELF loader\r\n");++pass;}else uart_puts("[FAIL] ELF loader\r\n"); mmu_user_prepare();
     ++total; if(virtio_net_present()){uart_puts("[PASS] VirtIO-Net detected\r\n");++pass;}else uart_puts("[SKIP] VirtIO-Net unavailable\r\n");
@@ -969,6 +1026,7 @@ void execute_command(
     if (str_equal(command, "net")) { command_net(); return; }
     if (str_equal(command, "ping")) { command_ping(argument); return; }
     if (str_equal(command, "selftest")) { command_selftest(); return; }
+    if (str_equal(command, "pages")) { command_pages(); return; }
     if (str_equal(command, "irq")) { command_irq(argument); return; }
 
     if (str_equal(command, "level"))

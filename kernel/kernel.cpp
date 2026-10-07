@@ -13,6 +13,7 @@
 #include "storage.h"
 #include "netstack.h"
 #include "interrupt.h"
+#include "page_alloc.h"
 #include "version.h"
 
 extern "C" void kernel_main()
@@ -30,6 +31,16 @@ extern "C" void kernel_main()
     uart_puts("[1] Initializing memory...\r\n");
     memory_init();
     uart_puts("[2] Memory initialized.\r\n");
+
+    /* Physical page pool (4 MiB + alignment slack) carved from the heap. */
+    {
+        void* pool = kmalloc(4ULL * 1024ULL * 1024ULL + PAGE_SIZE_BYTES);
+
+        if (pool == 0 || page_alloc_init(pool, 4ULL * 1024ULL * 1024ULL + PAGE_SIZE_BYTES) != 0)
+            uart_puts("Page allocator unavailable.\r\n");
+        else
+            uart_puts("Page allocator ready.\r\n");
+    }
 
     /* Install a real EL1 vector before enabling MMU. If MMU setup faults,
        the exception path can report it instead of silently hanging. */

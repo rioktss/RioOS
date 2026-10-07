@@ -3,6 +3,7 @@
 #include "syscall.h"
 #include "uart.h"
 #include "interrupt.h"
+#include "fault.h"
 
 extern "C" char exception_vectors_el1[];
 extern "C" void user_exit_return();
@@ -42,7 +43,8 @@ extern "C" void exception_sync_el1(void* raw)
     if (frame == 0) { stop_kernel(); return; }
     uint64_t ec = (frame->esr >> 26) & 0x3FULL;
     if (ec == 0x15ULL) { syscall_dispatch(frame, 0); return; }
-    /* Report ESR/ELR/FAR/SPSR so a kernel fault is never silent. */
+    /* Decode and report so a kernel fault is never silent. */
+    fault_report(frame->esr, frame->elr, frame->far, frame->spsr);
     interrupt_exception(frame->esr, frame->elr, frame->far, frame->spsr);
     stop_kernel();
 }
@@ -54,7 +56,8 @@ extern "C" void exception_sync_el0(void* raw)
     uint64_t ec = (frame->esr >> 26) & 0x3FULL;
     if (ec == 0x15ULL) { syscall_dispatch(frame, 1); return; }
 
-    uart_puts("\r\n[EL0] Fatal user exception; terminating process.\r\n");
+    fault_report(frame->esr, frame->elr, frame->far, frame->spsr);
+    uart_puts("[EL0] Fatal user exception; terminating process.\r\n");
     frame->x[0] = (uint64_t)-14;
     frame->spsr = 0x3C5ULL;
     frame->elr = (uint64_t)user_exit_return;

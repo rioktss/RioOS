@@ -61,3 +61,15 @@ tests/  storage/  build.sh  linker.ld
 ```
 
 Files were moved with `git mv` (history kept, nothing deleted). Object names in `build/` are unchanged.
+
+
+## P2 - Memory (in progress)
+
+- `memory/page_alloc.cpp`: bitmap physical page allocator (`allocate_page()` / `free_page()`),
+  4 KiB aligned, zeroed on allocation, double-free and bad-address rejection, out-of-memory returns 0.
+  Pool: 4 MiB carved from the kernel heap at boot. Shell: `pages`; `selftest` has a `[PASS] page allocator` line.
+- `kernel/fault.cpp`: decodes ESR into instruction/data abort, read/write, translation/permission/access
+  fault + level. Kernel and EL0 faults now print `[FAULT] ...` with ELR/FAR/ESR/SPSR before the existing handling.
+- `tests/mem_host_test.cpp` covers both on the host (runs inside `build.sh`).
+- Existing `kmalloc` bump heap and `mmu_user_pointer_ok` are unchanged.
+- Not done yet: per-page permission split (W^X), user page tables per process, heap `kfree`.
