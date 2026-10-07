@@ -43,3 +43,21 @@ Hardening done in this phase: GICC/GICD enable value 3 (valid in all GICv2 views
 spurious IDs counted without EOI, nesting/depth tracking, 64-bit CVAL timer re-arm
 without drift or TVAL wrap, timer self-disables when it fires with no mode (storm guard),
 and kernel/unhandled exceptions now print ESR/ELR/FAR/SPSR.
+
+
+## P1 - Source layout
+
+```
+boot/      boot.S, exceptions.S (vectors)
+kernel/    kernel, exceptions, interrupt, timer, syscall, shell, commands, string
+drivers/   uart, keyboard, virtio_mmio/blk/net, storage
+memory/    memory, mmu
+process/   process, scheduler, elf, user, user_entry.S
+fs/        fs, vfs, mkfs_myfs (host tool)
+net/       netstack
+userspace/ user_init.S, user_init.ld
+include/   all headers (compiled with -Iinclude)
+tests/  storage/  build.sh  linker.ld
+```
+
+Files were moved with `git mv` (history kept, nothing deleted). Object names in `build/` are unchanged.

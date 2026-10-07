@@ -29,24 +29,34 @@ mkdir -p "$HOST_TOOLS"
 rm -f build/*.o build/kernel.elf build/user_init.elf
 rm -f "$HOST_TOOLS/fs_host_test" "$HOST_TOOLS/net_host_test"
 
+# Map module name -> source path (P1 directory layout).
+src_of() {
+    local f="$1" d
+    for d in kernel drivers memory process fs net; do
+        [[ -f "$d/$f.cpp" ]] && { printf '%s' "$d/$f.cpp"; return; }
+    done
+    echo "ERROR: source for $f not found" >&2; exit 1
+}
+
 CXXFLAGS=(
+    -Iinclude
     --target=aarch64-none-elf -mcpu=cortex-a72 -mgeneral-regs-only -mstrict-align
     -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-builtin
     -fno-pic -fno-pie -fno-vectorize -fno-slp-vectorize
     -fno-unwind-tables -fno-asynchronous-unwind-tables
     -nostdinc++ -std=c++17 -O1 -Wall -Wextra -Werror
 )
-ASMFLAGS=( --target=aarch64-none-elf -mcpu=cortex-a72 -ffreestanding -fno-pic -fno-pie )
+ASMFLAGS=( -Iinclude --target=aarch64-none-elf -mcpu=cortex-a72 -ffreestanding -fno-pic -fno-pie )
 
 # [1/9] USERSPACE
 step "1/9" "Bundling userspace"
 vlog "  -> user_init.S"
-"$CLANG" "${ASMFLAGS[@]}" -c user_init.S -o build/user_init.o
-"$LD" -T user_init.ld -nostdlib -z max-page-size=0x1000 build/user_init.o -o build/user_init.elf
+"$CLANG" "${ASMFLAGS[@]}" -c userspace/user_init.S -o build/user_init.o
+"$LD" -T userspace/user_init.ld -nostdlib -z max-page-size=0x1000 build/user_init.o -o build/user_init.elf
 
 # [2/9] FORMATTER
 step "2/9" "Building host tools"
-"$CXX" -std=c++17 -O2 -Wall -Wextra -pedantic mkfs_myfs.cpp -o "$HOST_TOOLS/mkfs_myfs"
+"$CXX" -std=c++17 -O2 -Wall -Wextra -pedantic fs/mkfs_myfs.cpp -o "$HOST_TOOLS/mkfs_myfs"
 
 # [3/9] DISK IMAGE
 step "3/9" "Preparing disk image"
@@ -58,21 +68,21 @@ vlog "  -> storage/disk.img ready (16 MiB)"
 
 # [4/9] BOOT
 step "4/9" "Compiling boot"
-"$CLANG" "${ASMFLAGS[@]}" -c boot.S -o build/boot.o
-"$CLANG" "${ASMFLAGS[@]}" -c exceptions.S -o build/exception_vectors.o
-"$CLANG" "${ASMFLAGS[@]}" -c user_entry.S -o build/user_entry.o
+"$CLANG" "${ASMFLAGS[@]}" -c boot/boot.S -o build/boot.o
+"$CLANG" "${ASMFLAGS[@]}" -c boot/exceptions.S -o build/exception_vectors.o
+"$CLANG" "${ASMFLAGS[@]}" -c process/user_entry.S -o build/user_entry.o
 
 # [5/9] KERNEL
 step "5/9" "Compiling kernel (22 modules)"
 if [[ $VERBOSE -eq 1 ]]; then
     for f in uart memory string fs vfs process scheduler timer interrupt keyboard commands shell exceptions syscall user mmu virtio_mmio virtio_blk storage elf virtio_net netstack kernel; do
         echo "  -> $f.cpp"
-        "$CXX" "${CXXFLAGS[@]}" -c "$f.cpp" -o "build/$f.o"
+        "$CXX" "${CXXFLAGS[@]}" -c "$(src_of "$f")" -o "build/$f.o"
     done
 else
     for f in uart memory string fs vfs process scheduler timer interrupt keyboard commands shell exceptions syscall user mmu virtio_mmio virtio_blk storage elf virtio_net netstack kernel; do
         printf '.'
-        "$CXX" "${CXXFLAGS[@]}" -c "$f.cpp" -o "build/$f.o" > /dev/null 2>&1
+        "$CXX" "${CXXFLAGS[@]}" -c "$(src_of "$f")" -o "build/$f.o" > /dev/null 2>&1
     done
     printf ' done\n'
 fi
@@ -97,10 +107,10 @@ fi
 
 # [8/9] TESTS
 step "8/9" "Running host tests"
-"$CXX" -std=c++17 -O2 -Wall -Wextra -pedantic -idirafter . -DHOST_TEST tests/fs_host_test.cpp fs.cpp string.cpp -o "$HOST_TOOLS/fs_host_test" > /dev/null
+"$CXX" -std=c++17 -O2 -Wall -Wextra -pedantic -iquote include -idirafter include -DHOST_TEST tests/fs_host_test.cpp fs/fs.cpp kernel/string.cpp -o "$HOST_TOOLS/fs_host_test" > /dev/null
 "$HOST_TOOLS/fs_host_test"
 
-"$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -idirafter . -DHOST_TEST tests/net_host_test.cpp netstack.cpp -o "$HOST_TOOLS/net_host_test" > /dev/null
+"$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -iquote include -idirafter include -DHOST_TEST tests/net_host_test.cpp net/netstack.cpp -o "$HOST_TOOLS/net_host_test" > /dev/null
 "$HOST_TOOLS/net_host_test"
 
 python3 tests/verify_release.py

@@ -3,7 +3,7 @@ import struct, subprocess
 
 root=Path(__file__).resolve().parents[1]
 kernel=root/'build/kernel.elf'; disk=root/'storage/disk.img'; user=root/'build/user_init.elf'
-required=['virtio_mmio.cpp','virtio_net.cpp','netstack.cpp','user.cpp','elf.cpp','exceptions.S','scheduler.cpp']
+required=['drivers/virtio_mmio.cpp','drivers/virtio_net.cpp','net/netstack.cpp','process/user.cpp','process/elf.cpp','boot/exceptions.S','process/scheduler.cpp']
 for name in required: assert (root/name).is_file(), f'missing {name}'
 assert kernel.is_file() and kernel.stat().st_size>0
 assert user.is_file() and user.stat().st_size>0
