@@ -91,3 +91,12 @@ Fixed: `SYS_UNAME` previously only checked the destination for *read* access; it
 `tests/syscall_host_test.cpp` exercises the dispatcher with a fake user memory window.
 
 Deferred (need per-process contexts / fd table, planned with the P4 scheduler): fork, exec, wait, yield, open, close.
+
+
+## P4 - Diagnostics (part 1)
+
+- `include/diag.h`, `kernel/diag.cpp`: `klog(level, msg)` with runtime level, `PANIC(msg)`, `KASSERT(cond)`
+  (prints message + file:line, masks IRQs, halts). Host-tested in `tests/diag_host_test.cpp`.
+- New shell commands: `tasks`, `mount`, `stats`, `log [0-3]` (existing `ps`, `mem`, `uptime`, `uname`, `ls`, `cat`, `echo` unchanged).
+- Not done (needs QEMU to validate safely): preemptive context switch, sleep/wakeup queues, priorities/aging,
+  fs permissions/caching, sockets/UDP/TCP changes, driver framework.

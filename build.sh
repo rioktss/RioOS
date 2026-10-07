@@ -27,7 +27,7 @@ HOST_TOOLS="$HOME/.mykernel-tools"
 mkdir -p "$HOST_TOOLS"
 
 rm -f build/*.o build/kernel.elf build/user_init.elf
-rm -f "$HOST_TOOLS/fs_host_test" "$HOST_TOOLS/net_host_test" "$HOST_TOOLS/mem_host_test" "$HOST_TOOLS/syscall_host_test"
+rm -f "$HOST_TOOLS/fs_host_test" "$HOST_TOOLS/net_host_test" "$HOST_TOOLS/mem_host_test" "$HOST_TOOLS/syscall_host_test" "$HOST_TOOLS/diag_host_test"
 
 # Map module name -> source path (P1 directory layout).
 src_of() {
@@ -73,14 +73,14 @@ step "4/9" "Compiling boot"
 "$CLANG" "${ASMFLAGS[@]}" -c process/user_entry.S -o build/user_entry.o
 
 # [5/9] KERNEL
-step "5/9" "Compiling kernel (24 modules)"
+step "5/9" "Compiling kernel (25 modules)"
 if [[ $VERBOSE -eq 1 ]]; then
-    for f in uart memory string fs vfs process scheduler timer interrupt keyboard commands shell exceptions syscall user mmu virtio_mmio virtio_blk storage elf virtio_net netstack page_alloc fault kernel; do
+    for f in uart memory string fs vfs process scheduler timer interrupt keyboard commands shell exceptions syscall user mmu virtio_mmio virtio_blk storage elf virtio_net netstack page_alloc fault diag kernel; do
         echo "  -> $f.cpp"
         "$CXX" "${CXXFLAGS[@]}" -c "$(src_of "$f")" -o "build/$f.o"
     done
 else
-    for f in uart memory string fs vfs process scheduler timer interrupt keyboard commands shell exceptions syscall user mmu virtio_mmio virtio_blk storage elf virtio_net netstack page_alloc fault kernel; do
+    for f in uart memory string fs vfs process scheduler timer interrupt keyboard commands shell exceptions syscall user mmu virtio_mmio virtio_blk storage elf virtio_net netstack page_alloc fault diag kernel; do
         printf '.'
         "$CXX" "${CXXFLAGS[@]}" -c "$(src_of "$f")" -o "build/$f.o" > /dev/null 2>&1
     done
@@ -94,7 +94,7 @@ step "6/9" "Linking"
     build/kernel.o build/uart.o build/memory.o build/string.o build/fs.o build/vfs.o \
     build/process.o build/scheduler.o build/timer.o build/interrupt.o build/keyboard.o \
     build/commands.o build/shell.o build/exceptions.o build/syscall.o build/user.o build/mmu.o \
-    build/virtio_mmio.o build/virtio_blk.o build/storage.o build/elf.o build/virtio_net.o build/netstack.o build/page_alloc.o build/fault.o \
+    build/virtio_mmio.o build/virtio_blk.o build/storage.o build/elf.o build/virtio_net.o build/netstack.o build/page_alloc.o build/fault.o build/diag.o \
     -o build/kernel.elf
 
 # [7/9] VERIFY
@@ -118,6 +118,9 @@ step "8/9" "Running host tests"
 
 "$CXX" -std=c++17 -O2 -Wall -Wextra -pedantic -iquote include -DHOST_TEST tests/syscall_host_test.cpp kernel/syscall.cpp -o "$HOST_TOOLS/syscall_host_test" > /dev/null
 "$HOST_TOOLS/syscall_host_test"
+
+"$CXX" -std=c++17 -O2 -Wall -Wextra -pedantic -iquote include -DHOST_TEST tests/diag_host_test.cpp kernel/diag.cpp -o "$HOST_TOOLS/diag_host_test" > /dev/null
+"$HOST_TOOLS/diag_host_test"
 
 python3 tests/verify_release.py
 

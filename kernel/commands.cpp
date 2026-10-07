@@ -20,6 +20,7 @@
 #include "interrupt.h"
 #include "page_alloc.h"
 #include "fault.h"
+#include "diag.h"
 
 static void print_u64(
     uint64_t value
@@ -303,6 +304,66 @@ static void command_pages()
     uart_puts("\r\n");
 }
 
+static void command_tasks()
+{
+    uart_puts("Tasks\r\n-----\r\n");
+    uart_puts("Processes      : "); print_u64((uint64_t)process_count());
+    uart_puts("\r\nRunnable       : "); print_u64((uint64_t)scheduler_ready_count());
+    uart_puts("\r\nCurrent PID    : ");
+
+    int cur = scheduler_current_pid();
+
+    if (cur < 0) uart_puts("none"); else print_u64((uint64_t)cur);
+
+    uart_puts("\r\nSched ticks    : "); print_u64(scheduler_ticks());
+    uart_puts("\r\n\r\n");
+    process_list();
+}
+
+static void command_mount()
+{
+    uart_puts("Mounts\r\n------\r\n");
+    uart_puts("block device   : "); uart_puts(storage_ready() ? "virtio-blk (ready)" : "none");
+    uart_puts("\r\nroot (/)       : myfs, ");
+    uart_puts(fs_persistent() ? "persistent (disk-backed)" : "RAM only (not persistent)");
+    uart_puts("\r\n");
+}
+
+static void command_stats()
+{
+    InterruptStats irq;
+    PageStats pg;
+    interrupt_get_stats(&irq);
+    page_alloc_get_stats(&pg);
+
+    uart_puts("System statistics\r\n-----------------\r\n");
+    uart_puts("Uptime (s)     : "); print_u64(timer_seconds());
+    uart_puts("\r\nIRQ total/timer: "); print_u64(irq.total); uart_puts(" / "); print_u64(irq.timer);
+    uart_puts("\r\nIRQ spurious   : "); print_u64(irq.spurious);
+    uart_puts("\r\nSched ticks    : "); print_u64(scheduler_ticks());
+    uart_puts("\r\nProcesses      : "); print_u64((uint64_t)process_count());
+    uart_puts("\r\nHeap used/free : "); print_u64(heap_used()); uart_puts(" / "); print_u64(heap_free());
+    uart_puts("\r\nPages free/tot : "); print_u64(pg.free_pages); uart_puts(" / "); print_u64(pg.total_pages);
+    uart_puts("\r\nFaults user/krn: "); print_u64(fault_user_count()); uart_puts(" / "); print_u64(fault_kernel_count());
+    uart_puts("\r\nLog level      : "); uart_puts(diag_level_name(diag_get_level()));
+    uart_puts("\r\n");
+}
+
+static void command_log(const char* argument)
+{
+    if (argument != 0 && argument[0] >= '0' && argument[0] <= '3' && argument[1] == 0)
+        diag_set_level(argument[0] - '0');
+    else if (argument != 0 && argument[0] != 0)
+    {
+        uart_puts("Usage: log [0=error|1=warn|2=info|3=debug]\r\n");
+        return;
+    }
+
+    uart_puts("Log level: ");
+    uart_puts(diag_level_name(diag_get_level()));
+    uart_puts("\r\n");
+}
+
 static void command_help()
 {
     uart_puts(
@@ -342,6 +403,10 @@ static void command_help()
         "  ping <ip>            Send ICMP echo request\r\n"
         "  selftest             Run kernel integration checks\r\n"
         "  pages                Show physical page allocator\r\n"
+        "  tasks                Show scheduler and processes\r\n"
+        "  mount                Show storage and filesystem mount\r\n"
+        "  stats                Show system statistics\r\n"
+        "  log [0-3]            Show/set log level\r\n"
         "  irq [status|off|oneshot|stagec|staged|selftest] [hz]  Timer IRQ bring-up\r\n"
     );
 }
@@ -1027,6 +1092,10 @@ void execute_command(
     if (str_equal(command, "ping")) { command_ping(argument); return; }
     if (str_equal(command, "selftest")) { command_selftest(); return; }
     if (str_equal(command, "pages")) { command_pages(); return; }
+    if (str_equal(command, "tasks")) { command_tasks(); return; }
+    if (str_equal(command, "mount")) { command_mount(); return; }
+    if (str_equal(command, "stats")) { command_stats(); return; }
+    if (str_equal(command, "log")) { command_log(argument); return; }
     if (str_equal(command, "irq")) { command_irq(argument); return; }
 
     if (str_equal(command, "level"))
