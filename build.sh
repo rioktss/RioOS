@@ -107,10 +107,10 @@ fi
 
 # [8/9] TESTS
 step "8/9" "Running host tests"
-"$CXX" -std=c++17 -O2 -Wall -Wextra -pedantic -iquote include -idirafter include -DHOST_TEST tests/fs_host_test.cpp fs/fs.cpp kernel/string.cpp -o "$HOST_TOOLS/fs_host_test" > /dev/null
+"$CXX" -std=c++17 -O2 -Wall -Wextra -pedantic -iquote include -DHOST_TEST tests/fs_host_test.cpp fs/fs.cpp kernel/string.cpp -o "$HOST_TOOLS/fs_host_test" > /dev/null
 "$HOST_TOOLS/fs_host_test"
 
-"$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -iquote include -idirafter include -DHOST_TEST tests/net_host_test.cpp net/netstack.cpp -o "$HOST_TOOLS/net_host_test" > /dev/null
+"$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -iquote include -DHOST_TEST tests/net_host_test.cpp net/netstack.cpp -o "$HOST_TOOLS/net_host_test" > /dev/null
 "$HOST_TOOLS/net_host_test"
 
 python3 tests/verify_release.py
