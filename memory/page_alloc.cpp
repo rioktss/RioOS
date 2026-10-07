@@ -128,8 +128,16 @@ int free_page(void* page)
 
 void page_alloc_get_stats(PageStats* out)
 {
-    if (out != 0)
-        *out = stats;
+    if (out == 0)
+        return;
+
+    /* Field-by-field: a struct assignment can compile to a memcpy call. */
+    out->total_pages = stats.total_pages;
+    out->free_pages = stats.free_pages;
+    out->allocs = stats.allocs;
+    out->frees = stats.frees;
+    out->failed_allocs = stats.failed_allocs;
+    out->rejected_frees = stats.rejected_frees;
 }
 
 int page_alloc_ready()
