@@ -373,7 +373,7 @@ int mmu_user_pointer_ok(uint64_t address, uint64_t length, int write)
         }
         else if (pos >= MMU_USER_STACK_BASE && pos < MMU_USER_STACK_TOP)
         {
-            okay =!write || 1;
+            okay = 1; /* private EL0 stack is always RW */
         }
         if (!okay)
             return 0;

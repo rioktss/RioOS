@@ -16,7 +16,10 @@ enum UserApiSyscall
     USER_SYS_WRITE_BUF = 8,
     USER_SYS_SLEEP_MS = 9,
     USER_SYS_READ = 10,
-    USER_SYS_TIME_MS = 11
+    USER_SYS_TIME_MS = 11,
+    USER_SYS_FILE_READ = 12,
+    USER_SYS_FILE_WRITE = 13,
+    USER_SYS_GETARG = 14
 };
 
 static inline uint64_t user_syscall0(uint64_t nr)

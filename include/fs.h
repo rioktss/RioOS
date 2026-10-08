@@ -19,6 +19,9 @@ int fs_write_data(const char* path, int cwd, const uint8_t* data, uint64_t size)
 int fs_read_file(const char* path, int cwd, uint8_t* buffer, uint64_t capacity, uint64_t* out_size);
 int fs_cat(const char* path, int cwd);
 int fs_rm(const char* path, int cwd);
+/* Move/rename. 0 ok; -1 source missing; -2 destination exists; -3 root;
+   -4 into itself; -5 bad destination; -6 I/O error. */
+int fs_rename(const char* from, const char* to, int cwd);
 uint64_t fs_file_size(int id);
 int fs_get_type(int id);
 const char* fs_get_name(int id);

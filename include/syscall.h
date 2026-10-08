@@ -17,7 +17,10 @@ enum SyscallNumber
     SYS_WRITE_BUF  = 8,   /* write(buf, len) -> bytes written          */
     SYS_SLEEP_MS   = 9,   /* sleep(ms), ms <= 10000                    */
     SYS_READ       = 10,  /* read(buf, len) non-blocking -> bytes read */
-    SYS_TIME_MS    = 11   /* milliseconds since boot                   */
+    SYS_TIME_MS    = 11,  /* milliseconds since boot                   */
+    SYS_FILE_READ  = 12,  /* file_read(path, buf, cap) -> bytes read   */
+    SYS_FILE_WRITE = 13,  /* file_write(path, buf, len) -> bytes written */
+    SYS_GETARG     = 14   /* getarg(buf, cap) -> length of argument string */
 };
 
 void syscall_init();
@@ -38,5 +41,7 @@ int syscall_user_pointer_ok_write(const void* pointer, uint64_t length);
 
 #define SYSCALL_IO_MAX 4096ULL
 #define SYSCALL_SLEEP_MAX_MS 10000ULL
+#define SYSCALL_PATH_MAX 128ULL
+#define SYSCALL_FILE_MAX 4096ULL
 
 #endif

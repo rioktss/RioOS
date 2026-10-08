@@ -2,10 +2,8 @@
 #include "keyboard.h"
 #include "commands.h"
 #include "uart.h"
-
-// opsional kalau belum ada fb, gak error
-__attribute__((weak)) void fb_putc(char c, unsigned int color) { (void)c; (void)color; }
-__attribute__((weak)) void fb_print(const char* s, unsigned int color) { (void)s; (void)color; }
+#include "fb.h"
+#include "vfs.h"
 
 void shell()
 {
@@ -13,10 +11,15 @@ void shell()
 
     while (1)
     {
-        uart_puts(
-            "[home@RioOS]$ "
-        );
-        if(fb_print) fb_print("[home@RioOS]$ ", 0x00FF00);
+        char cwd[96];
+        vfs_get_path(cwd, (int)sizeof(cwd));
+
+        uart_puts("[home@RioOS ");
+        uart_puts(cwd);
+        uart_puts("]$ ");
+        fb_print("[home@RioOS ", 0x00FF00);
+        fb_print(cwd, 0x00FF00);
+        fb_print("]$ ", 0x00FF00);
 
         int length = 0;
 
@@ -50,7 +53,7 @@ void shell()
                 uart_puts(
                     "\r\n"
                 );
-                if(fb_print) fb_print("\r\n", 0xFFFFFF);
+                fb_print("\r\n", 0xFFFFFF);
 
                 break;
             }
@@ -69,9 +72,7 @@ void shell()
                     uart_puts(
                         "\b \b"
                     );
-                    if(fb_putc){
-                        fb_putc('\b', 0xFFFFFF);
-                    }
+                    fb_putc('\b', 0xFFFFFF);
                 }
 
                 continue;
@@ -90,7 +91,7 @@ void shell()
                         '\0';
 
                     uart_putc(c);
-                    if(fb_putc) fb_putc(c, 0xFFFFFF);
+                    fb_putc(c, 0xFFFFFF);
                 }
 
                 continue;
@@ -104,6 +105,6 @@ void shell()
         uart_puts(
             "\r\n"
         );
-        if(fb_print) fb_print("\r\n", 0xFFFFFF);
+        fb_print("\r\n", 0xFFFFFF);
     }
 }

@@ -4,6 +4,7 @@
 #include "uart.h"
 #include "interrupt.h"
 #include "fault.h"
+#include "user.h"
 
 extern "C" char exception_vectors_el1[];
 extern "C" void user_exit_return();
@@ -58,6 +59,7 @@ extern "C" void exception_sync_el0(void* raw)
 
     fault_report(frame->esr, frame->elr, frame->far, frame->spsr);
     uart_puts("[EL0] Fatal user exception; terminating process.\r\n");
+    user_set_exit_code(-14);
     frame->x[0] = (uint64_t)-14;
     frame->spsr = 0x3C5ULL;
     frame->elr = (uint64_t)user_exit_return;

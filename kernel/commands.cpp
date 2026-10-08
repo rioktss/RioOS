@@ -374,7 +374,7 @@ static void command_help()
         "  mem                  Show memory\r\n"
         "  echo <text>          Print text\r\n"
         "  hello                Test kernel\r\n"
-        "  ls                   List directory\r\n"
+        "  ls [dir]             List directory (with file sizes)\r\n"
         "  pwd                  Show current path\r\n"
         "  cd <path>            Change directory\r\n"
         "  mkdir <name>         Create directory\r\n"
@@ -382,11 +382,14 @@ static void command_help()
         "  write <file> <text>  Write file\r\n"
         "  cat <file>           Read file\r\n"
         "  rm <file>            Delete file\r\n"
+        "  cp <src> <dst>       Copy file (dst may be a directory)\r\n"
+        "  mv <src> <dst>       Move or rename file/directory\r\n"
         "  tree                 Show filesystem tree\r\n"
         "  ps                   Show processes\r\n"
         "  uptime               Show uptime\r\n"
         "  sched                Show scheduler status\r\n"
         "  exec <file>          Execute an ELF program\r\n"
+        "  nano <file>          Text editor (relative to current dir)\r\n"
         "  elf                  Show ELF loader status\r\n"
         "  syscall <test>        Test syscall interface\r\n"
         "  user                 Run EL0 userspace demo\r\n"
@@ -671,6 +674,163 @@ static void command_write(
     }
 }
 
+/* Split "<a> <b>" into two NUL-terminated words (in place). Returns 1 when
+   both exist and nothing follows the second word. */
+static int split_two_args(char* argument, char** first, char** second)
+{
+    if (argument == 0 || argument[0] == '\0')
+        return 0;
+
+    char* a = argument;
+    char* p = a;
+    while (*p && *p != ' ')
+        ++p;
+    if (*p == '\0')
+        return 0;
+    *p++ = '\0';
+    while (*p == ' ')
+        ++p;
+    if (*p == '\0')
+        return 0;
+
+    char* b = p;
+    while (*p && *p != ' ')
+        ++p;
+    if (*p != '\0')
+    {
+        *p++ = '\0';
+        while (*p == ' ')
+            ++p;
+        if (*p != '\0')
+            return 0;              /* extra operands */
+    }
+
+    *first = a;
+    *second = b;
+    return 1;
+}
+
+static void command_mv(char* argument)
+{
+    char* from = 0;
+    char* to = 0;
+    if (!split_two_args(argument, &from, &to))
+    {
+        uart_puts("mv: usage: mv <source> <destination>\r\n");
+        return;
+    }
+
+    int rc = fs_rename(from, to, vfs_cwd());
+    if (rc == 0)
+    {
+        /* Moving the directory we stand in keeps the id valid, so cwd is fine. */
+        uart_puts("Moved.\r\n");
+        return;
+    }
+    if (rc == -1) uart_puts("mv: source not found\r\n");
+    else if (rc == -2) uart_puts("mv: destination already exists\r\n");
+    else if (rc == -3) uart_puts("mv: cannot move the root directory\r\n");
+    else if (rc == -4) uart_puts("mv: cannot move a directory into itself\r\n");
+    else if (rc == -5) uart_puts("mv: invalid destination\r\n");
+    else uart_puts("mv: failed (disk error)\r\n");
+}
+
+#define CP_MAX_SIZE 65536ULL
+static uint8_t cp_buffer[CP_MAX_SIZE];
+
+static void command_cp(char* argument)
+{
+    char* from = 0;
+    char* to = 0;
+    if (!split_two_args(argument, &from, &to))
+    {
+        uart_puts("cp: usage: cp <source> <destination>\r\n");
+        return;
+    }
+
+    int cwd = vfs_cwd();
+    int src = fs_resolve(from, cwd);
+    if (src < 0)
+    {
+        uart_puts("cp: source not found\r\n");
+        return;
+    }
+    if (fs_get_type(src) != FS_FILE)
+    {
+        uart_puts("cp: source is a directory\r\n");
+        return;
+    }
+
+    /* Destination directory => copy into it under the source's name. */
+    char target[200];
+    int dst = fs_resolve(to, cwd);
+    if (dst >= 0 && fs_get_type(dst) == FS_DIR)
+    {
+        int n = str_len(to);
+        const char* name = fs_get_name(src);
+        if (n + 1 + str_len(name) >= (int)sizeof(target))
+        {
+            uart_puts("cp: path too long\r\n");
+            return;
+        }
+        str_copy(target, to, (int)sizeof(target));
+        if (n > 0 && target[n - 1] != '/')
+            target[n++] = '/';
+        str_copy(target + n, name, (int)sizeof(target) - n);
+    }
+    else
+    {
+        if (str_len(to) >= (int)sizeof(target))
+        {
+            uart_puts("cp: path too long\r\n");
+            return;
+        }
+        str_copy(target, to, (int)sizeof(target));
+    }
+
+    int existing = fs_resolve(target, cwd);
+    if (existing == src)
+    {
+        uart_puts("cp: source and destination are the same file\r\n");
+        return;
+    }
+    if (existing >= 0 && fs_get_type(existing) == FS_DIR)
+    {
+        uart_puts("cp: destination is a directory\r\n");
+        return;
+    }
+
+    uint64_t size = 0;
+    int rc = fs_read_file(from, cwd, cp_buffer, CP_MAX_SIZE, &size);
+    if (rc == -3)
+    {
+        uart_puts("cp: file too large (max 65536 bytes)\r\n");
+        return;
+    }
+    if (rc != 0)
+    {
+        uart_puts("cp: read failed\r\n");
+        return;
+    }
+    if (size == 0)
+    {
+        if (fs_write_data(target, cwd, cp_buffer, 0) != 0)
+        {
+            uart_puts("cp: write failed\r\n");
+            return;
+        }
+    }
+    else if (fs_write_data(target, cwd, cp_buffer, size) != 0)
+    {
+        uart_puts("cp: write failed\r\n");
+        return;
+    }
+
+    uart_puts("Copied ");
+    print_u64(size);
+    uart_puts(" bytes.\r\n");
+}
+
 static void command_rm(
     const char* arg
 )
@@ -855,6 +1015,7 @@ static void command_apps()
 {
     uart_puts("Bundled user programs\r\n----------------------\r\n");
     uart_puts("/bin/init.elf    - userspace self-test/demo\r\n");
+    uart_puts("/bin/nano.elf    - text editor (command: nano)\r\n");
 }
 
 static void command_uname()
@@ -992,7 +1153,7 @@ void execute_command(
 
     if (str_equal(command, "ls"))
     {
-        vfs_ls();
+        vfs_ls(argument);
         return;
     }
 
@@ -1035,6 +1196,18 @@ void execute_command(
     if (str_equal(command, "rm"))
     {
         command_rm(argument);
+        return;
+    }
+
+    if (str_equal(command, "cp"))
+    {
+        command_cp(argument);
+        return;
+    }
+
+    if (str_equal(command, "mv"))
+    {
+        command_mv(argument);
         return;
     }
 
@@ -1112,6 +1285,28 @@ void execute_command(
     if (str_equal(command, "user"))
     {
         user_execute("/bin/init.elf");
+        return;
+    }
+
+    if (str_equal(command, "nano"))
+    {
+        if (argument == 0 || argument[0] == '\0')
+        {
+            uart_puts("nano: usage: nano <file>\r\n");
+            return;
+        }
+        if (str_len(argument) >= USER_ARGS_MAX)
+        {
+            uart_puts("nano: file name too long\r\n");
+            return;
+        }
+        int existing = fs_resolve(argument, vfs_cwd());
+        if (existing >= 0 && fs_get_type(existing) == FS_DIR)
+        {
+            uart_puts("nano: is a directory\r\n");
+            return;
+        }
+        user_execute("/bin/nano.elf", argument);
         return;
     }
 

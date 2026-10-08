@@ -6,6 +6,8 @@
 #include "user.h"
 #include "mmu.h"
 #include "version.h"
+#include "fs.h"
+#include "vfs.h"
 
 extern "C" void user_exit_return();
 
@@ -37,6 +39,25 @@ int syscall_user_pointer_ok(const void* pointer, uint64_t length)
 int syscall_user_pointer_ok_write(const void* pointer, uint64_t length)
 {
     return mmu_user_pointer_ok((uint64_t)pointer, length, 1);
+}
+
+
+/* Copy a NUL-terminated path out of user memory, byte by byte, so every
+   byte is validated against the EL0 page permissions. */
+static int copy_path(const char* src, char* dst, int from_user)
+{
+    if (src == 0)
+        return -1;
+    for (uint64_t i = 0; i < SYSCALL_PATH_MAX; ++i)
+    {
+        if (from_user && !syscall_user_pointer_ok(src + i, 1))
+            return -1;
+        char c = src[i];
+        dst[i] = c;
+        if (c == '\0')
+            return 0;
+    }
+    return -1; /* no terminator within SYSCALL_PATH_MAX */
 }
 
 void syscall_dispatch(ExceptionFrame* frame, int from_user)
@@ -209,6 +230,95 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
         case SYS_TIME_MS:
             result = timer_millis();
             break;
+
+        case SYS_GETARG:
+        {
+            char* dst = (char*)frame->x[0];
+            uint64_t cap = frame->x[1];
+            if (cap == 0 || cap > SYSCALL_FILE_MAX)
+            {
+                result = (uint64_t)-22;
+                break;
+            }
+            if (dst == 0 || (from_user && !syscall_user_pointer_ok_write(dst, cap)))
+            {
+                result = (uint64_t)-14;
+                break;
+            }
+            const char* args = user_get_args();
+            uint64_t n = 0;
+            while (args[n] && n + 1 < cap) { dst[n] = args[n]; ++n; }
+            dst[n] = '\0';
+            result = n;
+            break;
+        }
+
+        case SYS_FILE_READ:
+        {
+            char path[SYSCALL_PATH_MAX];
+            uint8_t* buf = (uint8_t*)frame->x[1];
+            uint64_t cap = frame->x[2];
+
+            if (copy_path((const char*)frame->x[0], path, from_user) != 0)
+            {
+                result = (uint64_t)-14;
+                break;
+            }
+            if (cap == 0 || cap > SYSCALL_FILE_MAX)
+            {
+                result = (uint64_t)-22;
+                break;
+            }
+            if (buf == 0 || (from_user && !syscall_user_pointer_ok_write(buf, cap)))
+            {
+                result = (uint64_t)-14;
+                break;
+            }
+            uint64_t size = 0;
+            int rc = fs_read_file(path, vfs_cwd(), buf, cap, &size);
+            if (rc != 0)
+            {
+                /* -27 (EFBIG): exists but does not fit; callers must not
+                   mistake it for "missing" and overwrite the file. */
+                result = rc == -3 ? (uint64_t)-27 : (uint64_t)-2;
+                break;
+            }
+            result = size;
+            break;
+        }
+
+        case SYS_FILE_WRITE:
+        {
+            char path[SYSCALL_PATH_MAX];
+            const uint8_t* buf = (const uint8_t*)frame->x[1];
+            uint64_t len = frame->x[2];
+            static const uint8_t empty = 0;
+
+            if (copy_path((const char*)frame->x[0], path, from_user) != 0)
+            {
+                result = (uint64_t)-14;
+                break;
+            }
+            if (len > SYSCALL_FILE_MAX)
+            {
+                result = (uint64_t)-22;
+                break;
+            }
+            if (len == 0)
+                buf = &empty;
+            else if (buf == 0 || (from_user && !syscall_user_pointer_ok(buf, len)))
+            {
+                result = (uint64_t)-14;
+                break;
+            }
+            if (fs_write_data(path, vfs_cwd(), buf, len) != 0)
+            {
+                result = (uint64_t)-5;
+                break;
+            }
+            result = len;
+            break;
+        }
 
         default:
             result = (uint64_t)-38;

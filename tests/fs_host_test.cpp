@@ -44,5 +44,26 @@ int main(){
     if(fs_read_file("/storage/home/test.bin",fs_get_root(),dst,900,&got)!=0||got!=900||!same(src,dst,900))fail("remount persistence");
     if(fs_rm("/storage/home/test.bin",fs_get_root())!=0)fail("remove");
     fs_init(); if(fs_resolve("/storage/home/test.bin",fs_get_root())>=0)fail("remove persistence");
+    /* ---- fs_rename (mv) ---- */
+    {
+        int home=fs_resolve("/storage/home",fs_get_root());
+        if(fs_touch("a.txt",home)<0)fail("rename: touch");
+        if(fs_write_data("a.txt",home,src,300)!=0)fail("rename: write");
+        if(fs_rename("a.txt","b.txt",home)!=0)fail("rename: same dir");
+        if(fs_resolve("a.txt",home)>=0||fs_resolve("b.txt",home)<0)fail("rename: result");
+        if(fs_mkdir("/mvdir",fs_get_root())<0)fail("rename: mkdir");
+        if(fs_rename("b.txt","/mvdir",home)!=0)fail("rename: into dir");
+        got=0; if(fs_read_file("/mvdir/b.txt",fs_get_root(),dst,900,&got)!=0||got!=300||!same(src,dst,300))fail("rename: data kept");
+        if(fs_mkdir("/mvdir/sub",fs_get_root())<0)fail("rename: mkdir sub");
+        if(fs_rename("/mvdir","/mvdir/sub",fs_get_root())!=-4)fail("rename: into itself");
+        if(fs_touch("/x.txt",fs_get_root())<0)fail("rename: touch x");
+        if(fs_rename("/x.txt","/mvdir/b.txt",fs_get_root())!=-2)fail("rename: exists");
+        if(fs_rename("/",  "/zzz",fs_get_root())!=-3)fail("rename: root");
+        if(fs_rename("/nope","/zzz",fs_get_root())!=-1)fail("rename: missing");
+        if(fs_rename("/x.txt","/nodir/y.txt",fs_get_root())!=-5)fail("rename: bad parent");
+        if(fs_rename("/mvdir","/renamed",fs_get_root())!=0)fail("rename: dir");
+        fs_init();
+        if(fs_resolve("/renamed/b.txt",fs_get_root())<0||fs_resolve("/mvdir",fs_get_root())>=0)fail("rename persistence");
+    }
     fclose(g_file); remove(path); puts("FS HOST TEST: PASS"); return 0;
 }

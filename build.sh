@@ -165,7 +165,11 @@ for f in "${MODULES[@]}"; do
         "$CXX" "${CXXFLAGS[@]}" -c "$(src_of "$f")" -o "build/$f.o"
     else
         printf '.'
-        "$CXX" "${CXXFLAGS[@]}" -c "$(src_of "$f")" -o "build/$f.o" > /dev/null 2>&1
+        if ! "$CXX" "${CXXFLAGS[@]}" -c "$(src_of "$f")" -o "build/$f.o"; then
+            echo
+            echo "ERROR: gagal compile $f.cpp" >&2
+            exit 1
+        fi
     fi
 done
 [[ "$VERBOSE" -eq 0 ]] && printf ' done\n'
@@ -232,7 +236,7 @@ printf ' Tests : FS PASS | NET PASS | MEM PASS | SCHED PASS | SYSCALL PASS | DIA
 
 if [[ "$RUN_QEMU" -eq 1 ]]; then
     if command -v "${QEMU:-qemu-system-aarch64}" >/dev/null 2>&1; then
-        exec./run.sh
+        exec ./run.sh
     else
         echo "ERROR: QEMU not found. Build succeeded, but --run was requested." >&2
         exit 1

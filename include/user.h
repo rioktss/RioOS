@@ -3,7 +3,10 @@
 
 #include "types.h"
 
-void user_execute(const char* path);
+#define USER_ARGS_MAX 128
+
+void user_execute(const char* path, const char* args = 0);
+const char* user_get_args();
 int user_current_pid();
 void user_set_exit_code(int code);
 

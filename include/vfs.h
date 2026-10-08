@@ -6,7 +6,10 @@ void vfs_init();
 int vfs_cwd();
 
 void vfs_pwd();
-void vfs_ls();
+void vfs_ls(const char* path = 0);
+
+/* Absolute path of the current directory into out (always NUL-terminated). */
+void vfs_get_path(char* out, int capacity);
 void vfs_tree();
 
 int vfs_cd(

@@ -5,17 +5,28 @@
 #include "mmu.h"
 #include "uart.h"
 
-extern "C" uint64_t user_return_pc = 0;
+extern "C" { uint64_t user_return_pc = 0; }
 static int current_user_pid = -1;
 static int last_exit_code = 0;
 
+static char user_args[USER_ARGS_MAX];
+
 int user_current_pid() { return current_user_pid; }
+const char* user_get_args() { return user_args; }
 void user_set_exit_code(int code) { last_exit_code = code; }
 
-void user_execute(const char* path)
+void user_execute(const char* path, const char* args)
 {
     if (!path || !path[0]) { uart_puts("exec: missing path\r\n"); return; }
     if (!mmu_enabled()) { uart_puts("exec: MMU is disabled\r\n"); return; }
+
+    user_args[0] = '\0';
+    if (args)
+    {
+        uint64_t n = 0;
+        while (args[n] && n < USER_ARGS_MAX - 1) { user_args[n] = args[n]; ++n; }
+        user_args[n] = '\0';
+    }
 
     uint64_t entry=0;
     if (elf_load(path,&entry)!=0) return;
@@ -38,5 +49,6 @@ void user_execute(const char* path)
     if(last_exit_code==0)uart_puts("0"); else {int v=last_exit_code<0?-last_exit_code:last_exit_code;char b[12];int n=0;while(v&&n<11){b[n++]=(char)('0'+v%10);v/=10;}if(last_exit_code<0)uart_putc('-');while(n)uart_putc(b[--n]);}
     uart_puts("\r\n");
     current_user_pid=-1;
+    user_args[0] = '\0';
     mmu_user_prepare();
 }

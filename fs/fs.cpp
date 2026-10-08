@@ -775,6 +775,90 @@ int fs_rm(const char* path, int cwd)
     return storage_flush();
 }
 
+int fs_rename(const char* from, const char* to, int cwd)
+{
+    int id = fs_resolve(from, cwd);
+    if (id < 0) return -1;
+    if (id == root_id) return -3;
+    if (to == 0 || to[0] == '\0') return -5;
+
+    int parent = -1;
+    const char* base = 0;
+    char temp[192];
+
+    int dest = fs_resolve(to, cwd);
+    if (dest >= 0)
+    {
+        if (nodes[dest].type != FS_DIR)
+            return dest == id ? 0 : -2;
+        parent = dest;                 /* move into an existing directory */
+        base = nodes[id].name;
+    }
+    else
+    {
+        if (str_len(to) >= (int)sizeof(temp)) return -5;
+        str_copy(temp, to, sizeof(temp));
+        int len = str_len(temp);
+        while (len > 1 && temp[len - 1] == '/')
+            temp[--len] = '\0';
+
+        int slash = -1;
+        for (int i = 0; i < len; ++i)
+            if (temp[i] == '/') slash = i;
+
+        if (slash < 0)
+        {
+            parent = cwd;
+            base = temp;
+        }
+        else if (slash == 0)
+        {
+            parent = root_id;
+            base = temp + 1;
+        }
+        else
+        {
+            char parent_path[192];
+            for (int i = 0; i < slash; ++i) parent_path[i] = temp[i];
+            parent_path[slash] = '\0';
+            parent = fs_resolve(parent_path, cwd);
+            base = temp + slash + 1;
+        }
+    }
+
+    if (parent < 0 || parent >= FS_MAX_NODES || !nodes[parent].used ||
+        nodes[parent].type != FS_DIR)
+        return -5;
+    if (base[0] == '\0' || str_equal(base, ".") || str_equal(base, "..") ||
+        str_len(base) >= FS_NAME_SIZE)
+        return -5;
+
+    /* A directory may not be moved into itself or one of its descendants. */
+    int hops = 0;
+    for (int p = parent; p >= 0 && hops <= FS_MAX_NODES; p = nodes[p].parent, ++hops)
+    {
+        if (p == id) return -4;
+        if (p == root_id) break;
+    }
+
+    int existing = find_child(parent, base);
+    if (existing == id) return 0;      /* already there */
+    if (existing >= 0) return -2;
+
+    char new_name[FS_NAME_SIZE];
+    str_copy(new_name, base, FS_NAME_SIZE);
+
+    FsNode old; copy_node(&old, &nodes[id]);
+    nodes[id].parent = parent;
+    str_copy(nodes[id].name, new_name, FS_NAME_SIZE);
+    if (save_inode(id) != 0)
+    {
+        copy_node(&nodes[id], &old);
+        return -6;
+    }
+    return storage_flush() == 0 ? 0 : -6;
+}
+
 uint64_t fs_file_size(int id)
 {
     if (id < 0 || id >= FS_MAX_NODES || !nodes[id].used) return 0;
