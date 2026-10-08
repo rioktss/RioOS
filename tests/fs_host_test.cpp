@@ -42,7 +42,21 @@ int main(){
     fs_init();
     for(int i=0;i<900;i++)dst[i]=0; got=0;
     if(fs_read_file("/storage/home/test.bin",fs_get_root(),dst,900,&got)!=0||got!=900||!same(src,dst,900))fail("remount persistence");
+    if(fs_get_mode(fs_resolve("/storage/home/test.bin",fs_get_root())) != 0644U) fail("default file mode");
+    {
+        int id = fs_resolve("/storage/home/test.bin", fs_get_root());
+        if (fs_set_mode(id, 0751U) != 0) fail("chmod mode set");
+        fs_init();
+        id = fs_resolve("/storage/home/test.bin", fs_get_root());
+        if (fs_get_mode(id) != 0751U) fail("chmod mode persistence");
+        if (fs_total_sectors() != SECTORS) fail("disk sector total");
+        if (fs_used_sectors() == 0) fail("disk sector usage");
+    }
     if(fs_rm("/storage/home/test.bin",fs_get_root())!=0)fail("remove");
+    if(fs_mkdir_p("/storage/home/a/b/c",fs_get_root())<0)fail("mkdir -p");
+    if(fs_touch("/storage/home/a/.hidden",fs_get_root())<0)fail("hidden touch");
+    if(fs_rm_recursive("/storage/home/a",fs_get_root())!=0)fail("recursive remove");
+    if(fs_resolve("/storage/home/a/b/c",fs_get_root())>=0)fail("recursive remove persistence");
     fs_init(); if(fs_resolve("/storage/home/test.bin",fs_get_root())>=0)fail("remove persistence");
     /* ---- fs_rename (mv) ---- */
     {

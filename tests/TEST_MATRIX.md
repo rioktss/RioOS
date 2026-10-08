@@ -8,8 +8,8 @@
 - No unresolved kernel ELF symbols
 - Exception vector table exactly 2048 bytes and 2048-byte aligned
 - Persistent filesystem host create/write/read/remount/delete test
-- VFS host test (`tests/vfs_host_test.cpp`): `ls <dir>` with sizes, cwd path, `rm .` keeps cwd valid
-- Filesystem host test also covers `fs_rename` (mv)
+- VFS host test (`tests/vfs_host_test.cpp`): `ls <dir>` with sizes, cwd path, `rm .` keeps cwd valid, VFS recursive remove path
+- Filesystem host test also covers `fs_rename` (mv), mkdir-p, recursive remove, hidden files and default modes
 - Network parser host test (`tests/net_host_test.cpp`) (valid/invalid IPv4 input)
 - Disk image/superblock static verification
 - ELF AArch64/LOAD/W+X/entry-permission static verification

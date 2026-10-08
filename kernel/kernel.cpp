@@ -14,6 +14,7 @@
 #include "netstack.h"
 #include "interrupt.h"
 #include "page_alloc.h"
+#include "security.h"
 #include "version.h"
 
 extern "C" void kernel_main()
@@ -21,7 +22,7 @@ extern "C" void kernel_main()
     uart_puts(
         "\r\n"
         "============================\r\n"
-        "        MyKernel v" MYKERNEL_VERSION_STRING "\r\n"
+        "        RioOS v" MYKERNEL_VERSION_STRING "\r\n"
         "============================\r\n"
         "ARM64 Bare-Metal Kernel\r\n"
         "QEMU virt machine\r\n"
@@ -50,6 +51,7 @@ extern "C" void kernel_main()
     /* The counter is needed by every timeout path, so bring it up early. */
     uart_puts("[4] Initializing timer...\r\n");
     timer_init();
+    /* Timer starts OFF. Login/authentication never starts timer IRQs. */
 
     uart_puts("[5] Initializing MMU...\r\n");
     mmu_init();
@@ -68,6 +70,7 @@ extern "C" void kernel_main()
 
     uart_puts("[10] Initializing process manager...\r\n");
     process_init();
+    security_init();
 
     uart_puts("[11] Initializing keyboard...\r\n");
     keyboard_init();
@@ -85,15 +88,13 @@ extern "C" void kernel_main()
 
 uart_puts(
     "\r\n"
-    "MyKernel initialization complete.\r\n"
-    "Welcome to MyKernel!\r\n"
+    "RioOS initialization complete.\r\n"
+    "Welcome to RioOS!\r\n"
     "Type 'help' to get started.\r\n"
     "\r\n"
 );
 
 shell();
-
-    shell();
 
     while (1)
         asm volatile("wfe");

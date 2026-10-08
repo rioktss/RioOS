@@ -31,6 +31,36 @@ for i in range(phnum):
         if p_flags&1 and vaddr <= entry < end: entry_exec=True
 assert found_x
 assert entry_exec, 'ELF entry is not inside an executable PT_LOAD'
+
+# nano must be a real AArch64 user ELF with the same safe PT_LOAD layout.
+nano=root/'build/nano.elf'
+assert nano.is_file() and nano.stat().st_size>0
+nb=nano.read_bytes(); assert nb[:4]==b'\x7fELF' and nb[4]==2 and nb[5]==1
+assert struct.unpack_from('<H',nb,18)[0]==183
+nentry=struct.unpack_from('<Q',nb,24)[0]; nphoff=struct.unpack_from('<Q',nb,32)[0]; nphentsize,nphnum=struct.unpack_from('<HH',nb,54)
+assert nphentsize==56 and 0< nphnum <= 8 and nentry==0x47000000
+nranges=[]; nexec=False; nentry_exec=False
+for i in range(nphnum):
+    off=nphoff+i*nphentsize
+    pt,pf=struct.unpack_from('<II',nb,off)
+    va=struct.unpack_from('<Q',nb,off+16)[0]
+    fs=struct.unpack_from('<Q',nb,off+32)[0]
+    ms=struct.unpack_from('<Q',nb,off+40)[0]
+    if pt==1:
+        assert fs<=ms and ms>0
+        assert (va & 0xFFF)==0
+        nranges.append((va,va+ms,pf))
+        if pf&1 and va==0x47000000: nexec=True
+        if pf&1 and va<=nentry<va+ms: nentry_exec=True
+assert nexec and nentry_exec
+for i,(a0,a1,_) in enumerate(nranges):
+    for j,(b0,b1,_) in enumerate(nranges):
+        if i<j: assert not (a0<b1 and b0<a1), 'nano PT_LOAD ranges overlap'
+
+# Userspace entry must quiesce timer IRQs; normal exec is not allowed to enable them.
+user_src=(root/'process/user.cpp').read_text()
+assert 'timer_stop();' in user_src and 'interrupt_timer_line_disable();' in user_src and 'interrupt_disable();' in user_src
+assert 'interrupt_enable();' not in user_src
 for i,(a0,a1,_) in enumerate(load_ranges):
     for j,(b0,b1,_) in enumerate(load_ranges):
         if i<j:

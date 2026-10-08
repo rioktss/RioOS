@@ -2,6 +2,12 @@
 #include "storage.h"
 #include "uart.h"
 #include "string.h"
+#include "rtc.h"
+
+static uint64_t rtc_now()
+{
+    return rtc_get_epoch();
+}
 
 #define FS_MAGIC            0x4D4B4653U
 #define FS_VERSION          1U
@@ -53,6 +59,8 @@ struct FsNode
     int used;
     int type;
     int parent;
+    uint32_t mode;
+    uint64_t mtime;
     uint64_t size;
     uint64_t first_sector;
     uint32_t sector_count;
@@ -66,6 +74,18 @@ static int root_id = -1;
 static int mounted = 0;
 static uint8_t io_buffer[FS_SECTOR_SIZE] __attribute__((aligned(16)));
 static void clear_bytes(void* ptr, uint64_t size);
+static uint32_t default_mode_for_type(int type)
+{
+    return type == FS_DIR ? 0755U : 0644U;
+}
+
+static void set_mode_and_time_defaults(FsNode* n)
+{
+    if (n == 0) return;
+    if (n->mode == 0) n->mode = default_mode_for_type(n->type);
+    if (n->mtime == 0) n->mtime = rtc_now();
+}
+
 static void ram_fallback()
 {
     mounted = 0;
@@ -75,6 +95,8 @@ static void ram_fallback()
     nodes[0].used = 1;
     nodes[0].type = FS_DIR;
     nodes[0].parent = -1;
+    nodes[0].mode = 0755U;
+    nodes[0].mtime = rtc_now();
     str_copy(nodes[0].name, "/", FS_NAME_SIZE);
 }
 
@@ -92,6 +114,8 @@ static void copy_node(FsNode* dst, const FsNode* src)
     dst->used = src->used;
     dst->type = src->type;
     dst->parent = src->parent;
+    dst->mode = src->mode;
+    dst->mtime = src->mtime;
     dst->size = src->size;
     dst->first_sector = src->first_sector;
     dst->sector_count = src->sector_count;
@@ -137,6 +161,10 @@ static void node_to_disk(const FsNode* n, DiskInode* d)
     d->size = n->size;
     d->first_sector = n->first_sector;
     d->sector_count = n->sector_count;
+    for (int i = 0; i < 4; ++i)
+        d->reserved[i] = (uint8_t)((n->mode >> (i * 8)) & 0xFFU);
+    for (int i = 0; i < 8; ++i)
+        d->reserved[4 + i] = (uint8_t)((n->mtime >> (i * 8)) & 0xFFULL);
     str_copy(d->name, n->name, FS_NAME_SIZE);
 }
 
@@ -149,6 +177,13 @@ static void disk_to_node(const DiskInode* d, FsNode* n)
     n->size = d->size;
     n->first_sector = d->first_sector;
     n->sector_count = d->sector_count;
+    n->mode = 0;
+    for (int i = 0; i < 4; ++i)
+        n->mode |= (uint32_t)d->reserved[i] << (i * 8);
+    n->mtime = 0;
+    for (int i = 0; i < 8; ++i)
+        n->mtime |= (uint64_t)d->reserved[4 + i] << (i * 8);
+    if (n->mode == 0) n->mode = default_mode_for_type(n->type);
     str_copy(n->name, d->name, FS_NAME_SIZE);
 }
 
@@ -223,6 +258,8 @@ static int load_all_inodes()
             for (uint64_t i = 0; i < sizeof(d); ++i)
                 ((uint8_t*)&d)[i] = io_buffer[offset + i];
             disk_to_node(&d, &nodes[(int)(s * 4ULL + slot)]);
+            if (nodes[(int)(s * 4ULL + slot)].used)
+                set_mode_and_time_defaults(&nodes[(int)(s * 4ULL + slot)]);
         }
     }
     return 0;
@@ -356,6 +393,8 @@ static int format_fs()
     nodes[0].used = 1;
     nodes[0].type = FS_DIR;
     nodes[0].parent = -1;
+    nodes[0].mode = 0755U;
+    nodes[0].mtime = rtc_now();
     str_copy(nodes[0].name, "/", FS_NAME_SIZE);
     if (save_inode(0) != 0)
         return -1;
@@ -439,6 +478,8 @@ static int create_node(int type, const char* name, int parent)
     nodes[id].used = 1;
     nodes[id].type = type;
     nodes[id].parent = parent;
+    nodes[id].mode = default_mode_for_type(type);
+    nodes[id].mtime = rtc_now();
     str_copy(nodes[id].name, name, FS_NAME_SIZE);
     if (save_inode(id) != 0)
     {
@@ -590,6 +631,8 @@ void fs_init()
     int home_dir = ensure_dir_path("/storage/home");
     (void)home_dir;
     ensure_dir_path("/bin");
+    ensure_dir_path("/home");
+    ensure_dir_path("/home/user");
 }
 
 int fs_get_root() { return root_id; }
@@ -626,7 +669,59 @@ int fs_resolve(const char* path, int cwd)
 }
 
 int fs_mkdir(const char* path, int cwd) { return create_path(path, cwd, FS_DIR); }
-int fs_touch(const char* path, int cwd) { return create_path(path, cwd, FS_FILE); }
+
+int fs_touch(const char* path, int cwd)
+{
+    int existing = fs_resolve(path, cwd);
+    if (existing >= 0)
+    {
+        if (nodes[existing].type != FS_FILE) return -2;
+        nodes[existing].mtime = rtc_now();
+        return save_inode(existing) == 0 ? -2 : -4;
+    }
+    return create_path(path, cwd, FS_FILE);
+}
+
+int fs_mkdir_p(const char* path, int cwd)
+{
+    if (path == 0 || path[0] == '\0') return -1;
+    char temp[192];
+    if (str_len(path) >= (int)sizeof(temp)) return -1;
+    str_copy(temp, path, sizeof(temp));
+
+    int current = (temp[0] == '/') ? root_id : cwd;
+    int i = (temp[0] == '/') ? 1 : 0;
+    while (temp[i])
+    {
+        while (temp[i] == '/') ++i;
+        if (!temp[i]) break;
+        char part[FS_NAME_SIZE];
+        int p = 0;
+        while (temp[i] && temp[i] != '/')
+        {
+            if (p >= FS_NAME_SIZE - 1) return -1;
+            part[p++] = temp[i++];
+        }
+        part[p] = '\0';
+        if (str_equal(part, ".")) continue;
+        if (str_equal(part, ".."))
+        {
+            if (current != root_id && nodes[current].parent >= 0) current = nodes[current].parent;
+            continue;
+        }
+        int child = find_child(current, part);
+        if (child >= 0)
+        {
+            if (nodes[child].type != FS_DIR) return -2;
+            current = child;
+            continue;
+        }
+        int made = create_node(FS_DIR, part, current);
+        if (made < 0) return made;
+        current = made;
+    }
+    return current;
+}
 
 int fs_write_data(const char* path, int cwd, const uint8_t* data, uint64_t size)
 {
@@ -674,6 +769,7 @@ int fs_write_data(const char* path, int cwd, const uint8_t* data, uint64_t size)
     nodes[id].size = size;
     nodes[id].first_sector = new_first;
     nodes[id].sector_count = need;
+    nodes[id].mtime = rtc_now();
 
     /* Commit inode first while both old and new extents are still allocated. */
     if (save_inode(id) != 0)
@@ -747,6 +843,47 @@ int fs_cat(const char* path, int cwd)
     return 0;
 }
 
+int fs_cat_numbered(const char* path, int cwd)
+{
+    int id = fs_resolve(path, cwd);
+    if (id < 0) return -1;
+    if (nodes[id].type != FS_FILE) return -2;
+
+    uint64_t remaining = nodes[id].size;
+    uint64_t line = 1;
+    int at_line_start = 1;
+    for (uint32_t s = 0; s < nodes[id].sector_count; ++s)
+    {
+        if (storage_read_sector(nodes[id].first_sector + s, io_buffer) != 0) return -3;
+        uint64_t take = remaining > FS_SECTOR_SIZE ? FS_SECTOR_SIZE : remaining;
+        for (uint64_t i = 0; i < take; ++i)
+        {
+            char c = (char)io_buffer[i];
+            if (at_line_start)
+            {
+                uint64_t value = line;
+                char digits[24];
+                int n = 0;
+                do { digits[n++] = (char)('0' + (value % 10ULL)); value /= 10ULL; } while (value && n < (int)sizeof(digits));
+                int pad = 6 - n;
+                while (pad > 0) { uart_putc(' '); --pad; }
+                while (n > 0) uart_putc(digits[--n]);
+                uart_puts("  ");
+                at_line_start = 0;
+            }
+            uart_putc(c);
+            if (c == '\n')
+            {
+                ++line;
+                at_line_start = 1;
+            }
+        }
+        remaining -= take;
+        if (remaining == 0) break;
+    }
+    return 0;
+}
+
 int fs_rm(const char* path, int cwd)
 {
     int id = fs_resolve(path, cwd);
@@ -773,6 +910,39 @@ int fs_rm(const char* path, int cwd)
         return -5;
 
     return storage_flush();
+}
+
+static int rm_node_recursive(int id)
+{
+    if (id < 0 || id >= FS_MAX_NODES || !nodes[id].used) return -1;
+    if (id == root_id) return -3;
+
+    /* Children are deleted before the parent. Re-query index 0 each time because
+       node slots are compacted logically by the used flag. */
+    while (1)
+    {
+        int child = -1;
+        for (int i = 0; i < FS_MAX_NODES; ++i)
+            if (nodes[i].used && nodes[i].parent == id) { child = i; break; }
+        if (child < 0) break;
+        int rc = rm_node_recursive(child);
+        if (rc != 0) return rc;
+    }
+
+    FsNode old; copy_node(&old, &nodes[id]);
+    clear_bytes(&nodes[id], sizeof(nodes[id]));
+    if (save_inode(id) != 0) { copy_node(&nodes[id], &old); return -4; }
+    free_sectors(old.first_sector, old.sector_count);
+    if (write_bitmap() != 0) return -5;
+    return storage_flush();
+}
+
+int fs_rm_recursive(const char* path, int cwd)
+{
+    int id = fs_resolve(path, cwd);
+    if (id < 0) return -1;
+    if (id == root_id) return -3;
+    return rm_node_recursive(id);
 }
 
 int fs_rename(const char* from, const char* to, int cwd)
@@ -850,6 +1020,7 @@ int fs_rename(const char* from, const char* to, int cwd)
 
     FsNode old; copy_node(&old, &nodes[id]);
     nodes[id].parent = parent;
+    nodes[id].mtime = rtc_now();
     str_copy(nodes[id].name, new_name, FS_NAME_SIZE);
     if (save_inode(id) != 0)
     {
@@ -901,4 +1072,45 @@ int fs_get_child(int id, int index)
     }
     return -1;
 }
+uint32_t fs_get_mode(int id)
+{
+    if (id < 0 || id >= FS_MAX_NODES || !nodes[id].used) return 0;
+    return nodes[id].mode;
+}
+
+uint64_t fs_get_mtime(int id)
+{
+    if (id < 0 || id >= FS_MAX_NODES || !nodes[id].used) return 0;
+    return nodes[id].mtime;
+}
+
+int fs_set_mode(int id, uint32_t mode)
+{
+    if (id < 0 || id >= FS_MAX_NODES || !nodes[id].used) return -1;
+    nodes[id].mode = mode & 0777U;
+    nodes[id].mtime = rtc_now();
+    return save_inode(id);
+}
+
+uint64_t fs_total_sectors()
+{
+    return disk_sectors;
+}
+
+uint64_t fs_used_sectors()
+{
+    uint64_t used = 0;
+    for (int i = 0; i < FS_MAX_NODES; ++i)
+        if (nodes[i].used && nodes[i].type == FS_FILE)
+            used += nodes[i].sector_count;
+    return used;
+}
+
+int fs_set_mode_path(const char* path, int cwd, uint32_t mode)
+{
+    int id = fs_resolve(path, cwd);
+    if (id < 0) return -1;
+    return fs_set_mode(id, mode);
+}
+
 int fs_persistent() { return mounted; }

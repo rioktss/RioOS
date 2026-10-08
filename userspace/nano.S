@@ -109,13 +109,30 @@ nano_main:
     stp x19, x20, [sp, #16]
     mov x29, sp
 
-    /* Fetch the file name given on the command line ("nano <file>"). */
+    /* Fetch the file name given on the command line ("nano <file>").
+       Direct `exec /bin/nano.elf` is also valid: use a safe default file
+       name instead of entering the old error path. */
     adrp x0, fname
     add x0, x0, :lo12:fname
     mov x1, #128
     bl sys_getarg
     cmp x0, #0
-    b.le no_name
+    b.lt arg_error
+    b.ne have_name
+    adrp x0, fname
+    add x0, x0, :lo12:fname
+    adrp x1, default_name
+    add x1, x1, :lo12:default_name
+    mov x2, #16
+copy_default_name:
+    ldrb w3, [x1], #1
+    strb w3, [x0], #1
+    cbz w3, have_name
+    subs x2, x2, #1
+    b.ne copy_default_name
+    b arg_error
+
+have_name:
 
     /* Load the file (missing file => empty buffer). */
     adrp x0, fname
@@ -247,7 +264,7 @@ too_big:
     mov x0, #1
     b leave
 
-no_name:
+arg_error:
     adrp x0, msg_noname
     add x0, x0, :lo12:msg_noname
     bl sys_puts
@@ -290,3 +307,5 @@ len:
     .quad 0
 fname:
     .skip 128
+default_name:
+    .asciz "untitled.txt"

@@ -4,4 +4,6 @@
 #define MYKERNEL_VERSION_MINOR 5
 #define MYKERNEL_VERSION_PATCH 1
 #define MYKERNEL_VERSION_STRING "1.5.1"
+
+void command_version();
 #endif

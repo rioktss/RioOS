@@ -442,3 +442,6 @@ The kernel, scheduler, interrupt subsystem, userspace, networking, filesystem, a
 License
 
 See ""LICENSE"" (LICENSE).
+## Unix-like shell additions
+
+`grep`, `find`, `history` + arrow recall, `date`, `du`, `df`, `wc`, `chmod`, `env`, `export`, `$VAR` expansion, Tab completion, `>`, `>>`, `<`, and `cat | grep` are included without enabling timer IRQs during normal shell use.

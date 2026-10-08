@@ -4,6 +4,8 @@
 #include "scheduler.h"
 #include "mmu.h"
 #include "uart.h"
+#include "timer.h"
+#include "interrupt.h"
 
 extern "C" { uint64_t user_return_pc = 0; }
 static int current_user_pid = -1;
@@ -20,6 +22,17 @@ void user_execute(const char* path, const char* args)
     if (!path || !path[0]) { uart_puts("exec: missing path\r\n"); return; }
     if (!mmu_enabled()) { uart_puts("exec: MMU is disabled\r\n"); return; }
 
+    /* Userspace is deliberately run with asynchronous timer IRQs quiesced.
+       Shell input is polling-based, and user syscalls do not require the
+       scheduler tick, so this avoids timer-driven re-entrancy entirely. */
+    timer_stop();
+    interrupt_timer_line_disable();
+    interrupt_disable();
+    timer_set_sched_tick(0);
+
+    /* Always start from a clean, non-userspace MMU state. */
+    mmu_user_prepare();
+
     user_args[0] = '\0';
     if (args)
     {
@@ -29,7 +42,22 @@ void user_execute(const char* path, const char* args)
     }
 
     uint64_t entry=0;
-    if (elf_load(path,&entry)!=0) return;
+    if (elf_load(path,&entry)!=0)
+    {
+        mmu_user_prepare();
+        uart_puts("exec: failed to load ELF: ");
+        uart_puts(path);
+        uart_puts("\r\n");
+        return;
+    }
+
+    if (entry < MMU_USER_BASE || entry >= MMU_USER_LIMIT ||
+        (entry & 3ULL) != 0)
+    {
+        uart_puts("exec: ELF entry is outside the user address space\r\n");
+        mmu_user_prepare();
+        return;
+    }
 
     int pid=process_create(path);
     if(pid<0){uart_puts("exec: process table full\r\n");mmu_user_prepare();return;}

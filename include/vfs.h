@@ -20,6 +20,10 @@ int vfs_mkdir(
     const char* path
 );
 
+int vfs_mkdir_p(
+    const char* path
+);
+
 int vfs_touch(
     const char* path
 );
@@ -33,7 +37,15 @@ int vfs_cat(
     const char* path
 );
 
+int vfs_cat_numbered(
+    const char* path
+);
+
 int vfs_rm(
+    const char* path
+);
+
+int vfs_rm_recursive(
     const char* path
 );
 

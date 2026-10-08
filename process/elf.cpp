@@ -113,11 +113,12 @@ int elf_load(const char* path, uint64_t* entry_out)
     int load_count = 0;
     int entry_executable = 0;
 
+    /* Validate the complete program-header set first. Do not partially map an
+       ELF image and only then discover a malformed later segment. */
     for (uint16_t i = 0; i < eh->phnum; ++i)
     {
         const Elf64_Phdr* ph = (const Elf64_Phdr*)(image + eh->phoff + (uint64_t)i * eh->phentsize);
-        if (ph->type != PT_LOAD)
-            continue;
+        if (ph->type != PT_LOAD) continue;
         ++load_count;
 
         if (ph->memsz < ph->filesz ||
@@ -140,12 +141,6 @@ int elf_load(const char* path, uint64_t* entry_out)
 
         if (!range_valid(ph->vaddr, ph->memsz, MMU_USER_BASE, MMU_USER_LIMIT))
             return -8;
-
-        for (uint64_t j = 0; j < ph->memsz; ++j)
-            ((uint8_t*)ph->vaddr)[j] = 0;
-
-        for (uint64_t j = 0; j < ph->filesz; ++j)
-            ((uint8_t*)ph->vaddr)[j] = image[ph->offset + j];
 
         uint32_t mode = 0;
         if (ph->flags & PF_R) mode |= 1U;
@@ -172,12 +167,6 @@ int elf_load(const char* path, uint64_t* entry_out)
             }
         }
 
-        if (mmu_user_set_range(ph->vaddr, end, mode) != 0)
-        {
-            uart_puts("ELF: page permission setup failed.\r\n");
-            return -9;
-        }
-
         if ((ph->flags & PF_X) != 0 &&
             eh->entry >= ph->vaddr && eh->entry < end)
             entry_executable = 1;
@@ -202,6 +191,30 @@ int elf_load(const char* path, uint64_t* entry_out)
     {
         uart_puts("ELF: entry point is not executable.\r\n");
         return -14;
+    }
+
+    /* All segments are now known-good. Map and populate them in a clean pass. */
+    for (uint16_t i = 0; i < eh->phnum; ++i)
+    {
+        const Elf64_Phdr* ph = (const Elf64_Phdr*)(image + eh->phoff + (uint64_t)i * eh->phentsize);
+        if (ph->type != PT_LOAD) continue;
+        uint64_t end = ph->vaddr + ph->memsz;
+        uint32_t mode = 0;
+        if (ph->flags & PF_R) mode |= 1U;
+        if (ph->flags & PF_W) mode |= 2U;
+        if (ph->flags & PF_X) mode |= 4U;
+        if ((mode & 1U) == 0 && (mode & 2U) == 0 && (mode & 4U) == 0) mode = 1U;
+
+        for (uint64_t j = 0; j < ph->memsz; ++j)
+            ((uint8_t*)ph->vaddr)[j] = 0;
+        for (uint64_t j = 0; j < ph->filesz; ++j)
+            ((uint8_t*)ph->vaddr)[j] = image[ph->offset + j];
+        if (mmu_user_set_range(ph->vaddr, end, mode) != 0)
+        {
+            uart_puts("ELF: page permission setup failed.\r\n");
+            mmu_user_prepare();
+            return -9;
+        }
     }
 
     /* Give EL0 the private stack and make instruction fetches coherent. */

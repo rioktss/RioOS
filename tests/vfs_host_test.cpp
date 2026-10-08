@@ -39,10 +39,20 @@ int main()
     vfs_get_path(cwd, 6);                       /* truncates, stays terminated */
     CHECK(strlen(cwd) == 5 && cwd[5] == 0);
 
-    CHECK(vfs_write("note.txt", "hello") == 0);
+    CHECK(vfs_write("note.txt", "hello\nworld") == 0);
+    CHECK(vfs_touch("note.txt") == -2);
+    CHECK(vfs_touch(".hidden") >= 0);
     out_len = 0; out[0] = 0;
     vfs_ls();
-    CHECK(strstr(out, "note.txt") && strstr(out, "(5 bytes)"));
+    CHECK(strstr(out, "note.txt") && strstr(out, "(11 bytes)"));
+    CHECK(strstr(out, ".hidden") == 0);
+    out_len = 0; out[0] = 0;
+    vfs_ls("-la");
+    CHECK(strstr(out, ".hidden") != 0);
+    CHECK(strstr(out, "-rw-r--r--") != 0);
+    out_len = 0; out[0] = 0;
+    vfs_ls("-l /home");
+    CHECK(strstr(out, "drwxr-xr-x") != 0 && strstr(out, "user") != 0);
     out_len = 0; out[0] = 0;
     vfs_ls("/");
     CHECK(strstr(out, "[DIR]  storage") != 0);
@@ -52,6 +62,28 @@ int main()
     out_len = 0; out[0] = 0;
     vfs_ls("note.txt");
     CHECK(strstr(out, "[FILE] note.txt") != 0);
+
+    out_len = 0; out[0] = 0;
+    CHECK(vfs_cat_numbered("note.txt") == 0);
+    CHECK(strstr(out, "     1  hello\n     2  world") != 0);
+
+    CHECK(vfs_mkdir_p("/home/user/docs/projects") >= 0);
+    CHECK(vfs_cd("/home/user/docs/projects") == 0);
+    vfs_get_path(cwd, sizeof cwd);
+    CHECK(strcmp(cwd, "/home/user/docs/projects") == 0);
+    CHECK(vfs_touch("empty.txt") >= 0);
+    out_len = 0; out[0] = 0;
+    vfs_ls("-la ..");
+    CHECK(strstr(out, "projects") != 0 && strstr(out, "empty.txt") == 0);
+
+    out_len = 0; out[0] = 0;
+    vfs_ls("-R /home/user");
+    CHECK(strstr(out, "/home/user/docs:") != 0);
+    CHECK(strstr(out, "/home/user/docs/projects:") != 0);
+
+    /* recursive delete removes the full tree */
+    CHECK(vfs_rm_recursive("/home/user/docs") == 0);
+    CHECK(fs_resolve("/home/user/docs", vfs_cwd()) < 0);
 
     /* rm of the directory we stand in must move the shell to root */
     CHECK(vfs_mkdir("/tmpdir") >= 0 && vfs_cd("/tmpdir") == 0);

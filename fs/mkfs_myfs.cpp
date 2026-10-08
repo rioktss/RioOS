@@ -79,15 +79,25 @@ static bool fill_file(FILE* f,Inode* ins,uint8_t* bm,int parent,const char* name
     if(ins[id].used && old_count>=need && (!need || old_first>=DATA_START)){
         if(!write_host_file(f,old_first,need,data))return false;
         for(uint32_t s=need;s<old_count;s++) if(old_first+s<TOTAL_SECTORS) bit_set(bm,(uint32_t)old_first+s,false);
-        Inode n=ins[id]; n.used=1;n.type=0;n.parent=parent;n.size=size;n.first_sector=need?old_first:0;n.sector_count=need;ins[id]=n;
+        Inode n=ins[id]; n.used=1;n.type=0;n.parent=parent;n.size=size;n.first_sector=need?old_first:0;n.sector_count=need;
+        bool executable = std::strstr(name, ".elf") != nullptr;
+        n.reserved[0] = (unsigned char)(executable ? 0xED : 0xA4);
+        n.reserved[1] = 0x01; /* 0755 for .elf, otherwise 0644 */
+        ins[id]=n;
         return true;
     }
     int first=alloc_run(bm,need);if(need&&first<0)return false;
     if(need&&!write_host_file(f,(uint64_t)first,need,data))return false;
     if(ins[id].used&&old_count)for(uint32_t s=0;s<old_count;s++)if(old_first+s<TOTAL_SECTORS)bit_set(bm,(uint32_t)old_first+s,false);
-    Inode n{};n.used=1;n.type=0;n.parent=parent;n.size=size;n.first_sector=need?(uint64_t)first:0;n.sector_count=need;std::strncpy(n.name,name,NAME_SIZE-1);ins[id]=n;return true;
+    Inode n{};n.used=1;n.type=0;n.parent=parent;n.size=size;n.first_sector=need?(uint64_t)first:0;n.sector_count=need;
+    bool executable = std::strstr(name, ".elf") != nullptr;
+    n.reserved[0] = (unsigned char)(executable ? 0xED : 0xA4);
+    n.reserved[1] = 0x01; /* 0755 for .elf, otherwise 0644 */
+    std::strncpy(n.name,name,NAME_SIZE-1);ins[id]=n;return true;
 }
-static bool ensure_dir(Inode* ins,int parent,const char* name){int id=find_inode(ins,name,parent);if(id>=0)return ins[id].type==1;id=alloc_inode(ins);if(id<0)return false;Inode n{};n.used=1;n.type=1;n.parent=parent;std::strncpy(n.name,name,NAME_SIZE-1);ins[id]=n;return true;}
+static bool ensure_dir(Inode* ins,int parent,const char* name){int id=find_inode(ins,name,parent);if(id>=0)return ins[id].type==1;id=alloc_inode(ins);if(id<0)return false;Inode n{};n.used=1;n.type=1;n.parent=parent;
+    n.reserved[0]=0xED; n.reserved[1]=0x01; /* 0755 */
+    std::strncpy(n.name,name,NAME_SIZE-1);ins[id]=n;return true;}
 static const char* basename_of(const char* path){const char* p=strrchr(path,'/'); return p? p+1 : path;}
 
 int main(int argc,char**argv){
@@ -106,13 +116,16 @@ int main(int argc,char**argv){
     }else{
         if(save_super(f)==false){std::fprintf(stderr,"cannot write superblock\n");std::fclose(f);return 1;}
         std::memset(ins,0,sizeof(ins));std::memset(bm,0,sizeof(bm));for(uint32_t s=0;s<DATA_START;s++)bit_set(bm,s,true);
-        ins[0].used=1;ins[0].type=1;ins[0].parent=-1;std::strcpy(ins[0].name,"/");
+        ins[0].used=1;ins[0].type=1;ins[0].parent=-1;ins[0].reserved[0]=0xED;ins[0].reserved[1]=0x01;std::strcpy(ins[0].name,"/");
     }
     int root=0;
     if(!ins[root].used||ins[root].type!=1){std::fprintf(stderr,"invalid root inode\n");std::fclose(f);return 1;}
     if(!ensure_dir(ins,root,"storage")||!ensure_dir(ins,root,"bin")){std::fprintf(stderr,"cannot create directories\n");std::fclose(f);return 1;}
     int storage=find_inode(ins,"storage",root);
     if(!ensure_dir(ins,storage,"home")){std::fprintf(stderr,"cannot create home directory\n");std::fclose(f);return 1;}
+    if(!ensure_dir(ins,root,"home")){std::fprintf(stderr,"cannot create home directory\n");std::fclose(f);return 1;}
+    int home=find_inode(ins,"home",root);
+    if(!ensure_dir(ins,home,"user")){std::fprintf(stderr,"cannot create home/user directory\n");std::fclose(f);return 1;}
     int bin=find_inode(ins,"bin",root);
 
     for(int i=2;i<argc;i++){
