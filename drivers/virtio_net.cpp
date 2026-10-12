@@ -35,7 +35,9 @@
 #define DESC_NEXT                1U
 #define DESC_WRITE               2U
 #define QUEUE_MAX                8U
-#define NET_HDR_SIZE             12U
+/* We do not negotiate VIRTIO_NET_F_MRG_RXBUF, so v1 uses the base 10-byte
+   virtio_net_hdr (not the 12-byte mergeable-RX header). */
+#define NET_HDR_SIZE             10U
 #define RX_BUFFER_SIZE           2048U
 #define TX_BUFFER_SIZE           2048U
 #define REQUEST_TIMEOUT_MS       2000ULL
@@ -246,6 +248,18 @@ int virtio_net_send(const void* frame, uint32_t length)
     return 0;
 }
 
+
+static void recycle_rx_buffer(uint32_t descriptor_id)
+{
+    if (!ready || queue_size <= 0 || descriptor_id >= (uint32_t)queue_size) return;
+    rx_avail.ring[rx_avail.idx % (uint16_t)queue_size] = (uint16_t)descriptor_id;
+    barrier();
+    rx_avail.idx = (uint16_t)(rx_avail.idx + 1U);
+    barrier();
+    mmio_write(V_QUEUE_SEL, 0);
+    mmio_write(V_QUEUE_NOTIFY, 0);
+}
+
 int virtio_net_receive(void* frame, uint32_t capacity)
 {
     if (!ready || !frame || capacity == 0) return -22;
@@ -257,29 +271,25 @@ int virtio_net_receive(void* frame, uint32_t capacity)
         rx_last_used = (uint16_t)(rx_last_used + 1U);
         return -5;
     }
-    if (elem->len < NET_HDR_SIZE)
+    if (elem->len < NET_HDR_SIZE || elem->len > RX_BUFFER_SIZE)
     {
-        rx_avail.ring[rx_avail.idx % (uint16_t)queue_size] = (uint16_t)elem->id;
-        barrier();
-        rx_avail.idx = (uint16_t)(rx_avail.idx + 1U);
-        barrier();
-        mmio_write(V_QUEUE_SEL, 0);
-        mmio_write(V_QUEUE_NOTIFY, 0);
+        recycle_rx_buffer(elem->id);
         rx_last_used = (uint16_t)(rx_last_used + 1U);
         return -5;
     }
     uint32_t frame_len = elem->len - NET_HDR_SIZE;
-    if (frame_len > capacity) frame_len = capacity;
+    /* Ethernet frames are atomic packets; do not silently return truncated data. */
+    if (frame_len > capacity)
+    {
+        recycle_rx_buffer(elem->id);
+        rx_last_used = (uint16_t)(rx_last_used + 1U);
+        return -90; /* EMSGSIZE */
+    }
     const uint8_t* src = &rx_buffers[elem->id][NET_HDR_SIZE];
     uint8_t* dst = (uint8_t*)frame;
     for (uint32_t i = 0; i < frame_len; ++i) dst[i] = src[i];
 
-    rx_avail.ring[rx_avail.idx % (uint16_t)queue_size] = (uint16_t)elem->id;
-    barrier();
-    rx_avail.idx = (uint16_t)(rx_avail.idx + 1U);
-    barrier();
-    mmio_write(V_QUEUE_SEL, 0);
-    mmio_write(V_QUEUE_NOTIFY, 0);
+    recycle_rx_buffer(elem->id);
     rx_last_used = (uint16_t)(rx_last_used + 1U);
     return (int)frame_len;
 }

@@ -10,6 +10,11 @@
 #define MMU_USER_STACK_BASE  0x47F00000ULL
 #define MMU_USER_STACK_TOP   0x48000000ULL
 
+/* Permission bits accepted by mmu_user_set_range(). */
+#define MMU_USER_READ  1U
+#define MMU_USER_WRITE 2U
+#define MMU_USER_EXEC  4U
+
 void mmu_init();
 int mmu_enabled();
 uint64_t mmu_read_sctlr();

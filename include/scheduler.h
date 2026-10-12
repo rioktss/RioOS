@@ -25,6 +25,8 @@ struct CpuContext
 void scheduler_init();
 int scheduler_add(int pid);
 int scheduler_remove(int pid);
+/* Track the synchronously executing process in metadata; this is not a CPU context switch. */
+int scheduler_set_current_logical(int pid);
 int scheduler_current_pid();
 int scheduler_next_pid();
 

@@ -10,5 +10,10 @@ void fb_print(const char* s, uint32_t color);
 void fb_set_cursor(int x, int y);
 int fb_get_width();
 int fb_get_height();
+int fb_is_ready();
+
+#ifdef HOST_TEST
+int fb_test_attach(uint32_t* pixels, int width, int height);
+#endif
 
 #endif

@@ -1,4 +1,5 @@
 #include "security.h"
+#include "fs.h"
 #include "uart.h"
 #include "keyboard.h"
 #include "fb.h"
@@ -6,6 +7,7 @@
 
 static SecurityRole current_role = SECURITY_USER;
 static const char USER_PASSWORD[] = "123";
+static const char ROOT_PASSWORD[] = "rioos-root";
 
 static int security_get_char()
 {
@@ -24,6 +26,7 @@ static int security_get_char()
 void security_init()
 {
     current_role = SECURITY_USER;
+    fs_set_credentials(1000U, 1000U);
 }
 
 SecurityRole security_role()
@@ -52,17 +55,22 @@ int security_login_user(const char* password)
         return -1;
 
     current_role = SECURITY_USER;
+    fs_set_credentials(1000U, 1000U);
     return 0;
 }
 
-void security_login_root()
+int security_login_root(const char* password)
 {
+    if (password == 0 || !str_equal(password, ROOT_PASSWORD)) return -1;
     current_role = SECURITY_ROOT;
+    fs_set_credentials(0U, 0U);
+    return 0;
 }
 
 void security_logout_to_user()
 {
     current_role = SECURITY_USER;
+    fs_set_credentials(1000U, 1000U);
 }
 
 int security_read_password(char* out, uint64_t cap)

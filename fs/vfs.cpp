@@ -111,6 +111,8 @@ static void ls_entry_long(int id)
     put_permissions(id);
     uart_putc(' ');
     put_u64(fs_file_size(id));
+    uart_puts(" uid="); put_u64(fs_get_uid(id));
+    uart_puts(" gid="); put_u64(fs_get_gid(id));
     uart_putc(' ');
     put_datetime(fs_get_mtime(id));
     uart_putc(' ');
@@ -181,6 +183,11 @@ static void build_path(int id, char* out, int cap)
 static void ls_recursive(int dir, int long_format, int show_hidden, const char* display_path, int depth)
 {
     if (depth > 64) return;
+    if (fs_check_access(dir, FS_ACCESS_READ | FS_ACCESS_EXEC) != 0)
+    {
+        uart_puts("ls: permission denied: "); uart_puts(display_path); uart_puts("\r\n");
+        return;
+    }
     if (depth > 0)
     {
         uart_puts(display_path);
@@ -218,6 +225,7 @@ static void ls_recursive(int dir, int long_format, int show_hidden, const char* 
 
 void vfs_ls(const char* spec)
 {
+    /* Listing a directory requires both read and search permission. */
     int long_format = 0;
     int show_hidden = 0;
     int recursive = 0;
@@ -260,7 +268,14 @@ void vfs_ls(const char* spec)
     }
 
     int id = operand[0] ? fs_resolve(operand, current_directory) : current_directory;
-    if (id < 0) { uart_puts("ls: not found\r\n"); return; }
+    if (id < 0) { uart_puts("ls: not found or permission denied\r\n"); return; }
+
+    if (fs_get_type(id) == FS_DIR &&
+        fs_check_access(id, FS_ACCESS_READ | FS_ACCESS_EXEC) != 0)
+    {
+        uart_puts("ls: permission denied\r\n");
+        return;
+    }
 
     if (fs_get_type(id) != FS_DIR)
     {
@@ -296,6 +311,7 @@ int vfs_cd(const char* path)
     int target = fs_resolve(path, current_directory);
     if (target < 0) return -1;
     if (fs_get_type(target) != FS_DIR) return -2;
+    if (fs_check_access(target, FS_ACCESS_EXEC) != 0) return -13;
     current_directory = target;
     return 0;
 }
@@ -333,6 +349,14 @@ int vfs_rm_recursive(const char* path)
 
 static void tree_recursive(int id, int depth)
 {
+    if (fs_get_type(id) == FS_DIR &&
+        fs_check_access(id, FS_ACCESS_READ | FS_ACCESS_EXEC) != 0)
+    {
+        for (int i = 0; i < depth; ++i) uart_puts("  ");
+        uart_puts("[DIR]  "); uart_puts(fs_get_name(id));
+        uart_puts(" (permission denied)\r\n");
+        return;
+    }
     for (int i = 0; i < depth; ++i) uart_puts("  ");
     if (fs_get_type(id) == FS_DIR) uart_puts("[DIR]  ");
     else uart_puts("[FILE] ");
@@ -353,8 +377,13 @@ static void tree_recursive(int id, int depth)
 
 void vfs_tree()
 {
-    uart_puts("/\r\n");
     int root = fs_get_root();
+    if (fs_check_access(root, FS_ACCESS_READ | FS_ACCESS_EXEC) != 0)
+    {
+        uart_puts("tree: permission denied\r\n");
+        return;
+    }
+    uart_puts("/\r\n");
     int count = fs_get_child_count(root);
     for (int i = 0; i < count; ++i)
     {

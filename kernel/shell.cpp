@@ -14,7 +14,8 @@ static const char* command_names[] = {
     "write","cat","rm","cp","mv","tree","ps","uptime","sched","exec","nano","calc",
     "elf","syscall","user","userdemo","su","logout","exit","level","mmu","disk","diskread",
     "diskwrite","diskflush","apps","uname","whoami","net","ping","selftest","pages","tasks",
-    "mount","stats","log","irq","grep","find","history","date","du","df","wc","chmod","env","export"
+    "mount","stats","log","irq","grep","find","history","date","du","df","wc","chmod","env","export",
+    "ifconfig","nslookup","dnsserver","smp","fbinfo"
 };
 
 static void shell_prompt_text()
@@ -122,6 +123,8 @@ static void complete_command_or_file(char* input, int* length)
 
     int dir = fs_resolve(parent_path[0] ? parent_path : ".", vfs_cwd());
     if (dir < 0 || fs_get_type(dir) != FS_DIR) return;
+    /* Tab completion must not enumerate a directory the caller cannot list. */
+    if (fs_check_access(dir, FS_ACCESS_READ | FS_ACCESS_EXEC) != 0) return;
     int matches = 0; int last_id = -1;
     for (int i = 0; i < fs_get_child_count(dir); ++i)
     {

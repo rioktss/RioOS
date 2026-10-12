@@ -7,7 +7,7 @@
 .extern thread_entry_hook
 .extern thread_exit
 
-/* void thread_context_switch(uint64_t* old_sp_out /*x0*/, uint64_t new_sp /*x1*/) */
+/* void thread_context_switch: x0 = old_sp_out, x1 = new_sp */
 thread_context_switch:
     sub sp, sp, #96
     stp x19, x20, [sp, #0]

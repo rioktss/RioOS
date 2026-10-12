@@ -13,26 +13,26 @@ static int preempt_pending = 0;
 
 static uint64_t irq_save()
 {
+#ifdef HOST_TEST
+    return 0;
+#else
     uint64_t daif;
-
     asm volatile(
         "mrs %0, daif\n"
         "msr daifset, #0x2\n"
         "isb"
-        : "=r"(daif)
-        :
-        : "memory");
-
+        : "=r"(daif) : : "memory");
     return daif;
+#endif
 }
 
 static void irq_restore(uint64_t daif)
 {
-    asm volatile(
-        "msr daif, %0\n"
-        "isb"
-        :: "r"(daif)
-        : "memory");
+#ifndef HOST_TEST
+    asm volatile("msr daif, %0\n isb" :: "r"(daif) : "memory");
+#else
+    (void)daif;
+#endif
 }
 
 static void print_u64(uint64_t value)
@@ -98,6 +98,20 @@ static void compact_locked()
 
     if (cursor >= count)
         cursor = count - 1;
+
+    /* A logical current PID must still be queued and marked RUNNING. This
+       prevents stale current IDs after process exit or external state changes. */
+    int current_valid = 0;
+    for (int i = 0; i < count; ++i)
+    {
+        if (queue[i] == current && process_get_state(current) == PROCESS_RUNNING)
+        {
+            current_valid = 1;
+            break;
+        }
+    }
+    if (!current_valid)
+        current = -1;
 }
 
 static int first_runnable_locked()
@@ -254,7 +268,6 @@ int scheduler_remove(int pid)
     uint64_t flags = irq_save();
 
     int index = -1;
-
     for (int i = 0; i < count; ++i)
     {
         if (queue[i] == pid)
@@ -266,40 +279,38 @@ int scheduler_remove(int pid)
 
     if (index < 0)
     {
+        compact_locked();
         irq_restore(flags);
         return -1;
     }
 
     int removing_current = (pid == current);
+    if (process_get_state(pid) == PROCESS_RUNNING)
+        (void)process_set_state(pid, PROCESS_READY);
 
     for (int i = index; i < count - 1; ++i)
         queue[i] = queue[i + 1];
-
     --count;
 
+    if (index < cursor)
+        --cursor;
     if (count == 0)
     {
         current = -1;
         cursor = 0;
         preempt_pending = 0;
-
         irq_restore(flags);
         return 0;
     }
-
-    if (index < cursor)
-        --cursor;
-
     if (cursor >= count)
         cursor = count - 1;
-
     if (cursor < 0)
         cursor = 0;
 
-    if (removing_current)
+    compact_locked();
+    if (removing_current || current < 0)
     {
         int next_index = first_runnable_locked();
-
         if (next_index < 0)
         {
             current = -1;
@@ -309,16 +320,40 @@ int scheduler_remove(int pid)
         {
             cursor = next_index;
             current = queue[cursor];
-
-            process_set_state(
-                current,
-                PROCESS_RUNNING
-            );
+            (void)process_set_state(current, PROCESS_RUNNING);
+            preempt_pending = 0;
         }
     }
 
     irq_restore(flags);
+    return 0;
+}
 
+int scheduler_set_current_logical(int pid)
+{
+    uint64_t flags = irq_save();
+    compact_locked();
+
+    int index = -1;
+    for (int i = 0; i < count; ++i)
+        if (queue[i] == pid) { index = i; break; }
+
+    if (index < 0 || !runnable(pid))
+    {
+        irq_restore(flags);
+        return -1;
+    }
+
+    if (process_set_state(pid, PROCESS_RUNNING) != 0)
+    {
+        irq_restore(flags);
+        return -1;
+    }
+
+    current = pid;
+    cursor = index;
+    preempt_pending = 0;
+    irq_restore(flags);
     return 0;
 }
 

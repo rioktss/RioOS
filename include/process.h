@@ -20,6 +20,7 @@ enum ProcessKind
 
 void process_init();
 int process_create(const char* name);
+/* process_destroy returns -2 for built-ins, -3 for a RUNNING record, -1 if missing. */
 int process_destroy(int pid);
 int process_count();
 void process_list();

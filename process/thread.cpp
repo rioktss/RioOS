@@ -332,9 +332,10 @@ void thread_list()
 
 extern "C" void thread_entry_hook()
 {
-    /* A new thread begins inside schedule() with IRQs masked; threads run
-       with IRQs enabled like any other kernel code. */
-    asm volatile("msr daifclr, #0x2\nisb" ::: "memory");
+    /* Cooperative threads do not need asynchronous IRQs. Keep the IRQ mask
+       inherited from schedule(); in particular, never unmask the CPU IRQ line
+       as a side effect of creating/running a demo thread. */
+    asm volatile("isb" ::: "memory");
 }
 
 extern "C" void thread_exit()

@@ -6,6 +6,7 @@
 
 #define EI_NIDENT       16
 #define ELFCLASS64      2
+#define ET_EXEC          2
 #define ELFDATA2LSB     1
 #define EV_CURRENT      1
 #define EM_AARCH64      183
@@ -74,6 +75,23 @@ int elf_load(const char* path, uint64_t* entry_out)
     if (path == 0 || entry_out == 0)
         return -1;
 
+    /* A failed load must not leave a previous userspace image active. */
+    last_loaded = 0;
+    last_path[0] = '\0';
+    last_entry = 0;
+    last_low = 0;
+    last_high = 0;
+    if (mmu_user_prepare() != 0)
+        return -15;
+    int file_id = fs_resolve(path, fs_get_root());
+    if (file_id < 0 || fs_get_type(file_id) != FS_FILE ||
+        fs_check_access(file_id, FS_ACCESS_EXEC) != 0 ||
+        (fs_get_mode(file_id) & 0111U) == 0)
+    {
+        uart_puts("ELF: executable permission denied or file not found.\r\n");
+        return -13;
+    }
+
     uint64_t file_size = 0;
     if (fs_read_file(path, fs_get_root(), image, sizeof(image), &file_size) != 0)
     {
@@ -91,8 +109,9 @@ int elf_load(const char* path, uint64_t* entry_out)
     if (eh->ident[0] != 0x7F || eh->ident[1] != 'E' ||
         eh->ident[2] != 'L' || eh->ident[3] != 'F' ||
         eh->ident[4] != ELFCLASS64 || eh->ident[5] != ELFDATA2LSB ||
-        eh->ident[6] != EV_CURRENT || eh->machine != EM_AARCH64 ||
-        eh->version != EV_CURRENT || eh->ehsize < sizeof(Elf64_Ehdr) ||
+        eh->ident[6] != EV_CURRENT || eh->type != ET_EXEC ||
+        eh->machine != EM_AARCH64 || eh->version != EV_CURRENT ||
+        eh->ehsize != sizeof(Elf64_Ehdr) ||
         eh->phentsize != sizeof(Elf64_Phdr) || eh->phnum == 0 || eh->phnum > MAX_PHDRS)
     {
         uart_puts("ELF: invalid AArch64 executable.\r\n");
@@ -105,8 +124,6 @@ int elf_load(const char* path, uint64_t* entry_out)
         uart_puts("ELF: program header table outside file.\r\n");
         return -5;
     }
-
-    mmu_user_prepare();
 
     uint64_t low = MMU_USER_LIMIT;
     uint64_t high = MMU_USER_BASE;
@@ -127,7 +144,10 @@ int elf_load(const char* path, uint64_t* entry_out)
             ph->memsz == 0 || ph->memsz > MMU_USER_LIMIT - ph->vaddr ||
             (ph->vaddr & (MMU_PAGE_SIZE - 1ULL)) != 0 ||
             (ph->offset & (MMU_PAGE_SIZE - 1ULL)) != 0 ||
-            (ph->align != 0 && ph->align != 1 && ph->align < MMU_PAGE_SIZE))
+            (ph->flags & ~(PF_R | PF_W | PF_X)) != 0 ||
+            (ph->align != 0 && ph->align != 1 &&
+                (ph->align < MMU_PAGE_SIZE || (ph->align & (ph->align - 1ULL)) != 0 ||
+                 ((ph->vaddr - ph->offset) & (ph->align - 1ULL)) != 0)))
         {
             uart_puts("ELF: invalid LOAD segment.\r\n");
             return -6;
@@ -150,19 +170,21 @@ int elf_load(const char* path, uint64_t* entry_out)
             mode = 1U;
 
         uint64_t end = ph->vaddr + ph->memsz;
+        uint64_t page_end = (end + MMU_PAGE_SIZE - 1ULL) & ~(MMU_PAGE_SIZE - 1ULL);
 
-        /* Reject overlapping PT_LOAD memory ranges. A simple, non-overlapping
-           segment layout keeps page permissions deterministic and prevents one
-           segment from silently overriding another segment's attributes. */
+        /* Permissions are page-granular. Reject segment ranges that share even
+           one page, although their byte ranges may not overlap, so the later
+           segment cannot silently weaken the earlier segment's permissions. */
         for (uint16_t j = 0; j < i; ++j)
         {
             const Elf64_Phdr* prev = (const Elf64_Phdr*)(image + eh->phoff + (uint64_t)j * eh->phentsize);
             if (prev->type != PT_LOAD)
                 continue;
             uint64_t prev_end = prev->vaddr + prev->memsz;
-            if (ph->vaddr < prev_end && prev->vaddr < end)
+            uint64_t prev_page_end = (prev_end + MMU_PAGE_SIZE - 1ULL) & ~(MMU_PAGE_SIZE - 1ULL);
+            if (ph->vaddr < prev_page_end && prev->vaddr < page_end)
             {
-                uart_puts("ELF: overlapping LOAD segments rejected.\r\n");
+                uart_puts("ELF: LOAD segments sharing a permission page rejected.\r\n");
                 return -13;
             }
         }
@@ -219,7 +241,11 @@ int elf_load(const char* path, uint64_t* entry_out)
 
     /* Give EL0 the private stack and make instruction fetches coherent. */
     if (mmu_user_finish() != 0)
+    {
+        (void)mmu_user_prepare();
+        uart_puts("ELF: failed to activate user mappings.\r\n");
         return -12;
+    }
 
     uint64_t flush_end = high > low ? high : low + MMU_PAGE_SIZE;
     uint64_t begin = low & ~63ULL;

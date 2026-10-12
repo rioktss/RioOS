@@ -20,7 +20,24 @@ enum SyscallNumber
     SYS_TIME_MS    = 11,  /* milliseconds since boot                   */
     SYS_FILE_READ  = 12,  /* file_read(path, buf, cap) -> bytes read   */
     SYS_FILE_WRITE = 13,  /* file_write(path, buf, len) -> bytes written */
-    SYS_GETARG     = 14   /* getarg(buf, cap) -> length of argument string */
+    SYS_GETARG     = 14,  /* getarg(buf, cap) -> length of argument string */
+    SYS_FD_OPEN    = 15,  /* fd_open(path, flags) -> descriptor */
+    SYS_FD_CLOSE   = 16,  /* fd_close(fd) */
+    SYS_FD_READ    = 17,  /* fd_read(fd, buffer, length) */
+    SYS_FD_WRITE   = 18,  /* fd_write(fd, buffer, length) */
+    SYS_FD_SEEK    = 19,  /* fd_seek(fd, offset, whence) */
+    SYS_FD_DUP     = 20,  /* fd_dup(oldfd) */
+    SYS_FD_DUP2    = 21,  /* fd_dup2(oldfd, newfd) */
+    SYS_FD_PIPE    = 22,  /* fd_pipe(int descriptors[2]), non-blocking */
+    SYS_FS_STAT    = 23,  /* stat(path, FsStat*) */
+    SYS_FS_TRUNCATE= 24,  /* truncate(path, length) */
+    SYS_FS_CHMOD   = 25,  /* chmod(path, mode), owner or root */
+    SYS_NET_UDP_SOCKET   = 26, /* udp_socket() -> owner-scoped handle */
+    SYS_NET_UDP_BIND     = 27, /* udp_bind(handle, local_port) */
+    SYS_NET_UDP_SENDTO   = 28, /* udp_sendto(handle, ip, port, data, length) */
+    SYS_NET_UDP_RECVFROM = 29, /* udp_recvfrom(handle, &ip, &port, data, cap, timeout_ms) */
+    SYS_NET_UDP_CLOSE    = 30, /* udp_close(handle) */
+    SYS_NET_DNS_LOOKUP   = 31  /* dns_lookup(name, &ip, timeout_ms) */
 };
 
 void syscall_init();

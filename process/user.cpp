@@ -6,6 +6,8 @@
 #include "uart.h"
 #include "timer.h"
 #include "interrupt.h"
+#include "fd.h"
+#include "netstack.h"
 
 extern "C" { uint64_t user_return_pc = 0; }
 static int current_user_pid = -1;
@@ -62,17 +64,44 @@ void user_execute(const char* path, const char* args)
     int pid=process_create(path);
     if(pid<0){uart_puts("exec: process table full\r\n");mmu_user_prepare();return;}
     if(process_configure_user(pid,MMU_USER_BASE,MMU_USER_STACK_TOP)!=0){process_destroy(pid);mmu_user_prepare();uart_puts("exec: process isolation setup failed\r\n");return;}
-    if(scheduler_add(pid)!=0){process_destroy(pid);mmu_user_prepare();uart_puts("exec: scheduler full\r\n");return;}
+    if(scheduler_add(pid)!=0){(void)process_destroy(pid);mmu_user_prepare();uart_puts("exec: scheduler full\r\n");return;}
+    if(scheduler_set_current_logical(pid)!=0){(void)scheduler_remove(pid);(void)process_destroy(pid);mmu_user_prepare();uart_puts("exec: scheduler selection failed\r\n");return;}
 
-    current_user_pid=pid; last_exit_code=0; process_set_state(pid,PROCESS_RUNNING);
+    if (fd_set_process(pid) != 0)
+    {
+        (void)scheduler_remove(pid);
+        (void)process_destroy(pid);
+        int kernel_pid = process_pid_at(0);
+        if (kernel_pid >= 0) (void)scheduler_set_current_logical(kernel_pid);
+        (void)fd_set_process(kernel_pid >= 0 ? kernel_pid : 0);
+        mmu_user_prepare();
+        uart_puts("exec: file descriptor table allocation failed\r\n");
+        return;
+    }
+    fd_close_all(); /* Fresh process-local descriptor table; standard streams remain 0/1/2. */
+    current_user_pid=pid; last_exit_code=0;
     uart_puts("Starting userspace process: "); uart_puts(path); uart_puts("\r\n");
     uart_puts("EL0 entry: 0x"); static const char h[]="0123456789ABCDEF";for(int i=15;i>=0;--i)uart_putc(h[(entry>>(i*4))&15]);uart_puts("\r\n");
 
     user_enter(entry,mmu_user_stack_top());
+    net_udp_close_all_for(pid);
+    fd_close_all();
+    fd_release_process(pid);
 
-    process_mark_exit(pid,last_exit_code);
-    scheduler_remove(pid);
-    process_destroy(pid);
+    /* Remove the active logical PID before marking it terminal; this lets the
+       scheduler select a surviving record without compacting away its current
+       entry prematurely. This remains metadata scheduling, not CPU switching. */
+    (void)scheduler_remove(pid);
+    (void)process_mark_exit(pid, last_exit_code);
+    (void)process_destroy(pid);
+
+    /* EL0 execution is synchronous and returns to the existing kernel/shell
+       stack. Restore both the process-table state and the logical scheduler PID. */
+    int kernel_pid = process_pid_at(0);
+    if (kernel_pid >= 0)
+        (void)scheduler_set_current_logical(kernel_pid);
+    (void)fd_set_process(kernel_pid >= 0 ? kernel_pid : 0);
+
     uart_puts("Userspace returned to EL1. Exit code: ");
     if(last_exit_code==0)uart_puts("0"); else {int v=last_exit_code<0?-last_exit_code:last_exit_code;char b[12];int n=0;while(v&&n<11){b[n++]=(char)('0'+v%10);v/=10;}if(last_exit_code<0)uart_putc('-');while(n)uart_putc(b[--n]);}
     uart_puts("\r\n");

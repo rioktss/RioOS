@@ -285,11 +285,14 @@ uint64_t mmu_read_tcr() { return read_tcr(); }
 static int user_range_ok(uint64_t start, uint64_t end)
 {
     return start >= MMU_USER_BASE && end > start && end <= MMU_USER_LIMIT &&
-           (start & (MMU_PAGE_SIZE - 1ULL)) == 0;
+           (start & (MMU_PAGE_SIZE - 1ULL)) == 0 &&
+           (end & (MMU_PAGE_SIZE - 1ULL)) == 0;
 }
 
 int mmu_user_prepare()
 {
+    /* Fail closed before changing descriptors, then invalidate stale TLB state. */
+    user_active = 0;
     for (uint64_t i = 0; i < MAX_USER_PAGES; ++i)
     {
         user_page_modes[i] = 0;
@@ -304,21 +307,23 @@ int mmu_user_prepare()
         ram_l3[n / 512ULL][n % 512ULL] = page_descriptor_l3(va, kernel_rw_nx(), DESC_SH_INNER);
     }
 
-    user_active = 0;
     tlb_flush_all();
     return 0;
 }
 
 int mmu_user_set_range(uint64_t start, uint64_t end, uint32_t flags)
 {
-    if (end <= start || (start & (MMU_PAGE_SIZE - 1ULL))!= 0)
+    if (!mmu_enabled() || end <= start ||
+        (start & (MMU_PAGE_SIZE - 1ULL)) != 0)
         return -1;
     if (end > MMU_USER_LIMIT || start < MMU_USER_BASE)
         return -1;
-    if ((flags & USER_W)!= 0 && (flags & USER_X)!= 0)
+    if (flags == 0 || (flags & ~(USER_R | USER_W | USER_X)) != 0 ||
+        ((flags & USER_W) != 0 && (flags & USER_X) != 0))
         return -1;
 
     uint64_t first = start;
+    /* end is bounded above, so rounding cannot overflow uint64_t. */
     uint64_t last = (end + MMU_PAGE_SIZE - 1ULL) & ~(MMU_PAGE_SIZE - 1ULL);
     if (!user_range_ok(first, last))
         return -1;
@@ -338,6 +343,9 @@ int mmu_user_set_range(uint64_t start, uint64_t end, uint32_t flags)
 
 int mmu_user_finish()
 {
+    if (!mmu_enabled())
+        return -1;
+
     for (uint64_t va = MMU_USER_STACK_BASE; va < MMU_USER_STACK_TOP; va += MMU_PAGE_SIZE)
     {
         uint64_t n = (va - RAM_START) / MMU_PAGE_SIZE;

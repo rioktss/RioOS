@@ -25,7 +25,10 @@
 #include "security.h"
 #include "history.h"
 #include "env.h"
+#include "thread.h"
 #include "rtc.h"
+#include "fd.h"
+#include "smp.h"
 
 static void print_u64(
     uint64_t value
@@ -397,7 +400,10 @@ static const ManualEntry manual_entries[] =
     {"cat", "display file contents", "cat [-n] <file>", "-n show line numbers"},
     {"grep", "search for a pattern in files", "grep [-r] [-i] [-n] [-v] [-c] <pattern> <file|dir>", "-r recursive; -i ignore case; -n show line numbers; -v invert match; -c count matches"},
     {"find", "search filesystem entries", "find [path] -name <name> | -type <f/d>", "-name match entry name; -type f files; -type d directories"},
-    {"chmod", "change file mode", "chmod <mode> <file>", "numeric 000-777; symbolic +r/+w/+x or -r/-w/-x"},
+    {"chmod", "change file mode", "chmod <mode> <file>", "numeric 000-777; symbolic +r/+w/+x or -r/-w/-x; owner or root"},
+    {"stat", "show file metadata", "stat <path>", "shows inode, type, mode, owner, size, sector count, modification time"},
+    {"chown", "change file owner", "chown <uid> <gid> <path>", "root only; UID/GID are decimal numbers"},
+    {"truncate", "resize a file", "truncate <path> <size>", "size 0-262144 bytes; extended bytes are zero-filled"},
     {"cp", "copy files or directories", "cp [-r] [-f] <source> <destination>", "-r recursive; -f overwrite destination"},
     {"mv", "move or rename files", "mv [-f] <source> <destination>", "-f overwrite destination"},
     {"rm", "remove files or directories", "rm [-r] [-f] <file|dir>...", "-r recursive; -f force/ignore missing"},
@@ -410,7 +416,16 @@ static const ManualEntry manual_entries[] =
     {"tree", "show filesystem tree", "tree", "No options"},
     {"mount", "show mounted storage/filesystem status", "mount", "No options"},
     {"ps", "show processes", "ps", "No options"},
-    {"history", "show command history", "history [10|-c]", "-c clear history; N show last N entries; Arrow Up/Down recall"}
+    {"history", "show command history", "history [10|-c]", "-c clear history; N show last N entries; Arrow Up/Down recall"},
+    {"threads", "list cooperative kernel threads", "threads", "Shows state, priority, run counts, and context switches"},
+    {"smp", "show CPU/SMP bring-up readiness", "smp", "Reports current MPIDR Aff0, online CPU count, and whether SMP is enabled; secondary startup is disabled"},
+    {"fbinfo", "show framebuffer backend status", "fbinfo", "Reports software RAM-surface state; the default QEMU runner remains serial-only"},
+    {"thread-demo", "exercise voluntary context switching", "thread-demo", "Uses yield only; timer IRQ/preemption stays disabled"},
+    {"unset", "remove an environment variable", "unset NAME", "NAME must follow shell identifier rules"},
+    {"fds", "list open file descriptors", "fds", "Shows standard streams and currently open descriptors"},
+    {"ifconfig", "show the configured network interface", "ifconfig", "Displays static IPv4, gateway, DNS and VirtIO-Net MAC"},
+    {"nslookup", "resolve a DNS A record", "nslookup <hostname>", "Uses the configured DNS server; requires working UDP and ARP"},
+    {"dnsserver", "set the DNS server address", "dnsserver <ipv4>", "Root only; default for QEMU user networking is 10.0.2.3"}
 };
 
 static void command_man(const char* argument);
@@ -704,6 +719,7 @@ static void grep_walk_files(int id, const char* display_path, int options, const
         return;
     }
     if (fs_get_type(id) != FS_DIR) return;
+    if (fs_check_access(id, FS_ACCESS_READ | FS_ACCESS_EXEC) != 0) return;
 
     int count = fs_get_child_count(id);
     for (int i = 0; i < count; ++i)
@@ -780,6 +796,7 @@ static void find_walk(int id, const char* display_path, const char* name, int ty
         uart_puts(display_path); uart_puts("\r\n");
     }
     if (fs_get_type(id) != FS_DIR) return;
+    if (fs_check_access(id, FS_ACCESS_READ | FS_ACCESS_EXEC) != 0) return;
     int count = fs_get_child_count(id);
     for (int i = 0; i < count; ++i)
     {
@@ -824,13 +841,31 @@ static void command_find(char* argument)
     find_walk(root, start, name, type_filter);
 }
 
-static uint64_t du_sum(int id)
+static int du_sum(int id, uint64_t* out_total)
 {
-    if (fs_get_type(id) == FS_FILE) return fs_file_size(id);
+    if (id < 0 || out_total == 0) return -2;
+    if (fs_get_type(id) == FS_FILE)
+    {
+        *out_total = fs_file_size(id);
+        return 0;
+    }
+    if (fs_get_type(id) != FS_DIR) return -2;
+    if (fs_check_access(id, FS_ACCESS_READ | FS_ACCESS_EXEC) != 0) return -13;
+
     uint64_t sum = 0;
     int n = fs_get_child_count(id);
-    for (int i = 0; i < n; ++i) sum += du_sum(fs_get_child(id, i));
-    return sum;
+    for (int i = 0; i < n; ++i)
+    {
+        int child = fs_get_child(id, i);
+        if (child < 0) continue;
+        uint64_t child_size = 0;
+        int rc = du_sum(child, &child_size);
+        if (rc != 0) return rc;
+        if (child_size > 0xFFFFFFFFFFFFFFFFULL - sum) return -27;
+        sum += child_size;
+    }
+    *out_total = sum;
+    return 0;
 }
 
 static void command_du(char* argument)
@@ -841,7 +876,13 @@ static void command_du(char* argument)
     const char* path = n == 1 ? operands[0] : ".";
     int id = fs_resolve(path, vfs_cwd());
     if (id < 0) { uart_puts("du: path not found\r\n"); return; }
-    uint64_t total = du_sum(id);
+    uint64_t total = 0;
+    int sum_rc = du_sum(id, &total);
+    if (sum_rc != 0)
+    {
+        uart_puts(sum_rc == -13 ? "du: permission denied\r\n" : "du: unable to read metadata\r\n");
+        return;
+    }
     if (options & OPT_H) print_human_bytes(total); else print_u64(total);
     uart_puts("  "); uart_puts(path); uart_puts("\r\n");
     if (!(options & OPT_S) && fs_get_type(id) == FS_DIR)
@@ -850,7 +891,13 @@ static void command_du(char* argument)
         for (int i = 0; i < c; ++i)
         {
             int child = fs_get_child(id, i); if (child < 0) continue;
-            uint64_t v = du_sum(child);
+            uint64_t v = 0;
+            sum_rc = du_sum(child, &v);
+            if (sum_rc != 0)
+            {
+                uart_puts(sum_rc == -13 ? "du: permission denied\r\n" : "du: unable to read metadata\r\n");
+                return;
+            }
             if (options & OPT_H) print_human_bytes(v); else print_u64(v);
             uart_puts("  "); uart_puts(fs_get_name(child)); uart_puts("\r\n");
         }
@@ -915,6 +962,58 @@ static void command_chmod(char* argument)
     /* Print canonical octal mode. */
     char d[3]; d[0]=(char)('0'+((mode>>6)&7)); d[1]=(char)('0'+((mode>>3)&7)); d[2]=(char)('0'+(mode&7));
     uart_putc(d[0]); uart_putc(d[1]); uart_putc(d[2]); uart_puts("\r\n");
+}
+
+static void command_stat(char* argument)
+{
+    char* words[3];
+    int count = split_words(argument, words, 3);
+    if (count != 1) { uart_puts("stat: usage: stat <path>\r\n"); return; }
+    FsStat st;
+    int rc = fs_stat_path(words[0], vfs_cwd(), &st);
+    if (rc != 0) { uart_puts(rc == -13 ? "stat: permission denied\r\n" : "stat: path not found\r\n"); return; }
+    uart_puts("  File: "); uart_puts(words[0]); uart_puts("\r\n");
+    uart_puts("  Inode: "); print_u64(st.inode);
+    uart_puts("  Type: "); uart_puts(st.type == FS_DIR ? "directory\r\n" : "regular file\r\n");
+    uart_puts("  Mode: ");
+    uart_putc((char)('0' + ((st.mode >> 6) & 7U)));
+    uart_putc((char)('0' + ((st.mode >> 3) & 7U)));
+    uart_putc((char)('0' + (st.mode & 7U)));
+    uart_puts(" (owner/group/other)\r\n  UID: "); print_u64(st.uid);
+    uart_puts("\r\n  GID: "); print_u64(st.gid);
+    uart_puts("\r\n  Size: "); print_u64(st.size); uart_puts(" bytes\r\n  Sectors: "); print_u64(st.sector_count);
+    uart_puts("\r\n  Modified (Unix epoch): "); print_u64(st.mtime); uart_puts("\r\n");
+}
+
+static void command_chown(char* argument)
+{
+    if (!security_is_root()) { uart_puts("chown: permission denied (root required)\r\n"); return; }
+    char* words[4];
+    int count = split_words(argument, words, 4);
+    if (count != 3) { uart_puts("chown: usage: chown <uid> <gid> <path>\r\n"); return; }
+    uint64_t uid = 0, gid = 0;
+    if (!parse_u64_arg(words[0], &uid) || !parse_u64_arg(words[1], &gid) ||
+        uid > 0x7FFFFFFFULL || gid > 0x7FFFFFFFULL)
+    { uart_puts("chown: invalid UID/GID\r\n"); return; }
+    int id = fs_resolve(words[2], vfs_cwd());
+    if (id < 0) { uart_puts("chown: path not found or permission denied\r\n"); return; }
+    int rc = fs_set_owner(id, (uint32_t)uid, (uint32_t)gid);
+    if (rc != 0) { uart_puts("chown: update failed\r\n"); return; }
+    uart_puts("owner updated\r\n");
+}
+
+static void command_truncate(char* argument)
+{
+    char* words[3];
+    int count = split_words(argument, words, 3);
+    uint64_t size = 0;
+    if (count != 2 || !parse_u64_arg(count == 2 ? words[1] : "", &size))
+    { uart_puts("truncate: usage: truncate <path> <size>\r\n"); return; }
+    int rc = fs_truncate(words[0], vfs_cwd(), size);
+    if (rc == 0) return;
+    if (rc == -13) uart_puts("truncate: permission denied\r\n");
+    else if (rc == -27) uart_puts("truncate: file too large (max 262144 bytes)\r\n");
+    else uart_puts("truncate: failed (path missing, not a file, or storage error)\r\n");
 }
 
 static void command_env(const char* argument)
@@ -1007,7 +1106,9 @@ static int handle_shell_operators(const char* line)
             }
             else if (left[0]=='e'&&left[1]=='c'&&left[2]=='h'&&left[3]=='o'&&left[4]==' ')
             {
-                str_copy((char*)pipebuf, left + 5, sizeof(pipebuf)); psz = (uint64_t)str_len((char*)pipebuf);
+                const char* echo_text = normalize_echo_redirect_text(left + 5);
+                str_copy((char*)pipebuf, echo_text, sizeof(pipebuf));
+                psz = (uint64_t)str_len((char*)pipebuf);
             }
             else { uart_puts("pipe: supported source commands are cat and echo\r\n"); return 1; }
             char* rw[8]; int rc = split_words(right, rw, 8);
@@ -1032,7 +1133,52 @@ static int handle_shell_operators(const char* line)
                 if(ropt&OPT_C){print_u64(matches);uart_puts("\r\n");}
                 return 1;
             }
-            uart_puts("pipe: right side must be grep\r\n"); return 1;
+            if (rc >= 1 && str_equal(rw[0], "wc"))
+            {
+                int wopt = 0;
+                for (int k = 1; k < rc; ++k)
+                {
+                    if (rw[k][0] != '-')
+                    {
+                        uart_puts("pipe: wc does not take a filename on the right side\r\n");
+                        return 1;
+                    }
+                    int bits = option_bits(rw[k]);
+                    if (bits < 0)
+                    {
+                        uart_puts("pipe: invalid wc option\r\n");
+                        return 1;
+                    }
+                    wopt |= bits;
+                }
+                if (wopt & ~(OPT_L | OPT_W | OPT_C))
+                {
+                    uart_puts("pipe: usage: cat file | wc [-lwc]\r\n");
+                    return 1;
+                }
+                if (!(wopt & (OPT_L | OPT_W | OPT_C)))
+                    wopt = OPT_L | OPT_W | OPT_C;
+                uint64_t lines = 0, words_count = 0, chars = psz;
+                int in_word = 0;
+                for (uint64_t k = 0; k < psz; ++k)
+                {
+                    if (pipebuf[k] == (uint8_t)'\n') ++lines;
+                    int is_space = pipebuf[k] == (uint8_t)' ' ||
+                                   pipebuf[k] == (uint8_t)'\t' ||
+                                   pipebuf[k] == (uint8_t)'\n' ||
+                                   pipebuf[k] == (uint8_t)'\r';
+                    if (is_space) in_word = 0;
+                    else if (!in_word) { in_word = 1; ++words_count; }
+                }
+                if (psz > 0 && pipebuf[psz - 1] != (uint8_t)'\n') ++lines;
+                int first = 1;
+                if (wopt & OPT_L) { print_u64(lines); first = 0; }
+                if (wopt & OPT_W) { if (!first) uart_putc(' '); print_u64(words_count); first = 0; }
+                if (wopt & OPT_C) { if (!first) uart_putc(' '); print_u64(chars); }
+                uart_puts("\r\n");
+                return 1;
+            }
+            uart_puts("pipe: right side must be grep or wc\r\n"); return 1;
         }
         if (line[i] == '>' || line[i] == '<')
         {
@@ -1059,6 +1205,88 @@ static int handle_shell_operators(const char* line)
         }
     }
     return 0;
+}
+
+static void thread_demo_worker(void* argument)
+{
+    char label = ((uint64_t)argument == 1ULL) ? 'A' : 'B';
+    for (uint64_t step = 1; step <= 3; ++step)
+    {
+        uart_puts("[thread ");
+        uart_putc(label);
+        uart_puts("] step ");
+        print_u64(step);
+        uart_puts("\r\n");
+        thread_yield();
+    }
+}
+
+static void command_threads()
+{
+    thread_list();
+}
+
+static void command_smp_status()
+{
+    uart_puts("SMP / CPU topology\r\n------------------\r\nCPU Affinity-0 ID : ");
+    print_u64((uint64_t)smp_cpu_id());
+    uart_puts("\r\nOnline CPUs       : ");
+    print_u64((uint64_t)smp_online_cpu_count());
+    uart_puts("\r\nSMP scheduling    : ");
+    uart_puts(smp_is_enabled() ? "enabled\r\n" : "disabled (safe default)\r\n");
+    uart_puts("Spinlocks          : atomic acquire/release primitives available\r\n");
+    uart_puts("Secondary startup  : not implemented; no secondary core is released\r\n");
+}
+
+static void command_fbinfo()
+{
+    uart_puts("Framebuffer diagnostics\r\n------------------------\r\nBackend : reserved RAM surface\r\nStatus  : ");
+    uart_puts(fb_is_ready() ? "initialized\r\n" : "not initialized\r\n");
+    uart_puts("Geometry: "); print_u64((uint64_t)fb_get_width());
+    uart_putc('x'); print_u64((uint64_t)fb_get_height());
+    uart_puts(" pixels, 32 bpp\r\nDisplay : no QEMU video device is wired to this surface; UART remains the console\r\n");
+}
+
+static void command_thread_demo()
+{
+    if (thread_active_count() != 1)
+    {
+        uart_puts("thread-demo: finish/avoid other threads first\r\n");
+        return;
+    }
+
+    uart_puts("Running cooperative context-switch demo; timer IRQ remains off.\r\n");
+    int a = thread_create("demo-A", thread_demo_worker, (void*)1ULL, 1);
+    int b = thread_create("demo-B", thread_demo_worker, (void*)2ULL, 1);
+    if (a < 0 || b < 0)
+    {
+        uart_puts("thread-demo: could not create both demo threads\r\n");
+        while (thread_active_count() > 1) thread_yield();
+        return;
+    }
+
+    while (thread_active_count() > 1)
+        thread_yield();
+
+    uart_puts("thread-demo: PASS (cooperative switches completed)\r\n");
+}
+
+static void command_unset(const char* argument)
+{
+    if (!argument || !argument[0])
+    {
+        uart_puts("unset: usage: unset NAME\r\n");
+        return;
+    }
+    for (int i = 0; argument[i]; ++i)
+        if (argument[i] == ' ' || argument[i] == '\t')
+        {
+            uart_puts("unset: usage: unset NAME\r\n");
+            return;
+        }
+    int rc = env_unset(argument);
+    if (rc == -2) uart_puts("unset: variable not found\r\n");
+    else if (rc != 0) uart_puts("unset: invalid variable name\r\n");
 }
 
 static void command_help()
@@ -1090,10 +1318,14 @@ static void command_help()
         "  du [-h] [-s] [path]  Show disk usage\r\n"
         "  df [-h]              Show filesystem free/used space\r\n"
         "  wc [-lwc] <file>     Count lines/words/chars\r\n"
-        "  chmod <mode> <file>  Change file mode\r\n"
+        "  chmod <mode> <file>  Change file mode (owner or root)\r\n"
+        "  stat <path>          Show inode/permission/owner metadata\r\n"
+        "  chown <uid> <gid> <path>  Change owner (root only)\r\n"
+        "  truncate <path> <size>  Resize file (max 262144 bytes)\r\n"
         "  env                  Show environment variables\r\n"
         "  export VAR=val       Set environment variable\r\n"
-        "  shell: > >> < |      Redirection and simple cat/echo -> grep pipe\r\n"
+        "  unset VAR           Remove environment variable\r\n"
+        "  shell: > >> < |      Redirection; in-memory cat/echo -> grep/wc pipe\r\n"
         "  tree                 Show filesystem tree\r\n"
         "  ps                   Show processes\r\n"
         "  uptime               Show uptime\r\n"
@@ -1106,7 +1338,7 @@ static void command_help()
         "  user [password]      Login as user (password: 123)\r\n"
         "  user demo            Run preserved EL0 userspace demo\r\n"
         "  userdemo             Run preserved EL0 userspace demo\r\n"
-        "  su [root|user]       Switch security user\r\n"
+        "  su [root|user]       Switch user; root asks for password\r\n"
         "  logout               Return from root to user\r\n"
         "  level                Show current exception level\r\n"
         "  mmu                  Show MMU status\r\n"
@@ -1118,10 +1350,18 @@ static void command_help()
         "  uname                Show kernel identity\r\n"
         "  whoami               Show current security domain\r\n"
         "  net                  Show network status\r\n"
+        "  ifconfig             Show IPv4/MAC/gateway/DNS settings\r\n"
         "  ping <ip>            Send ICMP echo request\r\n"
+        "  nslookup <hostname>  Resolve a DNS A record over UDP\r\n"
+        "  dnsserver <ipv4>     Set DNS server (root only)\r\n"
         "  selftest             Run kernel integration checks\r\n"
         "  pages                Show physical page allocator\r\n"
         "  tasks                Show scheduler and processes\r\n"
+        "  threads              Show cooperative kernel threads\r\n"
+        "  smp                  Show CPU topology; SMP remains disabled by default\r\n"
+        "  fbinfo               Show framebuffer RAM-surface status (serial console remains default)\r\n"
+        "  fds                  List open file descriptors\r\n"
+        "  thread-demo          Test context switching without timer IRQ\r\n"
         "  mount                Show storage and filesystem mount\r\n"
         "  stats                Show system statistics\r\n"
         "  log [0-3]            Show/set log level\r\n"
@@ -1512,6 +1752,8 @@ static int copy_tree_node(int src, const char* target, int cwd, int recursive, i
         /* Source paths are resolved by the caller before this helper. */
         return -1;
     }
+    if (type != FS_DIR) return -1;
+    if (fs_check_access(src, FS_ACCESS_READ | FS_ACCESS_EXEC) != 0) return -13;
     if (!recursive) return -2;
 
     int existing = fs_resolve(target, cwd);
@@ -1728,6 +1970,7 @@ static void command_disk()
 
 static void command_diskread(const char* arg)
 {
+    if (!security_is_root()) { uart_puts("diskread: permission denied (root required)\r\n"); return; }
     uint64_t sector = 0;
     if (!parse_u64_arg(arg, &sector))
     {
@@ -1775,6 +2018,7 @@ static void command_diskread(const char* arg)
 
 static void command_diskwrite(char* arg)
 {
+    if (!security_is_root()) { uart_puts("diskwrite: permission denied (root required)\r\n"); return; }
     if (arg == 0 || arg[0] == '\0')
     {
         uart_puts("diskwrite: usage: diskwrite <sector> <text>\r\n");
@@ -1833,6 +2077,7 @@ static void command_diskwrite(char* arg)
 
 static void command_diskflush()
 {
+    if (!security_is_root()) { uart_puts("diskflush: permission denied (root required)\r\n"); return; }
     int rc = storage_flush();
     uart_puts("diskflush: ");
     uart_puts(rc == 0 ? "OK\r\n" : "failed\r\n");
@@ -1891,7 +2136,15 @@ static void command_su(const char* argument)
 {
     if (!argument || !argument[0] || str_equal(argument, "root"))
     {
-        security_login_root();
+        char password[48];
+        uart_puts("root password: ");
+        fb_print("root password: ", 0xFFFFFF);
+        if (security_read_password(password, sizeof(password)) < 0 ||
+            security_login_root(password) != 0)
+        {
+            uart_puts("su: authentication failed\r\n");
+            return;
+        }
         uart_puts("Switched to root.\r\n");
         return;
     }
@@ -1948,6 +2201,55 @@ static void command_ping(const char* arg)
     else uart_puts("ping: timeout or network error\r\n");
 }
 
+static void command_nslookup(const char* argument)
+{
+    if (!argument || !argument[0] || !net_ready())
+    {
+        uart_puts(!net_ready() ? "nslookup: network not ready\r\n" : "nslookup: usage: nslookup <hostname>\r\n");
+        return;
+    }
+    uint32_t ip = 0;
+    if (net_parse_ipv4(argument, &ip))
+    {
+        uart_puts(argument); uart_puts(" is already an IPv4 address\r\n");
+        return;
+    }
+    uart_puts("Server: "); net_print_ipv4(net_dns_server()); uart_puts("\r\n");
+    uint64_t start = timer_millis();
+    int rc = net_dns_resolve(argument, &ip, 2500U);
+    if (rc == 0)
+    {
+        uart_puts("Name: "); uart_puts(argument); uart_puts("\r\nAddress: ");
+        net_print_ipv4(ip); uart_puts("\r\n");
+    }
+    else if (rc == -2) uart_puts("nslookup: no A record found (or NXDOMAIN)\r\n");
+    else if (rc == -110) uart_puts("nslookup: DNS request timed out\r\n");
+    else if (rc == -19) uart_puts("nslookup: network device unavailable\r\n");
+    else uart_puts("nslookup: DNS/network error\r\n");
+    if (rc == 0) { uart_puts("Query time: "); print_u64(timer_millis() - start); uart_puts(" ms\r\n"); }
+}
+
+static void command_dnsserver(const char* argument)
+{
+    if (!security_is_root())
+    {
+        uart_puts("dnsserver: permission denied (root required)\r\n");
+        return;
+    }
+    if (!argument || !argument[0])
+    {
+        uart_puts("dnsserver: usage: dnsserver <ipv4>\r\n");
+        return;
+    }
+    uint32_t ip = 0;
+    if (!net_parse_ipv4(argument, &ip) || net_dns_set_server(ip) != 0)
+    {
+        uart_puts("dnsserver: invalid DNS server address\r\n");
+        return;
+    }
+    uart_puts("DNS server set to "); net_print_ipv4(ip); uart_puts("\r\n");
+}
+
 static void command_selftest()
 {
     int pass=0,total=0;
@@ -1999,7 +2301,7 @@ static void command_man(const char* argument)
     if (!query[0])
     {
         uart_puts("man: usage: man <command>\r\n");
-        uart_puts("Available manuals: ls cat grep find chmod cp mv rm mkdir echo wc du df nano tree mount ps history\r\n");
+        uart_puts("Available manuals: ls cat grep find chmod cp mv rm mkdir echo wc du df nano tree mount ps history threads thread-demo unset fds ifconfig nslookup dnsserver\r\n");
         return;
     }
 
@@ -2148,8 +2450,12 @@ void execute_command(
     if (str_equal(command, "df")) { command_df(argument); return; }
     if (str_equal(command, "wc")) { command_wc(argument); return; }
     if (str_equal(command, "chmod")) { command_chmod(argument); return; }
+    if (str_equal(command, "stat")) { command_stat(argument); return; }
+    if (str_equal(command, "chown")) { command_chown(argument); return; }
+    if (str_equal(command, "truncate")) { command_truncate(argument); return; }
     if (str_equal(command, "env")) { command_env(argument); return; }
     if (str_equal(command, "export")) { command_export(argument); return; }
+    if (str_equal(command, "unset")) { command_unset(argument); return; }
 
     if (str_equal(command, "ls"))
     {
@@ -2262,10 +2568,18 @@ void execute_command(
     if (str_equal(command, "uname")) { command_uname(); return; }
     if (str_equal(command, "whoami")) { command_whoami(); return; }
     if (str_equal(command, "net")) { command_net(); return; }
+    if (str_equal(command, "ifconfig")) { command_net(); return; }
     if (str_equal(command, "ping")) { command_ping(argument); return; }
+    if (str_equal(command, "nslookup")) { command_nslookup(argument); return; }
+    if (str_equal(command, "dnsserver")) { command_dnsserver(argument); return; }
     if (str_equal(command, "selftest")) { command_selftest(); return; }
     if (str_equal(command, "pages")) { command_pages(); return; }
     if (str_equal(command, "tasks")) { command_tasks(); return; }
+    if (str_equal(command, "threads")) { command_threads(); return; }
+    if (str_equal(command, "smp")) { command_smp_status(); return; }
+    if (str_equal(command, "fbinfo")) { command_fbinfo(); return; }
+    if (str_equal(command, "fds")) { fd_list(); return; }
+    if (str_equal(command, "thread-demo")) { command_thread_demo(); return; }
     if (str_equal(command, "mount")) { command_mount(); return; }
     if (str_equal(command, "stats")) { command_stats(); return; }
     if (str_equal(command, "log")) { command_log(argument); return; }
@@ -2373,7 +2687,7 @@ void execute_command(
         if (argument == 0 || argument[0] == '\0')
         {
             uart_puts(
-                "syscall: usage: syscall <ping|uptime|pid|tick|mem|write> [text]\r\n"
+                "syscall: usage: syscall <ping|uptime|pid|tick|mem|write|fd> [text]\r\n"
             );
             return;
         }
@@ -2424,6 +2738,89 @@ void execute_command(
             uart_puts("syscall heap free: ");
             print_u64(result);
             uart_puts(" bytes\r\n");
+            return;
+        }
+
+        if (str_equal(argument, "fd"))
+        {
+            const char* path = "/storage/home/.rioos-fd-selftest.tmp";
+            static const char payload[] = "fd-ok";
+            char received[sizeof(payload)];
+            for (unsigned i = 0; i < sizeof(received); ++i) received[i] = '\0';
+
+            if (fs_resolve(path, vfs_cwd()) >= 0)
+            {
+                uart_puts("syscall fd: refusing to overwrite existing test file\r\n");
+                return;
+            }
+
+            fd_close_all();
+            int64_t descriptor = (int64_t)syscall_invoke(
+                SYS_FD_OPEN, (uint64_t)path,
+                FD_O_CREAT | FD_O_RDWR | FD_O_TRUNC, 0, 0, 0);
+            int passed = descriptor >= 3;
+            if (passed)
+            {
+                uint64_t written = syscall_invoke(SYS_FD_WRITE,
+                    (uint64_t)descriptor, (uint64_t)payload, sizeof(payload) - 1, 0, 0, 0);
+                uint64_t sought = syscall_invoke(SYS_FD_SEEK,
+                    (uint64_t)descriptor, 0, 0, 0, 0, 0);
+                uint64_t read_count = syscall_invoke(SYS_FD_READ,
+                    (uint64_t)descriptor, (uint64_t)received, sizeof(payload) - 1, 0, 0, 0);
+                passed = written == sizeof(payload) - 1 && sought == 0 &&
+                         read_count == sizeof(payload) - 1;
+                for (unsigned i = 0; passed && i < sizeof(payload); ++i)
+                    if (received[i] != payload[i]) passed = 0;
+
+                /* Duplicates share the underlying open-file cursor. */
+                int duplicate = (int)(int64_t)syscall_invoke(
+                    SYS_FD_DUP, (uint64_t)descriptor, 0, 0, 0, 0, 0);
+                char dup_bytes[4] = {0, 0, 0, 0};
+                int dup_ok = duplicate >= 3 &&
+                    syscall_invoke(SYS_FD_SEEK, (uint64_t)descriptor, 0, 0, 0, 0, 0) == 0 &&
+                    syscall_invoke(SYS_FD_READ, (uint64_t)duplicate,
+                        (uint64_t)dup_bytes, 2, 0, 0, 0) == 2 &&
+                    syscall_invoke(SYS_FD_READ, (uint64_t)descriptor,
+                        (uint64_t)(dup_bytes + 2), 2, 0, 0, 0) == 2 &&
+                    dup_bytes[0] == 'f' && dup_bytes[1] == 'd' &&
+                    dup_bytes[2] == '-' && dup_bytes[3] == 'o';
+                if (duplicate >= 3 && syscall_invoke(
+                    SYS_FD_CLOSE, (uint64_t)duplicate, 0, 0, 0, 0, 0) != 0)
+                    dup_ok = 0;
+                if (!dup_ok) passed = 0;
+
+                if (syscall_invoke(SYS_FD_CLOSE, (uint64_t)descriptor, 0, 0, 0, 0, 0) != 0)
+                    passed = 0;
+            }
+
+            /* The same ordinary read/write syscalls must support a kernel pipe. */
+            int pipefd[2] = {-1, -1};
+            static const char pipe_payload[] = "pipe-ok";
+            char pipe_received[sizeof(pipe_payload)];
+            for (unsigned i = 0; i < sizeof(pipe_received); ++i) pipe_received[i] = '\0';
+            int pipe_ok = syscall_invoke(SYS_FD_PIPE, (uint64_t)pipefd, 0, 0, 0, 0, 0) == 0;
+            if (pipe_ok)
+            {
+                uint64_t sent = syscall_invoke(SYS_FD_WRITE, (uint64_t)pipefd[1],
+                    (uint64_t)pipe_payload, sizeof(pipe_payload) - 1, 0, 0, 0);
+                uint64_t got = syscall_invoke(SYS_FD_READ, (uint64_t)pipefd[0],
+                    (uint64_t)pipe_received, sizeof(pipe_payload) - 1, 0, 0, 0);
+                pipe_ok = sent == sizeof(pipe_payload) - 1 && got == sent;
+                for (unsigned i = 0; pipe_ok && i < sizeof(pipe_payload) - 1; ++i)
+                    if (pipe_received[i] != pipe_payload[i]) pipe_ok = 0;
+                if (syscall_invoke(SYS_FD_CLOSE, (uint64_t)pipefd[1], 0, 0, 0, 0, 0) != 0)
+                    pipe_ok = 0;
+                if (syscall_invoke(SYS_FD_READ, (uint64_t)pipefd[0],
+                    (uint64_t)pipe_received, 1, 0, 0, 0) != 0) pipe_ok = 0;
+                if (syscall_invoke(SYS_FD_CLOSE, (uint64_t)pipefd[0], 0, 0, 0, 0, 0) != 0)
+                    pipe_ok = 0;
+            }
+            if (!pipe_ok) passed = 0;
+
+            fd_close_all();
+            (void)fs_rm(path, vfs_cwd());
+            uart_puts(passed ? "syscall fd: PASS (open/read/write/seek/close/dup/pipe)\r\n"
+                             : "syscall fd: FAIL\r\n");
             return;
         }
 

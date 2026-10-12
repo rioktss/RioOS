@@ -80,6 +80,11 @@ if [[ "$CLEAN" -eq 1 ]]; then
     rm -f "$HOST_TOOLS"/syscall_host_test
     rm -f "$HOST_TOOLS"/diag_host_test
     rm -f "$HOST_TOOLS"/vfs_host_test
+    rm -f "$HOST_TOOLS"/env_host_test
+    rm -f "$HOST_TOOLS"/fd_host_test
+    rm -f "$HOST_TOOLS"/process_host_test
+    rm -f "$HOST_TOOLS"/scheduler_process_host_test
+    rm -f "$HOST_TOOLS"/smp_host_test "$HOST_TOOLS"/fb_host_test
 fi
 
 src_of() {
@@ -106,10 +111,10 @@ ASMFLAGS=(
 )
 
 MODULES=(
-    uart memory string fs vfs process scheduler timer interrupt keyboard
-    commands version shell history env rtc exceptions syscall user mmu virtio_mmio virtio_blk storage
+    uart memory string fs vfs process sched_policy scheduler timer interrupt keyboard
+    commands version shell history env rtc exceptions syscall user mmu virtio_mmio virtio_blk storage thread fd
     fb font
-    elf virtio_net netstack page_alloc fault diag security kernel
+    elf virtio_net netstack page_alloc fault diag security smp kernel
 )
 
 # MINIMAL PRINT CUMA INI
@@ -163,6 +168,7 @@ step "4/9" "Compiling boot"
 "$CLANG" "${ASMFLAGS[@]}" -c boot/boot.S -o build/boot.o
 "$CLANG" "${ASMFLAGS[@]}" -c boot/exceptions.S -o build/exception_vectors.o
 "$CLANG" "${ASMFLAGS[@]}" -c process/user_entry.S -o build/user_entry.o
+"$CLANG" "${ASMFLAGS[@]}" -c process/ctx_switch.S -o build/ctx_switch.o
 
 step "5/9" "Compiling kernel (${#MODULES[@]} modules)"
 for f in "${MODULES[@]}"; do
@@ -180,13 +186,13 @@ done
 
 step "6/9" "Linking"
 "$LD" -T linker.ld -nostdlib -z max-page-size=0x1000 \
-    build/boot.o build/exception_vectors.o build/user_entry.o \
+    build/boot.o build/exception_vectors.o build/user_entry.o build/ctx_switch.o \
     build/kernel.o build/uart.o build/memory.o build/string.o build/fs.o build/vfs.o \
-    build/process.o build/scheduler.o build/timer.o build/interrupt.o build/keyboard.o \
+    build/process.o build/sched_policy.o build/scheduler.o build/timer.o build/interrupt.o build/keyboard.o \
     build/commands.o build/version.o build/shell.o build/history.o build/env.o build/rtc.o build/exceptions.o build/syscall.o build/user.o build/mmu.o \
     build/virtio_mmio.o build/virtio_blk.o build/storage.o build/elf.o build/virtio_net.o \
     build/netstack.o build/page_alloc.o build/fault.o build/diag.o build/security.o \
-    build/fb.o build/font.o \
+    build/fb.o build/font.o build/thread.o build/fd.o build/smp.o \
     -o build/kernel.elf
 
 step "7/9" "Verifying ELF"
@@ -213,7 +219,7 @@ step "8/9" "Running host tests"
 "$HOST_TOOLS/mem_host_test" > /dev/null
 
 "$CXX" -std=c++17 -O2 -Wall -Wextra -pedantic -iquote include -DHOST_TEST \
-    tests/syscall_host_test.cpp kernel/syscall.cpp \
+    tests/syscall_host_test.cpp kernel/syscall.cpp kernel/fd.cpp \
     -o "$HOST_TOOLS/syscall_host_test"
 "$HOST_TOOLS/syscall_host_test" > /dev/null
 
@@ -231,6 +237,36 @@ step "8/9" "Running host tests"
     tests/sched_host_test.cpp process/sched_policy.cpp \
     -o "$HOST_TOOLS/sched_host_test"
 "$HOST_TOOLS/sched_host_test" > /dev/null
+
+"$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -iquote include -DHOST_TEST \
+    tests/env_host_test.cpp kernel/env.cpp kernel/string.cpp \
+    -o "$HOST_TOOLS/env_host_test"
+"$HOST_TOOLS/env_host_test" > /dev/null
+
+"$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -iquote include -DHOST_TEST \
+    tests/fd_host_test.cpp kernel/fd.cpp fs/fs.cpp kernel/string.cpp kernel/rtc.cpp \
+    -o "$HOST_TOOLS/fd_host_test"
+"$HOST_TOOLS/fd_host_test" > /dev/null
+
+"$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -iquote include -DHOST_TEST \
+    tests/process_host_test.cpp process/process.cpp kernel/string.cpp \
+    -o "$HOST_TOOLS/process_host_test"
+"$HOST_TOOLS/process_host_test" > /dev/null
+
+"$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -iquote include -DHOST_TEST \
+    tests/scheduler_process_host_test.cpp process/scheduler.cpp process/process.cpp kernel/string.cpp \
+    -o "$HOST_TOOLS/scheduler_process_host_test"
+"$HOST_TOOLS/scheduler_process_host_test" > /dev/null
+
+"$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -iquote include -DHOST_TEST \
+    tests/smp_host_test.cpp kernel/smp.cpp \
+    -o "$HOST_TOOLS/smp_host_test"
+"$HOST_TOOLS/smp_host_test" > /dev/null
+
+"$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -iquote include -DHOST_TEST \
+    tests/fb_host_test.cpp drivers/fb.cpp drivers/font.cpp \
+    -o "$HOST_TOOLS/fb_host_test"
+"$HOST_TOOLS/fb_host_test" > /dev/null
 
 step "9/9" "Release verification"
 "$PYTHON" tests/verify_release.py > /dev/null

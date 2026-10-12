@@ -9,6 +9,10 @@
   <a href="https://github.com/rioktss/RioOS">Repository</a> ·
   <a href="./docs/BUILD_AND_RUN.md">Build & Run</a> ·
   <a href="./docs/ARCHITECTURE.md">Architecture</a> ·
+  <a href="./docs/P0_HARDENING.md">P0 Hardening</a> ·
+  <a href="./docs/P1_FD_PIPES.md">P1 FD & Pipes</a> ·
+  <a href="./docs/P2_FILESYSTEM_SECURITY.md">P2 Filesystem & Security</a> ·
+  <a href="./docs/P3_NETWORKING.md">P3 Networking</a> ·
   <a href="./docs/LEARN.md">Learning Guide</a>
 </p>
 
@@ -30,7 +34,7 @@ The repository explores topics such as:
 - AArch64 boot and exception handling
 - kernel memory management and MMU setup
 - UART and interactive shell development
-- processes, threads, and scheduling
+- process metadata, scheduling policy, and cooperative kernel threads
 - system calls and user/kernel boundaries
 - ELF userspace loading
 - virtual filesystems and persistent storage
@@ -54,6 +58,8 @@ Some subsystems are already implemented and tested, while others are still being
 
 ## Current capabilities
 
+**Current source baseline: 1.10.0 (P4 SMP/driver/framebuffer foundations).** This increment retains P0-P3 and adds CPU Affinity-0 diagnostics, acquire/release spinlock primitives, tested framebuffer text scrolling/background clearing, stricter VirtIO-Net RX length handling, `smp`/`fbinfo` diagnostics, and GitHub Actions CI. SMP remains disabled, only one CPU is reported online, the framebuffer is a reserved software RAM surface not attached to QEMU display, and timer IRQ remains off during normal boot. The process scheduler limitation remains explicit: process scheduling is still logical metadata, while CPU context switching is currently for cooperative kernel threads. See the [P4 notes](./docs/P4_SMP_DRIVER_HARDENING.md) and earlier P0-P3 documents for detailed scope and limitations.
+
 | Area | Current focus |
 |---|---|
 | CPU / platform | ARM64 / AArch64, QEMU `virt` |
@@ -65,14 +71,17 @@ Some subsystems are already implemented and tested, while others are still being
 | Interrupts | GIC support and interrupt handling |
 | Timer | Generic Timer support |
 | Processes | Process lifecycle and user/kernel execution |
-| Scheduler | Scheduler and scheduling policy components |
-| Syscalls | Kernel syscall interface + host tests |
+| Scheduler | Logical process scheduler + cooperative kernel-thread context switching (`yield`) |
+| Syscalls | Kernel syscall interface, pointer validation, and host tests |
+| File descriptors | Per-process tables, `open/read/write/close/seek`, shared-offset `dup/dup2`, standard streams, and bounded I/O |
+| IPC primitives | Bounded non-blocking kernel pipes exposed through `pipe/read/write/close` syscalls |
 | Userspace | ELF loading + bundled userspace programs |
 | Filesystem | Custom filesystem/VFS + persistent disk image |
 | Storage | VirtIO block device |
-| Networking | VirtIO network device + network stack components |
-| Graphics/input | Framebuffer/font code and keyboard components |
-| Validation | Host-side tests + release verification |
+| Networking | VirtIO-Net, ARP/IPv4/ICMP, UDP datagrams, bounded owner-scoped UDP sockets, DNS A lookup |
+| Graphics/input | Tested framebuffer RAM-surface rendering/scrolling and keyboard components; not a QEMU video device |
+| Shell | Environment expansion, `export`/`unset`, and in-memory `cat`/`echo` pipes to `grep`/`wc` |
+| Validation | 13 host-side tests + release verification + GitHub Actions CI |
 
 ## Architecture at a glance
 
@@ -216,9 +225,25 @@ Type 'help' to get started.
 
 The exact boot log can change as development continues.
 
+### Cooperative threads and timer safety
+
+This release links the AArch64 context-switch path and initializes a small cooperative kernel-thread subsystem. Try `threads` to inspect it, or `thread-demo` to run two yielding demo threads. This is **cooperative thread switching**, not full preemptive process multitasking. The periodic Generic Timer IRQ and CPU IRQ unmasking remain disabled during normal boot; `thread-demo` does not enable them.
+
+### P4: SMP/driver foundations and terminal rendering
+
+The 1.10.0 increment adds a CPU-topology diagnostic (`smp`) and acquire/release spinlock primitives as groundwork. It intentionally does **not** start secondary CPUs: per-CPU stacks/state, secondary boot protocol, interrupt routing, and subsystem-wide lock auditing are still required first. The reported online CPU count remains one and `smp_is_enabled()` remains false.
+
+Framebuffer rendering is now host-testable and scrolls one text row instead of clearing the whole surface. `fbinfo` explicitly reports that this is a reserved RAM surface and is not connected to a QEMU video adapter; the serial UART remains the real console. VirtIO-Net now rejects impossible receive lengths and avoids silently truncating Ethernet frames. A GitHub Actions workflow performs clean builds, host tests, and release checks. See [`docs/P4_SMP_DRIVER_HARDENING.md`](./docs/P4_SMP_DRIVER_HARDENING.md).
+
+P4 still does not enable timer IRQs during boot and does not claim SMP-safe drivers, real GUI support, or a complete graphical terminal.
+
+### File descriptors and userspace API
+
+The syscall ABI now includes bounded file-descriptor operations (`SYS_FD_OPEN`, `SYS_FD_CLOSE`, `SYS_FD_READ`, `SYS_FD_WRITE`, and `SYS_FD_SEEK`). The matching inline helpers and open flags are in `include/user_api.h`; the kernel implementation is in `kernel/fd.cpp`. Descriptors 0/1/2 represent non-blocking stdin and UART stdout/stderr. File reads/writes are limited to 4096 bytes per syscall, individual files to the filesystem limit, and descriptors are reset around each EL0 execution because RioOS currently supports one active userspace program at a time. This is a foundational API, not a claim of complete POSIX compatibility or generic kernel pipes. Use `fds` to inspect the current descriptor table.
+
 ## Shell and userspace
 
-The repository includes an interactive shell and bundled userspace programs. Depending on the current build, useful commands include filesystem navigation, process inspection, scheduler information, system-call tests, ELF execution, and disk/network diagnostics.
+The repository includes an interactive shell and bundled userspace programs. Useful commands include filesystem navigation, `export`/`unset` and `$VAR` expansion, `cat file | grep pattern`, `cat file | wc -l`, process/thread inspection, system-call tests (`syscall fd` exercises open/write/seek/read/close), ELF execution, and disk/network diagnostics.
 
 Start with:
 
@@ -227,6 +252,7 @@ help
 ```
 
 For a learning-oriented tour of the shell, ELF userspace, syscalls, and filesystem, see [`docs/LEARN.md`](./docs/LEARN.md).
+For details and a userspace example of the new descriptor syscalls, see [`docs/FILE_DESCRIPTORS.md`](./docs/FILE_DESCRIPTORS.md).
 
 ## Persistence
 
@@ -249,7 +275,7 @@ The build pipeline currently includes checks for areas such as:
 - filesystem persistence and VFS behaviour
 - network parsing
 - memory/page allocation helpers
-- syscall helpers
+- syscall helpers and file-descriptor API regression tests
 - diagnostics
 - scheduler policy
 - AArch64 kernel ELF properties

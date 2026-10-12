@@ -71,6 +71,8 @@ tests/mem_host_test.cpp
 tests/syscall_host_test.cpp
 tests/diag_host_test.cpp
 tests/sched_host_test.cpp
+tests/env_host_test.cpp
+tests/fd_host_test.cpp
 ```
 
 These tests do not replace QEMU testing. They make fast subsystem-level regression checks possible.

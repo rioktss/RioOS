@@ -56,6 +56,22 @@ int env_set(const char* assignment)
     return 0;
 }
 
+int env_unset(const char* name)
+{
+    if (!name || !name[0]) return -1;
+
+    for (int i = 0; name[i]; ++i)
+        if (!valid_name_char(name[i], i == 0)) return -1;
+
+    int idx = find_entry(name);
+    if (idx < 0) return -2;
+
+    envs[idx].used = 0;
+    envs[idx].name[0] = '\0';
+    envs[idx].value[0] = '\0';
+    return 0;
+}
+
 const char* env_get(const char* name)
 {
     int idx = find_entry(name);

@@ -82,6 +82,12 @@ interactive RioOS shell
 
 The exact initialization order can change as the kernel evolves. The authoritative implementation is the source tree.
 
+## Cooperative threads and interrupt policy
+
+`process/thread.cpp` and `process/ctx_switch.S` implement a small AArch64 cooperative thread facility. A thread gives up the CPU explicitly through `thread_yield()`, and the context switch saves/restores the AAPCS64 callee-saved register set and stack pointer. `thread-demo` exercises this path without unmasking CPU IRQs or enabling timer interrupts.
+
+This must not be confused with complete preemptive multitasking: the process table scheduler is still primarily process metadata/policy, and the current EL0 execution path runs one user program synchronously. Periodic timer IRQs remain disabled during boot because interrupt-driven preemption has not been validated for interactive input.
+
 ## AArch64 exception and interrupt model
 
 Low-level exception entry is implemented in Assembly and connected to C++ exception/interrupt handling.
@@ -156,7 +162,7 @@ The scheduler is an active development area, so the implementation details shoul
 
 ## System calls and userspace
 
-The syscall interface is represented by the syscall layer in the kernel and corresponding userspace support.
+The syscall interface is represented by the syscall layer in the kernel and corresponding userspace support. File-descriptor syscalls (`open`, `close`, `read`, `write`, `seek`) share a bounded kernel descriptor table; descriptors 0/1/2 map to polled UART input and UART output/error. User pointers are validated before buffer access. Since EL0 programs still run one at a time, the table is reset on each userspace entry/return and is not yet a separate table per process.
 
 A simplified path looks like:
 
@@ -278,6 +284,7 @@ See [`../tests/TEST_MATRIX.md`](../tests/TEST_MATRIX.md).
 | Where are processes/threads? | `process/` |
 | Where is scheduling implemented? | `process/scheduler.cpp`, `process/sched_policy.cpp` |
 | Where are syscalls? | `kernel/syscall.cpp`, `include/syscall.h` |
+| Where are file descriptors? | `kernel/fd.cpp`, `include/fd.h`, `include/user_api.h` |
 | How are ELF programs loaded? | `process/elf.cpp` |
 | Where is the filesystem? | `fs/` |
 | Where are block/network drivers? | `drivers/virtio_*.cpp`, `drivers/storage.cpp` |
@@ -304,3 +311,14 @@ userspace
 ```
 
 This makes the project useful for learning because the path from a virtual device to a shell command is traceable in the repository.
+
+## P0 hardening baseline
+
+See [P0_HARDENING.md](./P0_HARDENING.md) for the safety invariants, verification steps, timer policy, and explicit process-scheduler limitations in version 1.6.1.
+
+
+## CPU and framebuffer status (v1.10.0)
+
+The P4 SMP API reads `MPIDR_EL1.Aff0` for diagnostics and provides atomic spinlock primitives. The production state remains one online CPU; secondary CPUs are not launched and the locks are groundwork, not evidence that all existing drivers are SMP-safe. Timer IRQ remains disabled in normal boot.
+
+The framebuffer driver is a bounded software RAM surface at the address reserved by the memory layout. It supports text glyphs, background clearing, and row scrolling, but the default `-nographic` QEMU runner does not connect this RAM to a display device. UART remains the supported interactive console until a real display backend is implemented and tested.

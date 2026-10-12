@@ -7,6 +7,7 @@
 #include "keyboard.h"
 #include "shell.h"
 #include "scheduler.h"
+#include "thread.h"
 #include "exceptions.h"
 #include "syscall.h"
 #include "mmu.h"
@@ -15,6 +16,7 @@
 #include "interrupt.h"
 #include "page_alloc.h"
 #include "security.h"
+#include "smp.h"
 #include "version.h"
 
 extern "C" void kernel_main()
@@ -28,6 +30,23 @@ extern "C" void kernel_main()
         "QEMU virt machine\r\n"
         "\r\n"
     );
+
+    /* Read this core's MPIDR affinity. Secondary-core startup remains disabled. */
+    smp_init();
+    uart_puts("[0] CPU topology: boot CPU affinity-0 = ");
+    {
+        char cpu_id_text[4];
+        uint32_t cpu_id = smp_cpu_id();
+        int pos = 0;
+        if (cpu_id == 0U) cpu_id_text[pos++] = '0';
+        while (cpu_id > 0U && pos < 3)
+        {
+            cpu_id_text[pos++] = (char)('0' + (cpu_id % 10U));
+            cpu_id /= 10U;
+        }
+        while (pos > 0) uart_putc(cpu_id_text[--pos]);
+    }
+    uart_puts("; online CPUs = 1; SMP disabled by design.\r\n");
 
     uart_puts("[1] Initializing memory...\r\n");
     memory_init();
@@ -77,6 +96,8 @@ extern "C" void kernel_main()
 
     uart_puts("[12] Initializing scheduler...\r\n");
     scheduler_init();
+    thread_init();
+    uart_puts("Cooperative thread subsystem initialized (timer preemption remains off).\r\n");
 
     uart_puts("[13] Initializing interrupt controller...\r\n");
     interrupt_init();

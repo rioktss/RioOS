@@ -2,6 +2,7 @@
 #include "types.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static FILE* g_file = 0;
 static const uint64_t SECTOR = 512;
@@ -26,7 +27,8 @@ int storage_write_sector(uint64_t sector,const void* buffer)
 }
 int storage_flush(){return g_file&&fflush(g_file)==0?0:-1;}
 
-static void fail(const char* m){fprintf(stderr,"FS HOST TEST FAIL: %s\n",m);exit(1);} 
+static void fail(const char* m){fprintf(stderr,"FS HOST TEST FAIL: %s\n",m);exit(1);}
+#define CHECK(c) do { if (!(c)) { fprintf(stderr, "FS HOST TEST FAIL line %d: %s\n", __LINE__, #c); fail(#c); } } while (0)
 static int same(const unsigned char*a,const unsigned char*b,unsigned long n){for(unsigned long i=0;i<n;i++)if(a[i]!=b[i])return 0;return 1;}
 
 int main(){
@@ -79,5 +81,97 @@ int main(){
         fs_init();
         if(fs_resolve("/renamed/b.txt",fs_get_root())<0||fs_resolve("/mvdir",fs_get_root())>=0)fail("rename persistence");
     }
+    /* P2: persisted ownership, permission enforcement, stat and truncate. */
+    {
+        int root = fs_get_root();
+        const char* locked = "/p2-root-secret.txt";
+        CHECK(fs_touch(locked, root) >= 0);
+        CHECK(fs_write_data(locked, root, (const uint8_t*)"secret", 6) == 0);
+        int locked_id = fs_resolve(locked, root);
+        CHECK(locked_id >= 0 && fs_get_uid(locked_id) == 0U && fs_get_gid(locked_id) == 0U);
+        CHECK(fs_set_mode(locked_id, 0600U) == 0);
+
+        fs_set_credentials(1000U, 1000U);
+        unsigned char readbuf[32] = {0}; uint64_t readsize = 0;
+        CHECK(fs_read_file(locked, root, readbuf, sizeof(readbuf), &readsize) == -13);
+        CHECK(fs_write_data(locked, root, (const uint8_t*)"hack", 4) == -13);
+        CHECK(fs_set_mode(locked_id, 0644U) == -13);
+        CHECK(fs_set_owner(locked_id, 1000U, 1000U) == -13);
+        CHECK(fs_mkdir("/p2-user-must-not-create-at-root", root) == -13);
+
+        const char* owned = "/storage/home/p2-owned.txt";
+        CHECK(fs_touch(owned, root) >= 0);
+        CHECK(fs_write_data(owned, root, (const uint8_t*)"abc", 3) == 0);
+        int owned_id = fs_resolve(owned, root);
+        CHECK(owned_id >= 0 && fs_get_uid(owned_id) == 1000U && fs_get_gid(owned_id) == 1000U);
+        CHECK(fs_set_mode(owned_id, 0600U) == 0); /* owner may chmod own file */
+        FsStat st;
+        CHECK(fs_stat_path(owned, root, &st) == 0);
+        CHECK(st.inode == (uint32_t)owned_id && st.type == FS_FILE && st.mode == 0600U);
+        CHECK(st.uid == 1000U && st.gid == 1000U && st.size == 3U);
+        CHECK(fs_truncate(owned, root, 5) == 0);
+        memset(readbuf, 0xFF, sizeof(readbuf)); readsize = 0;
+        CHECK(fs_read_file(owned, root, readbuf, sizeof(readbuf), &readsize) == 0);
+        CHECK(readsize == 5 && readbuf[0] == 'a' && readbuf[1] == 'b' && readbuf[2] == 'c' && readbuf[3] == 0 && readbuf[4] == 0);
+        CHECK(fs_truncate(owned, root, 1) == 0);
+        CHECK(fs_truncate(owned, root, 262145U) == -27);
+
+        /* Search permission must be required before processing dot-dot. */
+        fs_set_credentials(1000U, 1000U);
+        CHECK(fs_mkdir("/storage/home/p2-no-search", root) >= 0);
+        int no_search_id = fs_resolve("/storage/home/p2-no-search", root);
+        CHECK(no_search_id >= 0 && fs_set_mode(no_search_id, 0600U) == 0);
+        CHECK(fs_resolve("/storage/home/p2-no-search/../p2-owned.txt", root) == -13);
+        CHECK(fs_mkdir_p("/storage/home/p2-no-search/../p2-created-escape", root) == -13);
+        CHECK(fs_resolve("/storage/home/p2-created-escape", root) == -1);
+        fs_set_credentials(0U, 0U);
+        CHECK(fs_rm("/storage/home/p2-no-search", root) == 0);
+
+        CHECK(fs_set_owner(owned_id, 2000U, 2000U) == 0);
+        CHECK(fs_get_uid(owned_id) == 2000U && fs_get_gid(owned_id) == 2000U);
+
+        /* Legacy v1 inode: clear the P2 metadata marker and verify conservative migration. */
+        const char* legacy = "/storage/home/p2-legacy.txt";
+        CHECK(fs_touch(legacy, root) >= 0);
+        int legacy_id = fs_resolve(legacy, root);
+        CHECK(legacy_id >= 0);
+        /* Also test a legacy file outside user homes is conservatively system-owned. */
+        long marker_offset = (long)(512ULL + (uint64_t)legacy_id * 128ULL + 120ULL);
+        long locked_marker_offset = (long)(512ULL + (uint64_t)locked_id * 128ULL + 120ULL);
+        CHECK(fseek(g_file, marker_offset, SEEK_SET) == 0);
+        const unsigned char zeros[4] = {0,0,0,0};
+        CHECK(fwrite(zeros, 1, sizeof(zeros), g_file) == sizeof(zeros));
+        CHECK(fseek(g_file, locked_marker_offset, SEEK_SET) == 0);
+        CHECK(fwrite(zeros, 1, sizeof(zeros), g_file) == sizeof(zeros));
+        CHECK(fflush(g_file) == 0);
+        fs_init();
+        legacy_id = fs_resolve(legacy, fs_get_root());
+        CHECK(legacy_id >= 0 && fs_get_uid(legacy_id) == 1000U && fs_get_gid(legacy_id) == 1000U);
+        locked_id = fs_resolve(locked, fs_get_root());
+        CHECK(locked_id >= 0 && fs_get_uid(locked_id) == 0U && fs_get_gid(locked_id) == 0U);
+        CHECK(fs_get_uid(fs_resolve("/bin", fs_get_root())) == 0U);
+        owned_id = fs_resolve(owned, fs_get_root());
+        CHECK(owned_id >= 0 && fs_get_uid(owned_id) == 2000U && fs_get_gid(owned_id) == 2000U);
+        CHECK(fs_stat_path(owned, fs_get_root(), &st) == 0 && st.uid == 2000U && st.gid == 2000U);
+    }
+
+    /* A corrupted UINT64_MAX file size must be rejected rather than wrapping
+       the sector-count calculation to zero and being accepted as an empty file. */
+    {
+        int root = fs_get_root();
+        fs_set_credentials(0U, 0U);
+        CHECK(fs_touch("/p2-corrupt-size.bin", root) >= 0);
+        int bad_id = fs_resolve("/p2-corrupt-size.bin", root);
+        CHECK(bad_id >= 0);
+        const long size_offset = (long)(512ULL + (uint64_t)bad_id * 128ULL + 16ULL);
+        const unsigned char impossible_size[8] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+        CHECK(fseek(g_file, size_offset, SEEK_SET) == 0);
+        CHECK(fwrite(impossible_size, 1, sizeof(impossible_size), g_file) == sizeof(impossible_size));
+        CHECK(fflush(g_file) == 0);
+        fs_init();
+        CHECK(fs_persistent() == 0);
+        CHECK(fs_resolve("/p2-corrupt-size.bin", fs_get_root()) < 0);
+    }
+
     fclose(g_file); remove(path); puts("FS HOST TEST: PASS"); return 0;
 }

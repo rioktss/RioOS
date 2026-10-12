@@ -316,3 +316,33 @@ On Windows:
 ```
 
 Cleaning removes generated build/test artifacts; it is separate from the source tree.
+
+## P0 hardening release
+
+The 1.6.1 build includes process-manager and logical scheduler regression tests, stricter ELF load-segment/page-permission validation, and syscall pointer-scan overflow guards. Normal boot keeps timer IRQ disabled. Review [P0_HARDENING.md](./P0_HARDENING.md) for verified scope and known scheduler limits.
+
+
+## P1 descriptor and pipes release (v1.7.0)
+
+Version 1.7.0 adds process-PID-scoped descriptor tables, shared open-file descriptions for `dup`/`dup2`, and a bounded non-blocking kernel pipe syscall. Run `bash build.sh` to execute the new host regressions. See [P1_FD_PIPES.md](./P1_FD_PIPES.md) for behavior and limitations. This does not add `fork()`/`wait()` or concurrent EL0 process execution; timer IRQ remains disabled at boot.
+
+## P2 filesystem and permissions (v1.8.0)
+
+The filesystem persists owner UID/GID in unused inode metadata bytes and migrates older images without changing their inode size. Standard user identity is UID/GID `1000`; root is UID/GID `0`. The development root password is `rioos-root` (embedded demo credential; not production security).
+
+New commands: `stat <path>`, `chown <uid> <gid> <path>` (root only), and `truncate <path> <size>` (up to 262144 bytes; extension is zero-filled). `chmod` now requires file ownership or root. File reads/writes, parent-directory mutations, path traversal, and ELF execution check mode bits. `diskread`, `diskwrite`, and `diskflush` require root.
+
+P2 userspace syscall helpers are `user_fs_stat`, `user_fs_truncate`, and `user_fs_chmod` in `include/user_api.h`. Run `bash build.sh --clean` to rebuild and execute filesystem permission/migration and syscall regression tests. The kernel still uses a single global shell credential context, so this is educational access control rather than a hardened multi-user security boundary. Timer IRQ stays off at boot.
+
+## P3 UDP and DNS networking (v1.9.0)
+
+P3 adds owner-PID-scoped UDP handles, bound/ephemeral ports, bounded receive queues, IPv4/UDP validation and UDP transmit checksum, DNS A-record queries, network syscall helpers, and the `ifconfig`, `nslookup`, and root-only `dnsserver` commands. The default DNS address is `10.0.2.3` for QEMU user-mode networking. See [P3 networking notes](./P3_NETWORKING.md) for API use and limits.
+
+Run `bash build.sh --clean` for the AArch64 clean build and host regressions. On a machine with `qemu-system-aarch64`, also run `net`, `ping 10.0.2.2`, and `nslookup example.com`. Host tests use a fake NIC/DNS peer and are not a replacement for that QEMU runtime test. TCP, DHCP, IPv6, and IP fragment reassembly are not included, and timer IRQ remains disabled at boot.
+
+
+## P4 SMP/driver foundations (v1.10.0)
+
+Run `bash build.sh --clean` (or `.\build.ps1 --clean` in PowerShell) to build the new SMP and framebuffer host regressions alongside the existing suite. There are 13 host-test executables. The release check verifies SMP stays disabled, the framebuffer host test is present, VirtIO-Net RX buffers are bounded, and timer IRQ has not been enabled in the normal boot path.
+
+After launching QEMU on a host with `qemu-system-aarch64`, try `smp` and `fbinfo`. `smp` should report one online CPU and disabled SMP. `fbinfo` explains that the software framebuffer is not yet connected to a QEMU display; the UART remains the interactive console. Keep timer IRQ disabled during ordinary boot.
