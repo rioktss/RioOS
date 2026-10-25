@@ -4,5 +4,6 @@
 void keyboard_init();
 char keyboard_getc();
 int keyboard_has_data();
+int keyboard_try_getc(char* out);
 
 #endif

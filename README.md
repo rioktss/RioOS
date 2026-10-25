@@ -58,7 +58,7 @@ Some subsystems are already implemented and tested, while others are still being
 
 ## Current capabilities
 
-**Current source baseline: 1.10.0 (P4 SMP/driver/framebuffer foundations).** This increment retains P0-P3 and adds CPU Affinity-0 diagnostics, acquire/release spinlock primitives, tested framebuffer text scrolling/background clearing, stricter VirtIO-Net RX length handling, `smp`/`fbinfo` diagnostics, and GitHub Actions CI. SMP remains disabled, only one CPU is reported online, the framebuffer is a reserved software RAM surface not attached to QEMU display, and timer IRQ remains off during normal boot. The process scheduler limitation remains explicit: process scheduling is still logical metadata, while CPU context switching is currently for cooperative kernel threads. See the [P4 notes](./docs/P4_SMP_DRIVER_HARDENING.md) and earlier P0-P3 documents for detailed scope and limitations.
+**Current source baseline: 1.11.0 (QEMU pixel UI foundation).** This increment retains the previous kernel features and adds a QEMU `ramfb` pixel backend, a RioOS boot splash, Android-inspired lock/home screens, built-in pixel-rendered Terminal, Calculator, Clock, Files, Launcher, Wallpaper and Settings apps, seven `.rpk` manifests installed under `/apps`, local BMP wallpaper/icon assets, and an MIUI-inspired Control Centre. The GUI is launched through `run-ui.sh` (or `run-ui.ps1`); the existing `run.sh` / `run.ps1` serial-only path is preserved. The graphical runner attaches VirtIO keyboard and tablet devices for QEMU-window keyboard/pointer control, while UART remains a fallback. The pixel Terminal calls the same `execute_command()` dispatcher as the serial shell; it is a RioOS shell interface, not GNU Bash. SMP stays disabled and timer IRQ remains off during normal boot. Process scheduling is still logical metadata, while CPU context switching is currently for cooperative kernel threads. See [Android-like UI customization](./docs/ANDROID_UI.md), [Pixel UI documentation](./docs/PIXEL_UI.md), the [P4 notes](./docs/P4_SMP_DRIVER_HARDENING.md), and earlier P0-P3 documents for scope and limitations.
 
 | Area | Current focus |
 |---|---|
@@ -79,9 +79,25 @@ Some subsystems are already implemented and tested, while others are still being
 | Filesystem | Custom filesystem/VFS + persistent disk image |
 | Storage | VirtIO block device |
 | Networking | VirtIO-Net, ARP/IPv4/ICMP, UDP datagrams, bounded owner-scoped UDP sockets, DNS A lookup |
-| Graphics/input | Tested framebuffer RAM-surface rendering/scrolling and keyboard components; not a QEMU video device |
+| Graphics/input | Pixel renderer via QEMU `ramfb`; polled VirtIO keyboard/tablet input in `run-ui.sh`; UART fallback |
 | Shell | Environment expansion, `export`/`unset`, and in-memory `cat`/`echo` pipes to `grep`/`wc` |
-| Validation | 13 host-side tests + release verification + GitHub Actions CI |
+| Validation | 15 host-side test executables + release verification + GitHub Actions CI |
+
+## Pixel UI (v1.11.0)
+
+RioOS now contains a pixel-rendered boot splash (`RioOS` in white lettering), Android/MIUI-inspired lock screen and home launcher, seven built-in apps, selectable local BMP wallpapers, local `.rpk`-configured icons, persistent light/dark appearance settings, and a Control Centre. The renderer is implemented in freestanding C++ using direct pixel primitives and a compact antialiased proportional glyph table derived from Inter; the serial console keeps the original bitmap font. It does not depend on SDL, Qt, a GUI framework, or third-party graphics libraries inside the guest kernel. QEMU provides the `ramfb` display surface.
+
+Build, then launch the graphical QEMU runner:
+
+```bash
+bash build.sh --clean
+./run-ui.sh
+# For an SDL-enabled QEMU build: RIOOS_DISPLAY=sdl ./run-ui.sh
+```
+
+On Windows PowerShell, use `.\build.ps1 --clean` and `.\run-ui.ps1`. Focus the QEMU window to use its VirtIO keyboard/tablet input: swipe or drag upward to unlock, click an app icon, and type in the pixel Terminal. Serial input remains available as a fallback; home navigation also supports **A/D**, **W/S**, arrow keys, **Enter**, **1–7**, **C** for Control Centre, and **X** to return to the serial shell. Inside apps, **Esc** requests back. Shell commands including `exit` and `logout` keep the serial shell's normal meaning inside the Terminal.
+
+The local BMP format currently supports uncompressed 24-bit or 32-bit BMP images up to 1 MiB; add wallpaper files to `assets/wallpapers/` and app icons to `assets/icons/`, then rebuild to install them under `/wallpapers` and `/icons`. The `.rpk` files are versioned built-in-app manifests under `/apps`, not general-purpose executable packages. The app implementations are statically linked into the kernel until RioOS has a safe, stable app ABI. QEMU runtime display and interaction must still be verified on the target host; this source change has been build/host-test checked but cannot honestly be described as proven bug-free without a QEMU visual run.
 
 ## Architecture at a glance
 
@@ -223,7 +239,9 @@ Type 'help' to get started.
 [home@RioOS ]$
 ```
 
-The exact boot log can change as development continues.
+The exact boot log can change as development continues. A normal unprivileged shell now starts in `/home/user`, a writable home directory, so `nano note.txt` works without making the system root writable.
+
+For the graphical UI, focus the QEMU window. Use the window keyboard to navigate/type, swipe upward or drag upward on the lock screen to unlock, and click a home-screen app icon. `run-ui.sh`/`run-ui.ps1` attach VirtIO keyboard and tablet devices; the serial terminal remains a fallback. This input path is implemented in source but needs runtime validation with the QEMU version and Termux:X11/desktop environment you use.
 
 ### Cooperative threads and timer safety
 

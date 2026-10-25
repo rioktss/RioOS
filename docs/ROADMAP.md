@@ -146,4 +146,13 @@ Implemented in this increment:
 - `smp` and `fbinfo` shell diagnostics
 - GitHub Actions CI for clean build, host regression tests, and release verification
 
-Not implemented: secondary CPU release, per-CPU stacks/state, interrupt routing for multiple CPUs, system-wide SMP locking, real QEMU video-device integration, GUI/window manager, mouse support, or timer preemption. Do not enable SMP by editing only the online CPU count; the boot and driver invariants must be completed together.
+Not implemented: secondary CPU release, per-CPU stacks/state, interrupt routing for multiple CPUs, system-wide SMP locking, general USB/HID input, a full desktop window manager, dynamic RPK execution, or timer preemption. The current QEMU pixel UI is a single-screen built-in launcher using ramfb plus a polled VirtIO keyboard/tablet path. Do not enable SMP by editing only the online CPU count; the boot and driver invariants must be completed together.
+
+
+## Pixel UI foundation (v1.11.0)
+
+- Added a QEMU `ramfb` XRGB8888 renderer configured through `fw_cfg` DMA.
+- Added separate boot, lock screen, home screen, app router, and Terminal/Calculator/Clock/Files/Launcher modules under `ui/`.
+- Added and image-packaged five `/apps/*.rpk` built-in-app manifests with release checks.
+- Added `run-ui.sh` and `run-ui.ps1`; the established headless serial runners remain unchanged.
+- QEMU-window keyboard and pointer input use VirtIO keyboard/tablet devices; UART remains a fallback. General USB/HID input, dynamic package execution, and the broader Bash/POSIX shell remain future work. Do not claim runtime stability until the graphical boot and navigation matrix has been tested on QEMU.

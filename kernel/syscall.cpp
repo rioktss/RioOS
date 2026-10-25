@@ -1,5 +1,6 @@
 #include "syscall.h"
 #include "uart.h"
+#include "keyboard.h"
 #include "timer.h"
 #include "memory.h"
 #include "scheduler.h"
@@ -241,6 +242,10 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
 
         case SYS_READ:
         {
+#ifndef HOST_TEST
+            /* Flush captured TUI output before an EL0 program polls for input. */
+            uart_flush_output();
+#endif
             char* buf = (char*)frame->x[0];
             uint64_t len = frame->x[1];
 
@@ -262,10 +267,15 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
             uint64_t got = 0;
             while (got < len)
             {
-                int c = uart_try_getc();
-                if (c < 0)
-                    break;
-                buf[got++] = (char)c;
+                char input_char = 0;
+#ifdef HOST_TEST
+                int serial_char = uart_try_getc();
+                if (serial_char < 0) break;
+                input_char = (char)serial_char;
+#else
+                if (!keyboard_try_getc(&input_char)) break;
+#endif
+                buf[got++] = input_char;
             }
             result = got;
             break;
@@ -512,7 +522,7 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
                 result = (uint64_t)-14;
                 break;
             }
-            if (frame->x[1] > 262144ULL)
+            if (frame->x[1] > 1048576ULL)
             {
                 result = (uint64_t)-27;
                 break;

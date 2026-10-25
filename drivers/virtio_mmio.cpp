@@ -85,10 +85,12 @@ static int compatible_has_virtio_mmio(const uint8_t* value, uint32_t len)
    whether a DTB was handed to the guest, so we can find devices by
    probing each slot's magic/version/device-id registers directly. */
 static int virtio_mmio_scan_fixed_window(uint32_t wanted_device_id,
+                                          uint32_t instance,
                                           uint64_t* base,
                                           uint64_t* size,
                                           int* irq)
 {
+    uint32_t matches = 0;
     for (uint64_t addr = MMIO_DEVICE_MIN; addr < MMIO_DEVICE_MAX; addr += MMIO_DEVICE_STRIDE)
     {
         volatile uint32_t* regs = (volatile uint32_t*)addr;
@@ -96,6 +98,7 @@ static int virtio_mmio_scan_fixed_window(uint32_t wanted_device_id,
             regs[V_VERSION / 4] == VIRTIO_VERSION &&
             regs[V_DEVICE_ID / 4] == wanted_device_id)
         {
+            if (matches++ != instance) continue;
             *base = addr;
             *size = 0x200ULL;
             *irq = -1;
@@ -110,15 +113,24 @@ int virtio_mmio_find_device(uint32_t wanted_device_id,
                             uint64_t* size,
                             int* irq)
 {
+    return virtio_mmio_find_device_instance(wanted_device_id, 0, base, size, irq);
+}
+
+int virtio_mmio_find_device_instance(uint32_t wanted_device_id,
+                                     uint32_t instance,
+                                     uint64_t* base,
+                                     uint64_t* size,
+                                     int* irq)
+{
     if (!base || !size || !irq) return 0;
     *irq = -1;
 
     if (boot_dtb_ptr == 0)
-        return virtio_mmio_scan_fixed_window(wanted_device_id, base, size, irq);
+        return virtio_mmio_scan_fixed_window(wanted_device_id, instance, base, size, irq);
 
     const uint8_t* dtb = (const uint8_t*)boot_dtb_ptr;
     if (be32(dtb) != FDT_MAGIC)
-        return virtio_mmio_scan_fixed_window(wanted_device_id, base, size, irq);
+        return virtio_mmio_scan_fixed_window(wanted_device_id, instance, base, size, irq);
 
     uint32_t total = be32(dtb + 4);
     uint32_t off_struct = be32(dtb + 8);
@@ -134,6 +146,7 @@ int virtio_mmio_find_device(uint32_t wanted_device_id,
     const char* strings = (const char*)(dtb + off_strings);
 
     int depth = 0;
+    uint32_t matches = 0;
     int candidate = 0;
     uint64_t candidate_base = 0;
     uint64_t candidate_size = 0;
@@ -163,10 +176,13 @@ int virtio_mmio_find_device(uint32_t wanted_device_id,
                     regs[V_VERSION / 4] == VIRTIO_VERSION &&
                     regs[V_DEVICE_ID / 4] == wanted_device_id)
                 {
-                    *base = candidate_base;
-                    *size = candidate_size;
-                    *irq = candidate_irq;
-                    return 1;
+                    if (matches++ == instance)
+                    {
+                        *base = candidate_base;
+                        *size = candidate_size;
+                        *irq = candidate_irq;
+                        return 1;
+                    }
                 }
             }
             candidate = 0;
@@ -207,5 +223,5 @@ int virtio_mmio_find_device(uint32_t wanted_device_id,
 
         p += align4(len);
     }
-    return virtio_mmio_scan_fixed_window(wanted_device_id, base, size, irq);
+    return virtio_mmio_scan_fixed_window(wanted_device_id, instance, base, size, irq);
 }

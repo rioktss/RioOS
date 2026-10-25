@@ -18,6 +18,7 @@
 #include "security.h"
 #include "smp.h"
 #include "version.h"
+#include "ui.h"
 
 extern "C" void kernel_main()
 {
@@ -115,6 +116,9 @@ uart_puts(
     "\r\n"
 );
 
+/* Pixel UI starts only when QEMU ramfb is present. The normal headless runner
+       retains its original UART shell, and timer IRQ remains disabled. */
+ui_start();
 shell();
 
     while (1)

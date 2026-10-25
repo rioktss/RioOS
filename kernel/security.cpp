@@ -13,6 +13,8 @@ static int security_get_char()
 {
     while (1)
     {
+        /* Let a foreground pixel terminal paint password prompts before blocking. */
+        uart_flush_output();
         if (uart_has_data())
             return (int)(unsigned char)uart_getc();
 
@@ -89,7 +91,7 @@ int security_read_password(char* out, uint64_t cap)
         {
             out[length] = '\0';
             uart_puts("\r\n");
-            fb_print("\r\n", 0xFFFFFF);
+            if (!uart_output_hook_active()) fb_print("\r\n", 0xFFFFFF);
             return (int)length;
         }
 
@@ -100,7 +102,7 @@ int security_read_password(char* out, uint64_t cap)
                 --length;
                 out[length] = '\0';
                 uart_puts("\b \b");
-                fb_putc('\b', 0xFFFFFF);
+                if (!uart_output_hook_active()) fb_putc('\b', 0xFFFFFF);
             }
             continue;
         }
@@ -111,7 +113,7 @@ int security_read_password(char* out, uint64_t cap)
             out[length] = '\0';
             /* Do not echo the actual password. */
             uart_putc('*');
-            fb_putc('*', 0xFFFFFF);
+            if (!uart_output_hook_active()) fb_putc('*', 0xFFFFFF);
         }
     }
 }

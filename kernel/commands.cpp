@@ -403,7 +403,7 @@ static const ManualEntry manual_entries[] =
     {"chmod", "change file mode", "chmod <mode> <file>", "numeric 000-777; symbolic +r/+w/+x or -r/-w/-x; owner or root"},
     {"stat", "show file metadata", "stat <path>", "shows inode, type, mode, owner, size, sector count, modification time"},
     {"chown", "change file owner", "chown <uid> <gid> <path>", "root only; UID/GID are decimal numbers"},
-    {"truncate", "resize a file", "truncate <path> <size>", "size 0-262144 bytes; extended bytes are zero-filled"},
+    {"truncate", "resize a file", "truncate <path> <size>", "size 0-1048576 bytes; extended bytes are zero-filled"},
     {"cp", "copy files or directories", "cp [-r] [-f] <source> <destination>", "-r recursive; -f overwrite destination"},
     {"mv", "move or rename files", "mv [-f] <source> <destination>", "-f overwrite destination"},
     {"rm", "remove files or directories", "rm [-r] [-f] <file|dir>...", "-r recursive; -f force/ignore missing"},
@@ -1012,7 +1012,7 @@ static void command_truncate(char* argument)
     int rc = fs_truncate(words[0], vfs_cwd(), size);
     if (rc == 0) return;
     if (rc == -13) uart_puts("truncate: permission denied\r\n");
-    else if (rc == -27) uart_puts("truncate: file too large (max 262144 bytes)\r\n");
+    else if (rc == -27) uart_puts("truncate: file too large (max 1048576 bytes)\r\n");
     else uart_puts("truncate: failed (path missing, not a file, or storage error)\r\n");
 }
 
@@ -1321,7 +1321,7 @@ static void command_help()
         "  chmod <mode> <file>  Change file mode (owner or root)\r\n"
         "  stat <path>          Show inode/permission/owner metadata\r\n"
         "  chown <uid> <gid> <path>  Change owner (root only)\r\n"
-        "  truncate <path> <size>  Resize file (max 262144 bytes)\r\n"
+        "  truncate <path> <size>  Resize file (max 1048576 bytes)\r\n"
         "  env                  Show environment variables\r\n"
         "  export VAR=val       Set environment variable\r\n"
         "  unset VAR           Remove environment variable\r\n"
@@ -1674,7 +1674,7 @@ static void command_write(
     }
 }
 
-#define CP_MAX_SIZE 262144ULL
+#define CP_MAX_SIZE 1048576ULL
 static uint8_t cp_buffer[CP_MAX_SIZE];
 
 static int path_parent(const char* path, char* out, int cap)
@@ -2118,7 +2118,7 @@ static void command_user_login(const char* argument)
     char password[32];
     uart_puts("user login\r\n");
     uart_puts("Password: ");
-    fb_print("Password: ", 0xFFFFFF);
+    if (!uart_output_hook_active()) fb_print("Password: ", 0xFFFFFF);
 
     if (security_read_password(password, sizeof(password)) < 0)
     {
@@ -2138,7 +2138,7 @@ static void command_su(const char* argument)
     {
         char password[48];
         uart_puts("root password: ");
-        fb_print("root password: ", 0xFFFFFF);
+        if (!uart_output_hook_active()) fb_print("root password: ", 0xFFFFFF);
         if (security_read_password(password, sizeof(password)) < 0 ||
             security_login_root(password) != 0)
         {

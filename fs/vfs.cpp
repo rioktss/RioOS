@@ -7,7 +7,23 @@ static int current_directory = -1;
 
 void vfs_init()
 {
-    current_directory = fs_get_root();
+    /* Start an unprivileged shell in a writable home directory. Starting at
+       '/' makes ordinary commands such as `nano note.txt` fail by design,
+       because the root directory is system-owned and not user-writable. Keep
+       '/' as a safe fallback for RAM-only/partially initialized filesystems. */
+    const int root = fs_get_root();
+    current_directory = root;
+
+    int home = fs_resolve("/home/user", root);
+    if (home >= 0 && fs_get_type(home) == FS_DIR)
+        current_directory = home;
+    else
+    {
+        int data_home = fs_resolve("/storage/home", root);
+        if (data_home >= 0 && fs_get_type(data_home) == FS_DIR)
+            current_directory = data_home;
+    }
+
     uart_puts("VFS initialized.\r\n");
 }
 

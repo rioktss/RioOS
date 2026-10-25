@@ -31,7 +31,14 @@ int main()
 
     char cwd[64];
     vfs_get_path(cwd, sizeof cwd);
-    CHECK(strcmp(cwd, "/") == 0);
+    CHECK(strcmp(cwd, "/home/user") == 0);
+
+    /* A regular user can edit/create files in its default home, but must not
+       gain write permission to the system root merely to make nano work. */
+    fs_set_credentials(1000U, 1000U);
+    CHECK(vfs_write("nano-home-regression.txt", "saved") == 0);
+    CHECK(vfs_write("/nano-root-regression.txt", "denied") == -13);
+    CHECK(vfs_rm("nano-home-regression.txt") == 0);
 
     CHECK(vfs_cd("/storage/home") == 0);
     vfs_get_path(cwd, sizeof cwd);
@@ -85,8 +92,11 @@ int main()
     CHECK(vfs_rm_recursive("/home/user/docs") == 0);
     CHECK(fs_resolve("/home/user/docs", vfs_cwd()) < 0);
 
-    /* rm of the directory we stand in must move the shell to root */
-    CHECK(vfs_mkdir("/tmpdir") >= 0 && vfs_cd("/tmpdir") == 0);
+    /* rm of the directory we stand in must move the shell to root. The
+       recursive-delete case above intentionally moved cwd to '/'; return to
+       a writable home before creating the temporary directory as user. */
+    CHECK(vfs_cd("/home/user") == 0);
+    CHECK(vfs_mkdir("tmpdir") >= 0 && vfs_cd("tmpdir") == 0);
     CHECK(vfs_rm(".") == 0);
     CHECK(vfs_cwd() == fs_get_root());
     vfs_get_path(cwd, sizeof cwd);

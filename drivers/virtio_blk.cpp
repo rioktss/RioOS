@@ -134,7 +134,6 @@ static uint8_t request_data[SECTOR_SIZE]
     __attribute__((aligned(16), section(".bss.virtio_req")));
 static uint8_t request_status
     __attribute__((aligned(1), section(".bss.virtio_req")));
-static uint16_t last_used_idx = 0;
 
 static int fdt_find_virtio(uint64_t* base, uint64_t* size, int* irq)
 {
@@ -183,7 +182,6 @@ static void clear_queue_memory()
     used.idx = 0;
     used.avail_event = 0;
     request_status = 0xFF;
-    last_used_idx = 0;
 }
 
 static int check_device()
@@ -361,7 +359,6 @@ static int submit_request(uint32_t type, uint64_t sector, const uint8_t* write_d
             read_data[i] = request_data[i];
     }
 
-    last_used_idx = new_idx;
     return 0;
 }
 

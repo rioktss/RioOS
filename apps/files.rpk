@@ -1,0 +1,9 @@
+RIOPKG/1
+id=files
+name=Files
+type=builtin
+entry=files
+version=1.0.0
+icon=/icons/files.bmp
+category=system
+description=Read-only-capable graphical browser for the MyFS file tree.

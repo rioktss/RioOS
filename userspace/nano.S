@@ -147,7 +147,12 @@ have_name:
     b.ge load_ok
     cmn x0, #27
     b.eq too_big
-    b load_empty
+    /* -ENOENT is the only read error that means a new file. Do not silently
+       turn permission/storage errors into an empty buffer that could later
+       overwrite an existing file. */
+    cmn x0, #2
+    b.eq load_empty
+    b load_failed
 load_ok:
     str x0, [x1]
     b redraw
@@ -247,19 +252,64 @@ do_save:
     bl sys_file_write
     cmp x0, #0
     b.lt save_failed
+    adrp x1, len
+    add x1, x1, :lo12:len
+    ldr x1, [x1]
+    cmp x0, x1
+    b.ne save_failed
     adrp x0, msg_saved
     add x0, x0, :lo12:msg_saved
     bl sys_puts
     b input_loop
 save_failed:
+    /* Preserve the in-memory text and explain common filesystem errors. */
+    cmn x0, #13
+    b.eq save_denied
+    cmn x0, #3
+    b.eq save_no_space
+    cmn x0, #4
+    b.eq save_storage
+    cmn x0, #5
+    b.eq save_metadata
+    cmn x0, #6
+    b.eq save_metadata
+    cmn x0, #7
+    b.eq save_metadata
     adrp x0, msg_fail
     add x0, x0, :lo12:msg_fail
+    bl sys_puts
+    b input_loop
+save_denied:
+    adrp x0, msg_denied
+    add x0, x0, :lo12:msg_denied
+    bl sys_puts
+    b input_loop
+save_no_space:
+    adrp x0, msg_no_space
+    add x0, x0, :lo12:msg_no_space
+    bl sys_puts
+    b input_loop
+save_storage:
+    adrp x0, msg_storage
+    add x0, x0, :lo12:msg_storage
+    bl sys_puts
+    b input_loop
+save_metadata:
+    adrp x0, msg_metadata
+    add x0, x0, :lo12:msg_metadata
     bl sys_puts
     b input_loop
 
 too_big:
     adrp x0, msg_big
     add x0, x0, :lo12:msg_big
+    bl sys_puts
+    mov x0, #1
+    b leave
+
+load_failed:
+    adrp x0, msg_read_fail
+    add x0, x0, :lo12:msg_read_fail
     bl sys_puts
     mov x0, #1
     b leave
@@ -288,12 +338,22 @@ msg_keys:
     .asciz " | CTRL+S save | CTRL+X exit\r\n------------------------\r\n"
 msg_big:
     .asciz "nano: file too large (max 4095 bytes), not opened\r\n"
+msg_read_fail:
+    .asciz "nano: cannot read file; refusing to edit an unreadable file\r\n"
 msg_noname:
     .asciz "nano: usage: nano <file>\r\n"
 msg_saved:
     .asciz "\r\n[Saved!]\r\n"
 msg_fail:
-    .asciz "\r\n[Save failed!]\r\n"
+    .asciz "\r\n[Save failed; text remains in memory]\r\n"
+msg_denied:
+    .asciz "\r\n[Permission denied; try /home/user]\r\n"
+msg_no_space:
+    .asciz "\r\n[Save failed: disk is full]\r\n"
+msg_storage:
+    .asciz "\r\n[Save failed: storage I/O error]\r\n"
+msg_metadata:
+    .asciz "\r\n[Save failed: filesystem metadata commit error]\r\n"
 msg_exit:
     .asciz "\r\n[Exit]\r\n"
 msg_bs:

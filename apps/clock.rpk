@@ -1,0 +1,9 @@
+RIOPKG/1
+id=clock
+name=Clock
+type=builtin
+entry=clock
+version=1.0.0
+icon=/icons/clock.bmp
+category=tools
+description=Digital clock and kernel uptime display backed by the QEMU PL031 RTC.

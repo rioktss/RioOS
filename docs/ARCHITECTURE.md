@@ -322,3 +322,10 @@ See [P0_HARDENING.md](./P0_HARDENING.md) for the safety invariants, verification
 The P4 SMP API reads `MPIDR_EL1.Aff0` for diagnostics and provides atomic spinlock primitives. The production state remains one online CPU; secondary CPUs are not launched and the locks are groundwork, not evidence that all existing drivers are SMP-safe. Timer IRQ remains disabled in normal boot.
 
 The framebuffer driver is a bounded software RAM surface at the address reserved by the memory layout. It supports text glyphs, background clearing, and row scrolling, but the default `-nographic` QEMU runner does not connect this RAM to a display device. UART remains the supported interactive console until a real display backend is implemented and tested.
+
+
+## Pixel UI and display path (v1.11.0)
+
+`drivers/fb.cpp` now provides clipped pixel primitives, bitmap text drawing, gradients, rounded panels, cache maintenance, and a direct QEMU `ramfb` setup path using the `fw_cfg` DMA interface. The framebuffer is a statically reserved 1024×768 XRGB8888 buffer, avoiding allocator ownership and lifetime problems. The boot splash, lock screen, home screen, app router, and each app have separate translation units under `ui/`.
+
+`run-ui.sh` adds `-device ramfb` and a graphical QEMU display while keeping PL011 UART attached to stdio as a fallback. Normal `run.sh` remains headless and is backward-compatible. The runner attaches VirtIO keyboard and tablet devices; the polled driver reads their advertised identity and absolute-coordinate ranges. The built-in `.rpk` manifests are installed into `/apps` at image-build time and validated before launch; app code is currently built into the kernel. General USB/HID devices, dynamically loaded RPK executables, and a full GNU Bash userspace are not implemented. Runtime rendering and input still need a visual QEMU acceptance run on a host with display support.

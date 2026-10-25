@@ -84,12 +84,27 @@ if [[ "$CLEAN" -eq 1 ]]; then
     rm -f "$HOST_TOOLS"/fd_host_test
     rm -f "$HOST_TOOLS"/process_host_test
     rm -f "$HOST_TOOLS"/scheduler_process_host_test
-    rm -f "$HOST_TOOLS"/smp_host_test "$HOST_TOOLS"/fb_host_test
+    rm -f "$HOST_TOOLS"/smp_host_test "$HOST_TOOLS"/fb_host_test "$HOST_TOOLS"/ui_host_test "$HOST_TOOLS"/ui_image_host_test
 fi
 
 src_of() {
     local f="$1" d
-    for d in kernel drivers memory process fs net; do
+    case "$f" in
+        ui_boot) printf '%s' 'ui/boot.cpp'; return ;;
+        ui_lock_screen) printf '%s' 'ui/lock_screen.cpp'; return ;;
+        ui_home_screen) printf '%s' 'ui/home_screen.cpp'; return ;;
+        ui_apps) printf '%s' 'ui/apps.cpp'; return ;;
+        ui_terminal) printf '%s' 'ui/terminal.cpp'; return ;;
+        ui_calculator) printf '%s' 'ui/calculator.cpp'; return ;;
+        ui_clock) printf '%s' 'ui/clock.cpp'; return ;;
+        ui_file_manager) printf '%s' 'ui/file_manager.cpp'; return ;;
+        ui_launcher) printf '%s' 'ui/launcher.cpp'; return ;;
+        ui_wallpaper) printf '%s' 'ui/wallpaper.cpp'; return ;;
+        ui_settings) printf '%s' 'ui/settings.cpp'; return ;;
+        ui_image) printf '%s' 'ui/image.cpp'; return ;;
+        ui_core) printf '%s' 'ui/ui.cpp'; return ;;
+    esac
+    for d in kernel drivers memory process fs net ui; do
         [[ -f "$d/$f.cpp" ]] && { printf '%s' "$d/$f.cpp"; return; }
     done
     echo "ERROR: source for $f not found" >&2
@@ -112,9 +127,11 @@ ASMFLAGS=(
 
 MODULES=(
     uart memory string fs vfs process sched_policy scheduler timer interrupt keyboard
-    commands version shell history env rtc exceptions syscall user mmu virtio_mmio virtio_blk storage thread fd
-    fb font
-    elf virtio_net netstack page_alloc fault diag security smp kernel
+    commands version shell history env rtc exceptions syscall user mmu virtio_mmio virtio_input virtio_blk storage thread fd
+    fb font ui_font_data
+    elf virtio_net netstack page_alloc fault diag security smp
+    ui_boot ui_lock_screen ui_home_screen ui_apps ui_terminal ui_calculator ui_clock ui_file_manager ui_launcher ui_wallpaper ui_settings ui_image ui_core
+    kernel
 )
 
 # MINIMAL PRINT CUMA INI
@@ -161,7 +178,15 @@ fi
 APP_ELFS=(build/user_init.elf)
 [[ -f build/nano.elf ]] && APP_ELFS+=(build/nano.elf)
 [[ -f build/calc.elf ]] && APP_ELFS+=(build/calc.elf)
-"$HOST_TOOLS/mkfs_myfs" storage/disk.img "${APP_ELFS[@]}" >/dev/null
+APP_PACKAGES=(apps/terminal.rpk apps/calculator.rpk apps/clock.rpk apps/files.rpk apps/launcher.rpk apps/wallpaper.rpk apps/pengaturan.rpk)
+for package in "${APP_PACKAGES[@]}"; do
+    [[ -f "$package" ]] || { echo "ERROR: required UI package missing: $package" >&2; exit 1; }
+done
+LOCAL_ASSETS=()
+for asset in assets/wallpapers/*.bmp assets/icons/*.bmp; do
+    [[ -f "$asset" ]] && LOCAL_ASSETS+=("$asset")
+done
+"$HOST_TOOLS/mkfs_myfs" storage/disk.img "${APP_ELFS[@]}" "${APP_PACKAGES[@]}" "${LOCAL_ASSETS[@]}" >/dev/null
 vlog " -> storage/disk.img ready"
 
 step "4/9" "Compiling boot"
@@ -190,9 +215,12 @@ step "6/9" "Linking"
     build/kernel.o build/uart.o build/memory.o build/string.o build/fs.o build/vfs.o \
     build/process.o build/sched_policy.o build/scheduler.o build/timer.o build/interrupt.o build/keyboard.o \
     build/commands.o build/version.o build/shell.o build/history.o build/env.o build/rtc.o build/exceptions.o build/syscall.o build/user.o build/mmu.o \
-    build/virtio_mmio.o build/virtio_blk.o build/storage.o build/elf.o build/virtio_net.o \
+    build/virtio_mmio.o build/virtio_input.o build/virtio_blk.o build/storage.o build/elf.o build/virtio_net.o \
     build/netstack.o build/page_alloc.o build/fault.o build/diag.o build/security.o \
-    build/fb.o build/font.o build/thread.o build/fd.o build/smp.o \
+    build/fb.o build/font.o build/ui_font_data.o build/thread.o build/fd.o build/smp.o \
+    build/ui_boot.o build/ui_lock_screen.o build/ui_home_screen.o build/ui_apps.o \
+    build/ui_terminal.o build/ui_calculator.o build/ui_clock.o build/ui_file_manager.o \
+    build/ui_launcher.o build/ui_wallpaper.o build/ui_settings.o build/ui_image.o build/ui_core.o \
     -o build/kernel.elf
 
 step "7/9" "Verifying ELF"
@@ -264,9 +292,19 @@ step "8/9" "Running host tests"
 "$HOST_TOOLS/smp_host_test" > /dev/null
 
 "$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -iquote include -DHOST_TEST \
-    tests/fb_host_test.cpp drivers/fb.cpp drivers/font.cpp \
+    tests/fb_host_test.cpp drivers/fb.cpp drivers/font.cpp drivers/ui_font_data.cpp \
     -o "$HOST_TOOLS/fb_host_test"
 "$HOST_TOOLS/fb_host_test" > /dev/null
+
+"$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -iquote include -DHOST_TEST \
+    tests/ui_host_test.cpp drivers/fb.cpp drivers/font.cpp drivers/ui_font_data.cpp ui/boot.cpp ui/lock_screen.cpp ui/home_screen.cpp \
+    -o "$HOST_TOOLS/ui_host_test"
+"$HOST_TOOLS/ui_host_test" > /dev/null
+
+"$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -iquote include -DHOST_TEST \
+    tests/ui_image_host_test.cpp drivers/fb.cpp drivers/font.cpp drivers/ui_font_data.cpp ui/image.cpp ui/settings.cpp kernel/string.cpp \
+    -o "$HOST_TOOLS/ui_image_host_test"
+"$HOST_TOOLS/ui_image_host_test" > /dev/null
 
 step "9/9" "Release verification"
 "$PYTHON" tests/verify_release.py > /dev/null

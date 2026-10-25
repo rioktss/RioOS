@@ -3,7 +3,7 @@ import shutil, struct, subprocess
 
 root=Path(__file__).resolve().parents[1]
 kernel=root/'build/kernel.elf'; disk=root/'storage/disk.img'; user=root/'build/user_init.elf'
-required=['drivers/virtio_mmio.cpp','drivers/virtio_net.cpp','net/netstack.cpp','docs/P3_NETWORKING.md','docs/TEST_MATRIX_P3.md','process/user.cpp','process/elf.cpp','boot/exceptions.S','process/scheduler.cpp','process/thread.cpp','process/ctx_switch.S','kernel/fd.cpp','include/fd.h','tests/fd_host_test.cpp','tests/process_host_test.cpp','tests/scheduler_process_host_test.cpp','drivers/fb.cpp','drivers/font.cpp','docs/P2_FILESYSTEM_SECURITY.md','include/smp.h','kernel/smp.cpp','tests/smp_host_test.cpp','tests/fb_host_test.cpp','docs/P4_SMP_DRIVER_HARDENING.md','docs/TEST_MATRIX_P4.md','.github/workflows/ci.yml']
+required=['drivers/virtio_mmio.cpp','drivers/virtio_net.cpp','net/netstack.cpp','docs/P3_NETWORKING.md','docs/TEST_MATRIX_P3.md','process/user.cpp','process/elf.cpp','boot/exceptions.S','process/scheduler.cpp','process/thread.cpp','process/ctx_switch.S','kernel/fd.cpp','include/fd.h','tests/fd_host_test.cpp','tests/process_host_test.cpp','tests/scheduler_process_host_test.cpp','drivers/fb.cpp','drivers/font.cpp','drivers/ui_font_data.cpp','include/ui_font_data.h','docs/THIRD_PARTY_NOTICES.md','docs/P2_FILESYSTEM_SECURITY.md','include/smp.h','kernel/smp.cpp','tests/smp_host_test.cpp','tests/fb_host_test.cpp','docs/P4_SMP_DRIVER_HARDENING.md','docs/TEST_MATRIX_P4.md','.github/workflows/ci.yml','include/ui.h','ui/boot.cpp','ui/lock_screen.cpp','ui/home_screen.cpp','ui/ui.cpp','ui/apps.cpp','ui/terminal.cpp','ui/calculator.cpp','ui/clock.cpp','ui/file_manager.cpp','ui/launcher.cpp','ui/wallpaper.cpp','ui/settings.cpp','ui/image.cpp','apps/wallpaper.rpk','apps/pengaturan.rpk','assets/wallpapers/rioos-default.bmp','assets/icons/terminal.bmp','assets/icons/calculator.bmp','assets/icons/clock.bmp','assets/icons/files.bmp','assets/icons/launcher.bmp','assets/icons/wallpaper.bmp','assets/icons/settings.bmp','docs/ANDROID_UI.md','tests/ui_image_host_test.cpp','run-ui.sh','run-ui.ps1','docs/PIXEL_UI.md','tests/ui_host_test.cpp','apps/terminal.rpk','apps/calculator.rpk','apps/clock.rpk','apps/files.rpk','apps/launcher.rpk']
 for name in required: assert (root/name).is_file(), f'missing {name}'
 assert kernel.is_file() and kernel.stat().st_size>0
 assert user.is_file() and user.stat().st_size>0
@@ -102,7 +102,7 @@ fd_test=(root/'tests/fd_host_test.cpp').read_text()
 for marker in ('fd_set_process(77)', 'fd_dup2(shared, 7)', 'fd_pipe(pfd)', '== -11', '== -32'):
     assert marker in fd_test, f'P1 descriptor regression missing: {marker}'
 version_h=(root/'include/version.h').read_text()
-assert '"1.10.0"' in version_h, 'release version mismatch'
+assert '"1.11.0"' in version_h, 'release version mismatch'
 
 # P0 process/MMU/ELF invariants: these checks make the release fail closed if
 # a future edit removes the guards. Runtime QEMU boot is still a separate test.
@@ -131,6 +131,56 @@ assert not u.stdout.strip(), 'unresolved symbols:\n'+u.stdout
 # superblock
 sb=disk.read_bytes()[:512]; vals=struct.unpack_from('<10I',sb,0); total=struct.unpack_from('<Q',sb,40)[0]
 assert vals[0]==0x4D4B4653 and vals[1]==1 and vals[2]==512 and vals[3]==128 and vals[4]==64 and vals[9]==25 and total==32768
+# Verify the build packaged the built-in RPK applications into /apps and local icon assets.
+db=disk.read_bytes()
+inodes=[]
+for i in range(64):
+    raw=db[512+i*128:512+(i+1)*128]
+    used,typ,parent,flags=struct.unpack_from('<IIiI',raw,0)
+    size,first=struct.unpack_from('<QQ',raw,16)
+    name=raw[36:100].split(b'\0',1)[0].decode('ascii','ignore')
+    inodes.append({'used':used,'type':typ,'parent':parent,'size':size,'first':first,'name':name})
+apps_id=next((i for i,n in enumerate(inodes) if n['used'] and n['type']==1 and n['parent']==0 and n['name']=='apps'),-1)
+assert apps_id >= 0, 'RPK /apps directory is missing from disk image'
+for app in ('terminal','calculator','clock','files','launcher','wallpaper','pengaturan'):
+    node=next((n for n in inodes if n['used'] and n['parent']==apps_id and n['name']==app+'.rpk'),None)
+    assert node is not None, f'{app}.rpk not installed into disk image'
+    payload=db[node['first']*512:node['first']*512+node['size']]
+    expected_id = b'id=settings' if app == 'pengaturan' else b'id=' + app.encode()
+    assert payload.startswith(b'RIOPKG/1\n') and expected_id in payload, f'{app}.rpk manifest invalid'
+    assert b'icon=/icons/' in payload, f'{app}.rpk local icon entry is missing'
+
+# All wallpaper/icon images must be installed in the guest filesystem, not just
+# present in the source tree. Reject accidental oversize or malformed assets.
+def root_dir(name):
+    return next((i for i,n in enumerate(inodes) if n['used'] and n['type']==1 and n['parent']==0 and n['name']==name),-1)
+def child_file(parent, name):
+    return next((n for n in inodes if n['used'] and n['type']==0 and n['parent']==parent and n['name']==name),None)
+def payload_of(node):
+    assert node is not None and node['size'] > 0, f'missing installed asset: {node}'
+    start=node['first']*512
+    payload=db[start:start+node['size']]
+    assert len(payload)==node['size']
+    return payload
+wallpapers_id=root_dir('wallpapers'); icons_id=root_dir('icons'); settings_id=root_dir('settings')
+assert wallpapers_id>=0 and icons_id>=0 and settings_id>=0, 'wallpaper/icon/settings directories are missing'
+default_wallpaper=child_file(wallpapers_id,'rioos-default.bmp')
+wb=payload_of(default_wallpaper)
+assert len(wb)<=1024*1024 and wb[:2]==b'BM', 'default wallpaper missing or over the 1 MiB cap'
+assert struct.unpack_from('<I',wb,14)[0]>=40
+ww,wh=struct.unpack_from('<ii',wb,18)
+planes,bpp,compression=struct.unpack_from('<HHI',wb,26)
+assert ww>0 and wh!=0 and planes==1 and bpp in (24,32) and compression==0, 'default wallpaper BMP must be uncompressed 24/32-bit'
+for icon_name in ('terminal.bmp','calculator.bmp','clock.bmp','files.bmp','launcher.bmp','wallpaper.bmp','settings.bmp'):
+    ib=payload_of(child_file(icons_id,icon_name))
+    assert len(ib)<=1024*1024 and ib[:2]==b'BM', f'bad local icon asset: {icon_name}'
+assert 'UI_IMAGE_CAPACITY (1024ULL * 1024ULL)' in (root/'ui/image.cpp').read_text()
+assert 'fb_draw_ui_text' in (root/'drivers/fb.cpp').read_text() and 'fb_draw_text(' in (root/'drivers/fb.cpp').read_text(), 'UI smoothing must not remove the legacy serial font renderer'
+assert 'Inter-derived coverage' in (root/'drivers/fb.cpp').read_text(), 'compact antialiased UI font is missing'
+ui_image_test=(root/'tests/ui_image_host_test.cpp').read_text()
+for marker in ('bad BMP format was accepted', 'oversized BMP was accepted', 'wallpaper path traversal was accepted', 'theme settings failed to toggle and persist'):
+    assert marker in ui_image_test, f'UI image/settings regression test missing: {marker}'
+assert 'FS_MAX_FILE_SIZE    (1024ULL * 1024ULL)' in (root/'fs/fs.cpp').read_text()
 print('RELEASE STATIC CHECK: PASS')
 
 # P2 filesystem/security contracts: persistent owners, centralized access checks,
@@ -202,7 +252,44 @@ assert 'pixel = (bits' in fb_src, 'framebuffer glyph writer must clear backgroun
 assert 'elem->len > RX_BUFFER_SIZE' in (root/'drivers/virtio_net.cpp').read_text(), 'VirtIO-Net RX length bounds are missing'
 assert 'return -90; /* EMSGSIZE */' in (root/'drivers/virtio_net.cpp').read_text(), 'oversized frame truncation should be rejected'
 assert 'fb_test_attach' in fb_test and 'scroll moves next text row' in fb_test
+assert 'ui_draw_boot_screen' in (root/'tests/ui_host_test.cpp').read_text(), 'pixel UI host rendering regression is missing'
 commands=(root/'kernel/commands.cpp').read_text()
 assert 'command_smp_status' in commands and 'command_fbinfo' in commands
 assert 'timer_start_periodic(' not in boot_src and 'interrupt_enable();' not in boot_src
+ui_src=(root/'ui/ui.cpp').read_text()
+fb_header=(root/'include/fb.h').read_text()
+vfs_src=(root/'fs/vfs.cpp').read_text()
+nano_src=(root/'userspace/nano.S').read_text()
+assert 'fs_resolve("/home/user", root)' in vfs_src, 'interactive VFS must default to the writable user home'
+assert 'current_directory = data_home' in vfs_src, 'VFS writable-home fallback is missing'
+assert 'cmn x0, #2' in nano_src and 'b.eq load_empty' in nano_src, 'nano must only treat ENOENT as a new file'
+assert 'load_failed:' in nano_src and 'msg_denied:' in nano_src, 'nano read/save error handling is missing'
+assert 'state = UI_STATE_HOME;' in ui_src and 'UI: unlocked.' in ui_src, 'lock screen serial unlock path is missing'
+ui_runner=(root/'run-ui.sh').read_text()
+assert 'virtio-keyboard-device' in ui_runner and 'virtio-tablet-device' in ui_runner, 'QEMU window keyboard and tablet devices must be attached'
+input_driver=(root/'drivers/virtio_input.cpp').read_text()
+assert 'virtio_input_poll' in input_driver and 'INPUT_SYN_REPORT' in input_driver, 'VirtIO input events must be polled and synchronized'
+assert '&d->queue_size' in input_driver and 'event_avail[i].idx % d->queue_size' in input_driver, 'VirtIO input must honor the negotiated queue size'
+assert 'virtio_input_keyboard_ready' in input_driver and 'virtio_input_pointer_ready' in input_driver, 'keyboard/tablet readiness must be distinguished'
+assert 'INPUT_CFG_ID_NAME' in input_driver and 'read_device_config(d, index)' in input_driver, 'input devices must be identified by their advertised name, not only MMIO order'
+assert 'normalize_axis' in input_driver and 'INPUT_CFG_ABS_INFO' in input_driver, 'tablet coordinates must use device-reported absolute ranges'
+ui_terminal=(root/'ui/terminal.cpp').read_text()
+assert 'execute_command(command_line)' in ui_terminal, 'RPK terminal must use the shared RioOS shell dispatcher'
+assert 'term_equal(command_line, \"logout\")' not in ui_terminal, 'RPK terminal must preserve shared logout/exit command semantics'
+assert 'uart_set_output_hook(term_capture_output, 0)' in ui_terminal, 'RPK terminal must capture normal shell-command output'
+assert 'term_tty_capture' in ui_terminal and 'uart_set_output_flush_hook(term_tty_flush)' in ui_terminal, 'interactive EL0 terminal UI output must be flushed to the framebuffer'
+assert 'uart_flush_output();' in (root/'kernel/security.cpp').read_text(), 'interactive security prompts must flush to the pixel terminal before waiting for input'
+assert 'uart_output_hook_active()' in (root/'kernel/security.cpp').read_text(), 'security input must not draw prompts over a redirected pixel terminal'
+assert 'uart_output_hook_active()' in (root/'kernel/version.cpp').read_text(), 'version output must not paint over a redirected pixel terminal'
+assert '-dy > fb_get_height() / 14' in ui_src and 'pointer_start_y < 52 && dy > fb_get_height() / 14' in ui_src, 'lock-screen/home swipe gestures missing'
+assert 'if (hit >= 0)' in ui_src and 'UI_STATE_APP' in ui_src, 'home-screen pointer hit testing missing'
+assert 'Android-like pixel UI ready' in (root/'ui/ui.cpp').read_text(), 'UI input routing status must be reported'
+assert 'fwcfg_init_ramfb' in fb_src and 'RAMFB_FOURCC_XRGB8888' in fb_src, 'QEMU ramfb pixel output path missing'
+assert 'DISPLAY_BACKEND="${RIOOS_DISPLAY:-gtk}"' in (root/'run-ui.sh').read_text(), 'QEMU UI runner display backend must be configurable'
+assert 'ui_start();' in boot_src and 'timer_delay_ms(900U)' in ui_src
+assert 'timer_start_periodic(' not in ui_src and 'interrupt_enable();' not in ui_src
+assert 'minute != last_render_minute' in ui_src, 'UI must avoid repainting full pages every second'
+for marker in ('fb_fill_rect','fb_draw_circle','fb_draw_round_rect','fb_draw_text','fb_present'):
+    assert marker in fb_header, f'pixel UI primitive missing: {marker}'
 print('P4 SMP/DRIVER/FRAMEBUFFER STATIC CHECK: PASS')
+print('UI/RPK STATIC CHECK: PASS')

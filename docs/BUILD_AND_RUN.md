@@ -343,6 +343,15 @@ Run `bash build.sh --clean` for the AArch64 clean build and host regressions. On
 
 ## P4 SMP/driver foundations (v1.10.0)
 
-Run `bash build.sh --clean` (or `.\build.ps1 --clean` in PowerShell) to build the new SMP and framebuffer host regressions alongside the existing suite. There are 13 host-test executables. The release check verifies SMP stays disabled, the framebuffer host test is present, VirtIO-Net RX buffers are bounded, and timer IRQ has not been enabled in the normal boot path.
+Run `bash build.sh --clean` (or `.\build.ps1 --clean` in PowerShell) to build the new SMP and framebuffer host regressions alongside the existing suite. There are 14 host-test executables. The release check verifies SMP stays disabled, the framebuffer host test is present, VirtIO-Net RX buffers are bounded, and timer IRQ has not been enabled in the normal boot path.
 
 After launching QEMU on a host with `qemu-system-aarch64`, try `smp` and `fbinfo`. `smp` should report one online CPU and disabled SMP. `fbinfo` explains that the software framebuffer is not yet connected to a QEMU display; the UART remains the interactive console. Keep timer IRQ disabled during ordinary boot.
+
+
+## Pixel UI and RPK apps (v1.11.0)
+
+The default `run.sh` / `run.ps1` remains a headless `-nographic` serial shell. To use the graphical framebuffer, build normally and launch `./run-ui.sh` on a QEMU build with GTK/SDL display support (PowerShell: `./run-ui.ps1`). The GUI runner attaches `-device ramfb`; the kernel locates `etc/ramfb` through QEMU `fw_cfg`, configures an XRGB8888 surface, and flushes rendered pixels from cache. The framebuffer is 1024×768.
+
+The graphical runner attaches VirtIO keyboard/tablet devices. Focus the QEMU window to type, swipe/drag upward to unlock, and click a home-screen app icon. Home navigation also supports A/D, W/S, arrow keys, Enter, and 1–5; X returns to the serial shell. UART input is retained as a fallback. The pixel Terminal forwards commands to the same `execute_command()` dispatcher used by the serial shell; it is not a GNU Bash process.
+
+Build installs `/apps/terminal.rpk`, `/apps/calculator.rpk`, `/apps/clock.rpk`, `/apps/files.rpk`, and `/apps/launcher.rpk`. RPK v1 is a manifest format for built-in apps, not a native executable/package loader. The implementations are linked into the kernel. Host tests verify pixel drawing bounds and RPK disk-image installation. They do not replace a visual QEMU runtime test; if `ramfb` is unavailable, RioOS reports that and falls back to the serial shell. Timer IRQ remains disabled.

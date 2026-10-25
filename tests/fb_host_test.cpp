@@ -21,6 +21,19 @@ int main()
     for (unsigned int i = 0; i < sizeof(pixels) / sizeof(pixels[0]); ++i)
         if (pixels[i] != 0U) return fail("attach clears surface");
 
+    fb_fill_rect(-2, -2, 5, 5, 0x00112233U);
+    if (fb_test_pixel(0, 0) != 0x00112233U || fb_test_pixel(2, 2) != 0x00112233U)
+        return fail("clipped rectangle writes expected pixels");
+    if (fb_test_pixel(3, 3) != 0U) return fail("clipped rectangle stays within bounds");
+    fb_clear(0U);
+    fb_draw_text("A", 0, 0, 0x0000FF00U, 1);
+    if (fb_test_pixel(1, 2) != 0x0000FF00U) return fail("transparent pixel text draws foreground");
+    if (fb_test_pixel(7, 7) != 0U) return fail("transparent pixel text preserves background");
+    fb_fill_gradient(0x000000U, 0x00FFFFFFU);
+    if (fb_test_pixel(0, 0) != 0U || fb_test_pixel(0, 31) != 0x00FFFFFFU)
+        return fail("gradient interpolates endpoints");
+    fb_clear(0U);
+
     fb_putc('A', 0x00FFFFFFU);
     int saw_foreground = 0;
     for (int i = 0; i < 16 * 16; ++i) if (pixels[i] == 0x00FFFFFFU) saw_foreground = 1;

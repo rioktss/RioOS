@@ -16,7 +16,7 @@
 static void putc_both(char c)
 {
     uart_putc(c);
-    fb_putc(c, 0xFFFFFFU);
+    if (!uart_output_hook_active()) fb_putc(c, 0xFFFFFFU);
 }
 
 static void puts_both(const char* text)
@@ -25,7 +25,7 @@ static void puts_both(const char* text)
         return;
 
     uart_puts(text);
-    fb_print(text, 0xFFFFFFU);
+    if (!uart_output_hook_active()) fb_print(text, 0xFFFFFFU);
 }
 
 static void print_u64_both(uint64_t value)
@@ -153,14 +153,17 @@ void command_version()
     /* UART gets the full logo first, matching the requested terminal output. */
     uart_puts(MYKERNEL_LOGO);
 
-    /* Framebuffer gets a fastfetch-like two-column layout. */
-    fb_set_cursor(0, 0);
-    fb_print(MYKERNEL_LOGO, 0x00FF00U);
-    fb_set_cursor(320, 0);
+    /* Preserve the serial shell's two-column framebuffer, but don't draw over
+       a foreground pixel terminal that has redirected UART output. */
+    if (!uart_output_hook_active())
+    {
+        fb_set_cursor(0, 0);
+        fb_print(MYKERNEL_LOGO, 0x00FF00U);
+        fb_set_cursor(320, 0);
+    }
     print_info();
-
-    /* Leave the framebuffer cursor below the longest column for the shell. */
-    fb_set_cursor(0, 512);
+    if (!uart_output_hook_active())
+        fb_set_cursor(0, 512);
 
     uart_puts("\r\n");
 }

@@ -16,7 +16,7 @@ static constexpr uint32_t BITMAP_START = 17U;
 static constexpr uint32_t DATA_START = 25U;
 static constexpr uint32_t TOTAL_SECTORS = 32768U;
 static constexpr uint32_t NAME_SIZE = 64U;
-static constexpr uint32_t MAX_FILE_SECTORS = 512U;
+static constexpr uint32_t MAX_FILE_SECTORS = 2048U;
 
 #pragma pack(push,1)
 struct Super {
@@ -99,6 +99,7 @@ static bool ensure_dir(Inode* ins,int parent,const char* name){int id=find_inode
     n.reserved[0]=0xED; n.reserved[1]=0x01; /* 0755 */
     std::strncpy(n.name,name,NAME_SIZE-1);ins[id]=n;return true;}
 static const char* basename_of(const char* path){const char* p=strrchr(path,'/'); return p? p+1 : path;}
+static bool has_suffix(const char* text,const char* suffix){size_t a=std::strlen(text),b=std::strlen(suffix);return a>=b&&std::strcmp(text+a-b,suffix)==0;}
 
 int main(int argc,char**argv){
     if(argc<3){std::fprintf(stderr,"usage: mkfs_myfs <disk.img> <elf1> [elf2...]\n");return 2;}
@@ -120,22 +121,32 @@ int main(int argc,char**argv){
     }
     int root=0;
     if(!ins[root].used||ins[root].type!=1){std::fprintf(stderr,"invalid root inode\n");std::fclose(f);return 1;}
-    if(!ensure_dir(ins,root,"storage")||!ensure_dir(ins,root,"bin")){std::fprintf(stderr,"cannot create directories\n");std::fclose(f);return 1;}
+    if(!ensure_dir(ins,root,"storage")||!ensure_dir(ins,root,"bin")||!ensure_dir(ins,root,"apps")||
+       !ensure_dir(ins,root,"wallpapers")||!ensure_dir(ins,root,"icons")||!ensure_dir(ins,root,"settings")){
+        std::fprintf(stderr,"cannot create directories\n");std::fclose(f);return 1;
+    }
     int storage=find_inode(ins,"storage",root);
     if(!ensure_dir(ins,storage,"home")){std::fprintf(stderr,"cannot create home directory\n");std::fclose(f);return 1;}
     if(!ensure_dir(ins,root,"home")){std::fprintf(stderr,"cannot create home directory\n");std::fclose(f);return 1;}
     int home=find_inode(ins,"home",root);
     if(!ensure_dir(ins,home,"user")){std::fprintf(stderr,"cannot create home/user directory\n");std::fclose(f);return 1;}
     int bin=find_inode(ins,"bin",root);
+    int apps=find_inode(ins,"apps",root);
+    int wallpapers=find_inode(ins,"wallpapers",root);
+    int icons=find_inode(ins,"icons",root);
 
     for(int i=2;i<argc;i++){
         const char* host = argv[i];
         const char* base = basename_of(host);
         const char* guest = base;
-        if(std::strcmp(base,"user_init.elf")==0) guest="init.elf";
-        // biar build/nano.elf tetap jadi nano.elf
-        std::printf("Installing %s -> /bin/%s\n", host, guest);
-        if(!fill_file(f,ins,bm,bin,guest,host,true)){
+        int parent = bin;
+        if(std::strncmp(host,"assets/wallpapers/",18)==0) parent=wallpapers;
+        else if(std::strncmp(host,"assets/icons/",13)==0) parent=icons;
+        else if(has_suffix(base,".rpk")) parent=apps;
+        else if(std::strcmp(base,"user_init.elf")==0) guest="init.elf";
+        const char* dir_name = parent==apps?"apps":(parent==wallpapers?"wallpapers":(parent==icons?"icons":"bin"));
+        std::printf("Installing %s -> /%s/%s\n", host, dir_name, guest);
+        if(!fill_file(f,ins,bm,parent,guest,host,true)){
             std::fprintf(stderr,"cannot install %s\n", host);
             std::fclose(f);
             return 1;
@@ -144,6 +155,6 @@ int main(int argc,char**argv){
 
     if(!save_inode_table(f,ins)||!save_bitmap(f,bm)){std::fprintf(stderr,"cannot write metadata\n");std::fclose(f);return 1;}
     std::fflush(f);std::fclose(f);
-    std::printf("persistent filesystem ready: %s (%d apps)\n",img, argc-2);
+    std::printf("persistent filesystem ready: %s (%d installed inputs)\n",img, argc-2);
     return 0;
 }

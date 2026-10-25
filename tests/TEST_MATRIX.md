@@ -8,19 +8,20 @@
 - No unresolved kernel ELF symbols
 - Exception vector table exactly 2048 bytes and 2048-byte aligned
 - Persistent filesystem host create/write/read/remount/delete test
-- VFS host test (`tests/vfs_host_test.cpp`): `ls <dir>` with sizes, cwd path, `rm .` keeps cwd valid, VFS recursive remove path
+- VFS host test (`tests/vfs_host_test.cpp`): writable `/home/user` startup, user can save there while root remains protected, `ls <dir>` with sizes, cwd path, `rm .` keeps cwd valid, VFS recursive remove path
 - Filesystem host test also covers `fs_rename` (mv), mkdir-p, recursive remove, hidden files/default modes, UID/GID persistence/migration, owner/group/other permission denial, stat metadata, truncate zero-fill, and rejection of a corrupt `UINT64_MAX` inode size
 - Network host test (`tests/net_host_test.cpp`): IPv4 parsing, ARP neighbor learning, UDP owner isolation, port conflicts, checksum handling, and DNS A lookup with a fake resolver peer
 - File-descriptor host test (`tests/fd_host_test.cpp`): read/write/seek/append/truncate, access modes, per-PID table isolation, shared offsets across `dup`/`dup2`, pipe transfer/ring semantics, non-blocking empty reads, EOF, and `EPIPE`
 - Process manager host test (`tests/process_host_test.cpp`): valid states, bounded EL0 metadata, unique RUNNING record, protected built-ins, zombie/exit-code lifecycle, and refusing to destroy a running process
 - Scheduler/process integration host test (`tests/scheduler_process_host_test.cpp`): logical-current selection, removal/cleanup, zombie compaction, and fallback selection
+- Framebuffer/UI host tests, including UI glyph antialiasing, BMP decoding bounds, wallpaper selection persistence, theme persistence, and UI composition
 - Disk image/superblock static verification
 - ELF AArch64/LOAD/W+X/entry-permission static verification; loader rejects files with no execute bit even under root
 - ZIP integrity verification
 
 ## Required on the user's Termux/QEMU host
 
-- Full QEMU boot (not run in the build container unless `qemu-system-aarch64` is available)
+- Full QEMU boot and visual/input verification (not run in the build container unless `qemu-system-aarch64` is available). `run-ui.sh` wires QEMU-window input through VirtIO keyboard/tablet devices; real input behavior still depends on the installed QEMU build and host display backend.
 - `selftest` command
 - `threads` followed by `thread-demo` (cooperative switching only; IRQ remains off)
 - `fds` and `syscall fd` (open/write/seek/read/close/dup/pipe smoke tests); userspace wrapper execution still requires QEMU validation
@@ -29,7 +30,7 @@
 - `disk` command
 - `mmu` and `level` commands
 - `exec /bin/init.elf`
-- `nano test.txt` in `/` and in `/storage/home`: type, Ctrl+S, Ctrl+X, then `cat test.txt` in the same directory
+- `nano test.txt` at the default `/home/user` prompt and in `/storage/home`: type, Ctrl+S, Ctrl+X, then `cat test.txt` in the same directory; a write to system-owned `/` should report permission denied unless logged in as root
 - `cp a.txt b.txt`, `cp a.txt /storage/home`, `mv b.txt c.txt`, `mv c.txt /storage/home`, `ls /storage`; prompt shows the current directory
 - `nano` with no argument prints usage; `nano <directory>` is refused
 - `net` and `ping 10.0.2.2`
