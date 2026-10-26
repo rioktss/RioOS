@@ -1,5 +1,6 @@
 $ErrorActionPreference = "Stop"
-Set-Location $PSScriptRoot
+$ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+Set-Location $ProjectRoot
 
 $VerboseBuild = $false
 $Clean = $false
@@ -10,8 +11,8 @@ foreach ($arg in $args) {
         "--verbose" { $VerboseBuild = $true }
         "--clean" { $Clean = $true }
         "--run" { $RunAfterBuild = $true }
-        "-h" { Write-Host "Usage: .\build.ps1 [--clean] [--verbose] [--run]"; exit 0 }
-        "--help" { Write-Host "Usage: .\build.ps1 [--clean] [--verbose] [--run]"; exit 0 }
+        "-h" { Write-Host "Usage: .\windows\build.ps1 [--clean] [--verbose] [--run]"; exit 0 }
+        "--help" { Write-Host "Usage: .\windows\build.ps1 [--clean] [--verbose] [--run]"; exit 0 }
         default { throw "Unknown argument: $arg" }
     }
 }
@@ -157,7 +158,7 @@ $linkObjects = @(
     "build/ui_boot.o","build/ui_lock_screen.o","build/ui_home_screen.o","build/ui_apps.o",
     "build/ui_terminal.o","build/ui_calculator.o","build/ui_clock.o","build/ui_file_manager.o","build/ui_launcher.o","build/ui_wallpaper.o","build/ui_settings.o","build/ui_image.o","build/ui_core.o"
 )
-Invoke-Tool $Ld (@("-T","linker.ld","-nostdlib","-z","max-page-size=0x1000") + $linkObjects + @("-o","build/kernel.elf"))
+Invoke-Tool $Ld (@("-T","boot/linker.ld","-nostdlib","-z","max-page-size=0x1000") + $linkObjects + @("-o","build/kernel.elf"))
 
 Write-Host "[7/9] Verifying ELF"
 if (Get-Command $ReadElf -ErrorAction SilentlyContinue) {
@@ -200,7 +201,7 @@ Write-Host "=================================="
 Write-Host "  Kernel: build/kernel.elf (AArch64)"
 Write-Host "  Disk  : storage/disk.img"
 Write-Host "  Tests : 15 host tests passed"
-Write-Host "  Pixel UI : QEMU ramfb backend (run-ui.ps1)"
+Write-Host "  Pixel UI : QEMU ramfb backend (windows/run-ui.ps1)"
 Write-Host "  RPK apps : terminal, calculator, clock, files, launcher, wallpaper, pengaturan"
 Write-Host "  Timer IRQ: remains disabled during normal boot"
 Write-Host ""

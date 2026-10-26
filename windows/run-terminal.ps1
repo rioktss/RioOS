@@ -1,5 +1,6 @@
 $ErrorActionPreference = "Stop"
-Set-Location $PSScriptRoot
+$ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+Set-Location $ProjectRoot
 
 $Qemu = if ($env:QEMU) { $env:QEMU } else { "qemu-system-aarch64" }
 $Kernel = if ($env:KERNEL) { $env:KERNEL } else { "build/kernel.elf" }
@@ -11,8 +12,8 @@ $Display = if ($env:RIOOS_DISPLAY) { $env:RIOOS_DISPLAY } else { "sdl" }
 if (-not (Get-Command $Qemu -ErrorAction SilentlyContinue)) {
     throw "qemu-system-aarch64 not found. Install QEMU with SDL or GTK display support."
 }
-if (-not (Test-Path $Kernel)) { throw "$Kernel not found. Run .\build.ps1 first." }
-if (-not (Test-Path $Disk)) { throw "$Disk not found. Run .\build.ps1 first." }
+if (-not (Test-Path $Kernel)) { throw "$Kernel not found. Run .\windows\build.ps1 first." }
+if (-not (Test-Path $Disk)) { throw "$Disk not found. Run .\windows\build.ps1 first." }
 
 $DisplayHelp = (& $Qemu -display help 2>&1 | Out-String)
 if (-not $DisplayHelp.Contains($Display)) {

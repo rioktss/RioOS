@@ -22,4 +22,4 @@
 
 ## Validation
 
-`build.sh` now includes host tests for spinlock/SMP default-state contracts and framebuffer glyph/scroll behaviour. `tests/verify_release.py` checks the version, these test sources, network receive bounds, and that timer IRQ activation has not been added to the default boot path.
+`linux/build.sh` now includes host tests for spinlock/SMP default-state contracts and framebuffer glyph/scroll behaviour. `tests/verify_release.py` checks the version, these test sources, network receive bounds, and that timer IRQ activation has not been added to the default boot path.

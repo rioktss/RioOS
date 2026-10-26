@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd "$(dirname "$0")"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_ROOT"
 
 QEMU="${QEMU:-qemu-system-aarch64}"
 KERNEL="${KERNEL:-build/kernel.elf}"
@@ -13,8 +15,8 @@ command -v "$QEMU" >/dev/null 2>&1 || {
     exit 1
 }
 
-[[ -f "$KERNEL" ]] || { echo "ERROR: $KERNEL not found. Run ./build.sh first."; exit 1; }
-[[ -f "$DISK" ]] || { echo "ERROR: $DISK not found. Run ./build.sh first."; exit 1; }
+[[ -f "$KERNEL" ]] || { echo "ERROR: $KERNEL not found. Run the build script for this platform first."; exit 1; }
+[[ -f "$DISK" ]] || { echo "ERROR: $DISK not found. Run the build script for this platform first."; exit 1; }
 
 exec "$QEMU" \
     -M virt,gic-version=2,virtualization=on \

@@ -1,0 +1,3 @@
+# Generated disk images; persistent files remain on disk but are not newly added to Git.
+*.img
+!.gitkeep

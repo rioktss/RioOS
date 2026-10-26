@@ -35,7 +35,7 @@ Examples:
 
 ## Build pipeline
 
-`build.sh` currently follows this sequence:
+`linux/build.sh` currently follows this sequence:
 
 ```text
 userspace

@@ -154,5 +154,5 @@ Not implemented: secondary CPU release, per-CPU stacks/state, interrupt routing 
 - Added a QEMU `ramfb` XRGB8888 renderer configured through `fw_cfg` DMA.
 - Added separate boot, lock screen, home screen, app router, and Terminal/Calculator/Clock/Files/Launcher modules under `ui/`.
 - Added and image-packaged five `/apps/*.rpk` built-in-app manifests with release checks.
-- Added `run-ui.sh` and `run-ui.ps1`; the established headless serial runners remain unchanged.
+- Added `linux/run-ui.sh` and `windows/run-ui.ps1`; the established headless serial runners remain unchanged.
 - QEMU-window keyboard and pointer input use VirtIO keyboard/tablet devices; UART remains a fallback. General USB/HID input, dynamic package execution, and the broader Bash/POSIX shell remain future work. Do not claim runtime stability until the graphical boot and navigation matrix has been tested on QEMU.

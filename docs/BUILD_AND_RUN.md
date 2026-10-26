@@ -39,31 +39,23 @@ git clone https://github.com/rioktss/RioOS.git
 cd RioOS
 ```
 
-## 3. Build on Linux, macOS, Termux, or WSL
+## 3. Linux / WSL
 
-Make the scripts executable:
-
-```bash
-chmod +x build.sh run.sh
-```
-
-Build:
+Linux and WSL use the scripts in `linux/`. From the repository root:
 
 ```bash
-./build.sh
+chmod +x linux/*.sh
+./linux/build.sh
+./linux/run.sh
 ```
 
-Build and immediately boot QEMU:
+Build and immediately boot the serial/headless runner:
 
 ```bash
-./build.sh --run
+./linux/build.sh --run
 ```
 
-Run QEMU separately after a successful build:
-
-```bash
-./run.sh
-```
+For the plain black shell in a QEMU window, use `./linux/run-terminal.sh`. For the lock/home pixel UI, use `./linux/run-ui.sh`.
 
 ## 4. Arch Linux
 
@@ -77,9 +69,8 @@ sudo pacman -S clang lld python qemu-desktop
 Then build:
 
 ```bash
-chmod +x build.sh run.sh
-./build.sh
-./run.sh
+bash linux/build.sh
+bash linux/run.sh
 ```
 
 ## 5. Debian / Ubuntu
@@ -99,9 +90,9 @@ qemu-system-aarch64 --version
 Then:
 
 ```bash
-chmod +x build.sh run.sh
-./build.sh
-./run.sh
+chmod +x linux/*.sh
+./linux/build.sh
+./linux/run.sh
 ```
 
 ## 6. Termux / Android
@@ -118,46 +109,56 @@ python3 --version
 qemu-system-aarch64 --version
 ```
 
-Then:
+Then run the Termux-specific entry points:
 
 ```bash
-chmod +x build.sh run.sh
-./build.sh
-./run.sh
+bash termux/build.sh
+bash termux/run.sh
 ```
 
-If QEMU cannot access the expected acceleration features on a particular Android device, software emulation may still be possible but can be slower or unavailable depending on the Termux/QEMU build.
+For the plain black shell window or pixel UI, use `bash termux/run-terminal.sh` or `bash termux/run-ui.sh`. Start Termux:X11 first for graphical windows and use a QEMU build with SDL or GTK support. If QEMU cannot access the expected acceleration features on a particular Android device, software emulation may still be possible but can be slower or unavailable depending on the Termux/QEMU build.
 
-## 7. Windows PowerShell
+## 7. macOS
+
+Use the scripts in `macos/`. Ensure that the installed LLVM/Clang supports `--target=aarch64-none-elf`, and install Python 3 and QEMU. The macOS window runners default to QEMU's `cocoa` backend; set `RIOOS_DISPLAY=sdl` if your QEMU build uses SDL instead.
+
+```bash
+bash macos/build.sh
+bash macos/run.sh
+bash macos/run-terminal.sh
+bash macos/run-ui.sh
+```
+
+## 8. Windows PowerShell
 
 Install LLVM/Clang, LLD, Python 3, and QEMU. Ensure their executable directories are available in `PATH`.
 
 Build:
 
 ```powershell
-.\build.ps1
+.\windows\build.ps1
 ```
 
 Build and run:
 
 ```powershell
-.\build.ps1 --run
+.\windows\build.ps1 --run
 ```
 
 Run separately:
 
 ```powershell
-.\run.ps1
+.\windows\run.ps1
 ```
 
 Optional:
 
 ```powershell
-.\build.ps1 --verbose
-.\build.ps1 --clean
+.\windows\build.ps1 --verbose
+.\windows\build.ps1 --clean
 ```
 
-## 8. QEMU configuration
+## 9. QEMU configuration
 
 The default Unix and PowerShell runners use these important settings:
 
@@ -175,12 +176,12 @@ Network       : virtio-net-device + user networking
 
 The source of truth is the runner script itself:
 
-- [`run.sh`](../run.sh)
-- [`run.ps1`](../run.ps1)
+- [`linux/run.sh`](../linux/run.sh)
+- [`windows/run.ps1`](../windows/run.ps1)
 
-To open the original RioOS shell in a plain black QEMU text-console window on Linux or Termux:X11, run `./run-terminal.sh`. Choose SDL with `RIOOS_DISPLAY=sdl ./run-terminal.sh` when GTK is unavailable. This requires a desktop/X11/Wayland session and QEMU with GTK or SDL display support; it does not require `ramfb` or VirtIO GUI input devices. UART input/output is handled by QEMU's virtual console, not the host terminal. On Windows PowerShell, use `./run-terminal.ps1`. `run.sh` remains the host serial-console option and `run-ui.sh` remains the normal lock/home UI option.
+To open the original RioOS shell in a plain black QEMU text-console window, use `linux/run-terminal.sh` on Linux/WSL, `termux/run-terminal.sh` on Termux:X11, `macos/run-terminal.sh` on macOS, or `windows/run-terminal.ps1` in PowerShell. Linux and Termux can select SDL with `RIOOS_DISPLAY=sdl` when GTK is unavailable; macOS defaults to Cocoa and can select SDL. This mode requires a usable graphical backend but does not require `ramfb` or VirtIO GUI input devices. UART input/output is handled by QEMU's virtual console, not the host terminal. The `run` script stays the serial-console option, while `run-ui` opens the pixel lock/home UI.
 
-## 9. Build outputs
+## 10. Build outputs
 
 After a successful build, the important generated files are:
 
@@ -192,9 +193,9 @@ build/calc.elf
 storage/disk.img
 ```
 
-Not every optional userspace artifact is guaranteed to exist in every future revision; consult `build.sh` for the current build flow.
+Not every optional userspace artifact is guaranteed to exist in every future revision; consult `linux/build.sh` for the current build flow.
 
-## 10. Environment overrides
+## 11. Environment overrides
 
 The build scripts support tool overrides through environment variables.
 
@@ -205,7 +206,7 @@ CLANG=/path/to/clang \
 CXX=/path/to/clang++ \
 LD=/path/to/ld.lld \
 QEMU=/path/to/qemu-system-aarch64 \
-./build.sh
+./linux/build.sh
 ```
 
 The QEMU runners also support:
@@ -218,12 +219,12 @@ RIOOS_CPU=cortex-a72
 Example:
 
 ```bash
-RIOOS_MEM=256M RIOOS_CPU=cortex-a72 ./run.sh
+RIOOS_MEM=256M RIOOS_CPU=cortex-a72 ./linux/run.sh
 ```
 
-## 11. What the build script does
+## 12. What the build script does
 
-At a high level, `build.sh` performs these stages:
+At a high level, `linux/build.sh` performs these stages:
 
 ```text
 1. Build userspace programs
@@ -239,7 +240,7 @@ At a high level, `build.sh` performs these stages:
 
 The build intentionally separates host tools/tests from the freestanding ARM64 kernel.
 
-## 12. First boot
+## 13. First boot
 
 When QEMU starts, RioOS uses the serial console. A typical boot ends at an interactive shell prompt similar to:
 
@@ -265,14 +266,14 @@ sched
 
 The available command set may change as RioOS evolves.
 
-## 13. Troubleshooting
+## 14. Troubleshooting
 
 ### `qemu-system-aarch64: command not found`
 
 Install QEMU for your platform or point `QEMU` at the executable:
 
 ```bash
-QEMU=/custom/path/qemu-system-aarch64 ./run.sh
+QEMU=/custom/path/qemu-system-aarch64 ./linux/run.sh
 ```
 
 ### `clang: command not found`
@@ -292,7 +293,7 @@ ld.lld --version
 Run the build first:
 
 ```bash
-./build.sh
+./linux/build.sh
 ```
 
 ### `storage/disk.img not found`
@@ -303,18 +304,18 @@ Run the build first. The build system creates and prepares the persistent disk i
 
 QEMU version, host platform, terminal handling, and acceleration support can affect runtime behaviour. Compare your environment against the QEMU configuration documented above and reproduce the problem from a clean build when possible.
 
-## 14. Cleaning generated output
+## 15. Cleaning generated output
 
 On Unix-like systems:
 
 ```bash
-./build.sh --clean
+./linux/build.sh --clean
 ```
 
 On Windows:
 
 ```powershell
-.\build.ps1 --clean
+.\windows\build.ps1 --clean
 ```
 
 Cleaning removes generated build/test artifacts; it is separate from the source tree.
@@ -326,7 +327,7 @@ The 1.6.1 build includes process-manager and logical scheduler regression tests,
 
 ## P1 descriptor and pipes release (v1.7.0)
 
-Version 1.7.0 adds process-PID-scoped descriptor tables, shared open-file descriptions for `dup`/`dup2`, and a bounded non-blocking kernel pipe syscall. Run `bash build.sh` to execute the new host regressions. See [P1_FD_PIPES.md](./P1_FD_PIPES.md) for behavior and limitations. This does not add `fork()`/`wait()` or concurrent EL0 process execution; timer IRQ remains disabled at boot.
+Version 1.7.0 adds process-PID-scoped descriptor tables, shared open-file descriptions for `dup`/`dup2`, and a bounded non-blocking kernel pipe syscall. Run `bash linux/build.sh` to execute the new host regressions. See [P1_FD_PIPES.md](./P1_FD_PIPES.md) for behavior and limitations. This does not add `fork()`/`wait()` or concurrent EL0 process execution; timer IRQ remains disabled at boot.
 
 ## P2 filesystem and permissions (v1.8.0)
 
@@ -334,25 +335,25 @@ The filesystem persists owner UID/GID in unused inode metadata bytes and migrate
 
 New commands: `stat <path>`, `chown <uid> <gid> <path>` (root only), and `truncate <path> <size>` (up to 262144 bytes; extension is zero-filled). `chmod` now requires file ownership or root. File reads/writes, parent-directory mutations, path traversal, and ELF execution check mode bits. `diskread`, `diskwrite`, and `diskflush` require root.
 
-P2 userspace syscall helpers are `user_fs_stat`, `user_fs_truncate`, and `user_fs_chmod` in `include/user_api.h`. Run `bash build.sh --clean` to rebuild and execute filesystem permission/migration and syscall regression tests. The kernel still uses a single global shell credential context, so this is educational access control rather than a hardened multi-user security boundary. Timer IRQ stays off at boot.
+P2 userspace syscall helpers are `user_fs_stat`, `user_fs_truncate`, and `user_fs_chmod` in `include/user_api.h`. Run `bash linux/build.sh --clean` to rebuild and execute filesystem permission/migration and syscall regression tests. The kernel still uses a single global shell credential context, so this is educational access control rather than a hardened multi-user security boundary. Timer IRQ stays off at boot.
 
 ## P3 UDP and DNS networking (v1.9.0)
 
 P3 adds owner-PID-scoped UDP handles, bound/ephemeral ports, bounded receive queues, IPv4/UDP validation and UDP transmit checksum, DNS A-record queries, network syscall helpers, and the `ifconfig`, `nslookup`, and root-only `dnsserver` commands. The default DNS address is `10.0.2.3` for QEMU user-mode networking. See [P3 networking notes](./P3_NETWORKING.md) for API use and limits.
 
-Run `bash build.sh --clean` for the AArch64 clean build and host regressions. On a machine with `qemu-system-aarch64`, also run `net`, `ping 10.0.2.2`, and `nslookup example.com`. Host tests use a fake NIC/DNS peer and are not a replacement for that QEMU runtime test. TCP, DHCP, IPv6, and IP fragment reassembly are not included, and timer IRQ remains disabled at boot.
+Run `bash linux/build.sh --clean` for the AArch64 clean build and host regressions. On a machine with `qemu-system-aarch64`, also run `net`, `ping 10.0.2.2`, and `nslookup example.com`. Host tests use a fake NIC/DNS peer and are not a replacement for that QEMU runtime test. TCP, DHCP, IPv6, and IP fragment reassembly are not included, and timer IRQ remains disabled at boot.
 
 
 ## P4 SMP/driver foundations (v1.10.0)
 
-Run `bash build.sh --clean` (or `.\build.ps1 --clean` in PowerShell) to build the new SMP and framebuffer host regressions alongside the existing suite. There are 14 host-test executables. The release check verifies SMP stays disabled, the framebuffer host test is present, VirtIO-Net RX buffers are bounded, and timer IRQ has not been enabled in the normal boot path.
+Run `bash linux/build.sh --clean` (or `.\windows\build.ps1 --clean` in PowerShell) to build the new SMP and framebuffer host regressions alongside the existing suite. There are 14 host-test executables. The release check verifies SMP stays disabled, the framebuffer host test is present, VirtIO-Net RX buffers are bounded, and timer IRQ has not been enabled in the normal boot path.
 
 After launching QEMU on a host with `qemu-system-aarch64`, try `smp` and `fbinfo`. `smp` should report one online CPU and disabled SMP. `fbinfo` explains that the software framebuffer is not yet connected to a QEMU display; the UART remains the interactive console. Keep timer IRQ disabled during ordinary boot.
 
 
 ## Pixel UI and RPK apps (v1.11.0)
 
-The default `run.sh` / `run.ps1` remains a headless `-nographic` serial shell. To use the graphical framebuffer, build normally and launch `./run-ui.sh` on a QEMU build with GTK/SDL display support (PowerShell: `./run-ui.ps1`). The GUI runner attaches `-device ramfb`; the kernel locates `etc/ramfb` through QEMU `fw_cfg`, configures an XRGB8888 surface, and flushes rendered pixels from cache. The framebuffer is 1024×768.
+The default `linux/run.sh` / `windows/run.ps1` remains a headless `-nographic` serial shell. To use the graphical framebuffer, build normally and launch `./linux/run-ui.sh` on a QEMU build with GTK/SDL display support (PowerShell: `./windows/run-ui.ps1`). The GUI runner attaches `-device ramfb`; the kernel locates `etc/ramfb` through QEMU `fw_cfg`, configures an XRGB8888 surface, and flushes rendered pixels from cache. The framebuffer is 1024×768.
 
 The graphical runner attaches VirtIO keyboard/tablet devices. Focus the QEMU window to type, swipe/drag upward to unlock, and click a home-screen app icon. Home navigation also supports A/D, W/S, arrow keys, Enter, and 1–5; X returns to the serial shell. UART input is retained as a fallback. The pixel Terminal forwards commands to the same `execute_command()` dispatcher used by the serial shell; it is not a GNU Bash process.
 

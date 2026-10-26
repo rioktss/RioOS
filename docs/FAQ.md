@@ -34,7 +34,7 @@ Start with:
 
 ```text
 boot/boot.S
-linker.ld
+boot/linker.ld
 kernel/kernel.cpp
 ```
 

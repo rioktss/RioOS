@@ -7,18 +7,18 @@ RioOS v1.11.0 adds an optional pixel-rendered interface for QEMU `virt` using QE
 Linux / Termux with a compatible AArch64 cross-build toolchain and QEMU:
 
 ```sh
-bash build.sh --clean
-./run-ui.sh
+bash linux/build.sh --clean
+./linux/run-ui.sh
 ```
 
 Windows PowerShell:
 
 ```powershell
-.\build.ps1 --clean
-.\run-ui.ps1
+.\windows\build.ps1 --clean
+.\windows\run-ui.ps1
 ```
 
-The graphical UI runner defaults to GTK; override it with `RIOOS_DISPLAY=sdl ./run-ui.sh` when SDL is supported. `./run-ui.sh` opens the RioOS lock/home UI and its built-in apps. For a separate plain black text shell, run `./run-terminal.sh` (or `RIOOS_DISPLAY=sdl ./run-terminal.sh` when SDL is preferred); on Windows PowerShell use `./run-terminal.ps1`. This text-only runner sends the original UART shell to QEMU's virtual console and deliberately does not attach `ramfb` or request the pixel Terminal app. The graphical UI runner requests a 1024x768 XRGB8888 ram framebuffer. The firmware config interface is probed at boot; if no compatible ramfb device is found, RioOS reports that fact over UART and continues into the existing serial shell rather than hanging while waiting for a display.
+The graphical UI runner defaults to GTK; override it with `RIOOS_DISPLAY=sdl ./linux/run-ui.sh` when SDL is supported. `./linux/run-ui.sh` opens the RioOS lock/home UI and its built-in apps. For a separate plain black text shell, run `./linux/run-terminal.sh` (or `RIOOS_DISPLAY=sdl ./linux/run-terminal.sh` when SDL is preferred); on Windows PowerShell use `./windows/run-terminal.ps1`. This text-only runner sends the original UART shell to QEMU's virtual console and deliberately does not attach `ramfb` or request the pixel Terminal app. The graphical UI runner requests a 1024x768 XRGB8888 ram framebuffer. The firmware config interface is probed at boot; if no compatible ramfb device is found, RioOS reports that fact over UART and continues into the existing serial shell rather than hanging while waiting for a display.
 
 ## Screens
 
@@ -65,7 +65,7 @@ The guest filesystem has `/wallpapers`, `/icons`, and `/settings` directories. W
 
 ## Current limitations / test status
 
-- QEMU-window keyboard and pointer input use VirtIO input devices added by `run-ui.sh` / `run-ui.ps1`; arbitrary physical input devices are not directly supported by the guest kernel.
+- QEMU-window keyboard and pointer input use VirtIO input devices added by `linux/run-ui.sh` / `windows/run-ui.ps1`; arbitrary physical input devices are not directly supported by the guest kernel.
 - The UI's VirtIO input driver is polled and does not enable the Generic Timer IRQ. UART input remains a fallback.
 - GUI display requires a QEMU build and display backend that support `ramfb`, the `fw_cfg` DMA interface, and the VirtIO keyboard/tablet device models. The launcher checks these models before starting.
 - App manifests are metadata for built-in apps, not dynamically loadable binaries.
@@ -74,13 +74,13 @@ The guest filesystem has `/wallpapers`, `/icons`, and `/settings` directories. W
 
 ## QEMU window controls and terminal command parity
 
-`run-ui.sh` attaches QEMU's VirtIO keyboard and tablet to the ARM `virt` machine. The UI polls these devices without enabling timer interrupts: swipe upward on the lock screen to unlock, click a home-screen app icon to open it, and type normally in the Terminal app. Serial input remains available as a fallback, so existing `WASD`/Enter workflows are retained.
+`linux/run-ui.sh` attaches QEMU's VirtIO keyboard and tablet to the ARM `virt` machine. The UI polls these devices without enabling timer interrupts: swipe upward on the lock screen to unlock, click a home-screen app icon to open it, and type normally in the Terminal app. Serial input remains available as a fallback, so existing `WASD`/Enter workflows are retained.
 
 The Terminal `.rpk` uses the same `execute_command()` dispatcher as the serial shell, with command output captured into the pixel terminal. This keeps command availability, filesystem changes, environment expansion, pipes, and redirection on the shared RioOS implementation rather than maintaining a second partial command list. `Esc` returns from the Terminal app to the home screen. Commands such as `exit` and `logout` are dispatched normally through the shared shell implementation, preserving their serial-shell semantics.
 
-QEMU builds need the `virtio-keyboard-device` and `virtio-tablet-device` device models enabled. On Windows, `run-ui.ps1` attaches the same devices.
+QEMU builds need the `virtio-keyboard-device` and `virtio-tablet-device` device models enabled. On Windows, `windows/run-ui.ps1` attaches the same devices.
 
 
 ## Plain black text-console runner
 
-`run-terminal.sh` opens QEMU’s virtual serial console as a black, monospace text window. It attaches the original RioOS UART shell to `-serial vc:100Cx32C`, but intentionally omits `ramfb`, VirtIO GUI input devices, and the `opt/rioos/start-terminal=1` flag. As a result, the pixel UI and its Terminal `.rpk` app do not launch; shell output and keyboard input are handled by the original serial shell inside the QEMU window. Use `run-ui.sh` when you want the lock/home UI and built-in apps, including the pixel Terminal. Use `run.sh` when you specifically want UART shell I/O in the host terminal. On Windows PowerShell, `run-terminal.ps1` provides the same text-console mode.
+`linux/run-terminal.sh` opens QEMU’s virtual serial console as a black, monospace text window. It attaches the original RioOS UART shell to `-serial vc:100Cx32C`, but intentionally omits `ramfb`, VirtIO GUI input devices, and the `opt/rioos/start-terminal=1` flag. As a result, the pixel UI and its Terminal `.rpk` app do not launch; shell output and keyboard input are handled by the original serial shell inside the QEMU window. Use `linux/run-ui.sh` when you want the lock/home UI and built-in apps, including the pixel Terminal. Use `linux/run.sh` when you specifically want UART shell I/O in the host terminal. On Windows PowerShell, `windows/run-terminal.ps1` provides the same text-console mode.

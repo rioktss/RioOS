@@ -21,7 +21,7 @@
 
 ## Required on the user's Termux/QEMU host
 
-- Full QEMU boot and visual/input verification (not run in the build container unless `qemu-system-aarch64` is available). `run-ui.sh` wires QEMU-window input through VirtIO keyboard/tablet devices; real input behavior still depends on the installed QEMU build and host display backend.
+- Full QEMU boot and visual/input verification (not run in the build container unless `qemu-system-aarch64` is available). `linux/run-ui.sh` wires QEMU-window input through VirtIO keyboard/tablet devices; real input behavior still depends on the installed QEMU build and host display backend.
 - `selftest` command
 - `threads` followed by `thread-demo` (cooperative switching only; IRQ remains off)
 - `fds` and `syscall fd` (open/write/seek/read/close/dup/pipe smoke tests); userspace wrapper execution still requires QEMU validation

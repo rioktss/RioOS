@@ -3,8 +3,25 @@ import shutil, struct, subprocess
 
 root=Path(__file__).resolve().parents[1]
 kernel=root/'build/kernel.elf'; disk=root/'storage/disk.img'; user=root/'build/user_init.elf'
-required=['drivers/virtio_mmio.cpp','drivers/virtio_net.cpp','net/netstack.cpp','docs/P3_NETWORKING.md','docs/TEST_MATRIX_P3.md','process/user.cpp','process/elf.cpp','boot/exceptions.S','process/scheduler.cpp','process/thread.cpp','process/ctx_switch.S','kernel/fd.cpp','include/fd.h','tests/fd_host_test.cpp','tests/process_host_test.cpp','tests/scheduler_process_host_test.cpp','drivers/fb.cpp','drivers/font.cpp','drivers/ui_font_data.cpp','include/ui_font_data.h','docs/THIRD_PARTY_NOTICES.md','docs/P2_FILESYSTEM_SECURITY.md','include/smp.h','kernel/smp.cpp','tests/smp_host_test.cpp','tests/fb_host_test.cpp','docs/P4_SMP_DRIVER_HARDENING.md','docs/TEST_MATRIX_P4.md','.github/workflows/ci.yml','include/ui.h','ui/boot.cpp','ui/lock_screen.cpp','ui/home_screen.cpp','ui/ui.cpp','ui/apps.cpp','ui/terminal.cpp','ui/calculator.cpp','ui/clock.cpp','ui/file_manager.cpp','ui/launcher.cpp','ui/wallpaper.cpp','ui/settings.cpp','ui/image.cpp','apps/wallpaper.rpk','apps/pengaturan.rpk','assets/wallpapers/rioos-default.bmp','assets/icons/terminal.bmp','assets/icons/calculator.bmp','assets/icons/clock.bmp','assets/icons/files.bmp','assets/icons/launcher.bmp','assets/icons/wallpaper.bmp','assets/icons/settings.bmp','docs/ANDROID_UI.md','tests/ui_image_host_test.cpp','run-ui.sh','run-ui.ps1','run-terminal.sh','run-terminal.ps1','docs/PIXEL_UI.md','tests/ui_host_test.cpp','apps/terminal.rpk','apps/calculator.rpk','apps/clock.rpk','apps/files.rpk','apps/launcher.rpk']
+required=['drivers/virtio_mmio.cpp','drivers/virtio_net.cpp','net/netstack.cpp','docs/P3_NETWORKING.md','docs/TEST_MATRIX_P3.md','process/user.cpp','process/elf.cpp','boot/exceptions.S','process/scheduler.cpp','process/thread.cpp','process/ctx_switch.S','kernel/fd.cpp','include/fd.h','tests/fd_host_test.cpp','tests/process_host_test.cpp','tests/scheduler_process_host_test.cpp','drivers/fb.cpp','drivers/font.cpp','drivers/ui_font_data.cpp','include/ui_font_data.h','docs/THIRD_PARTY_NOTICES.md','docs/P2_FILESYSTEM_SECURITY.md','include/smp.h','kernel/smp.cpp','tests/smp_host_test.cpp','tests/fb_host_test.cpp','docs/P4_SMP_DRIVER_HARDENING.md','docs/TEST_MATRIX_P4.md','.github/workflows/ci.yml','include/ui.h','ui/boot.cpp','ui/lock_screen.cpp','ui/home_screen.cpp','ui/ui.cpp','ui/apps.cpp','ui/terminal.cpp','ui/calculator.cpp','ui/clock.cpp','ui/file_manager.cpp','ui/launcher.cpp','ui/wallpaper.cpp','ui/settings.cpp','ui/image.cpp','apps/wallpaper.rpk','apps/pengaturan.rpk','assets/wallpapers/rioos-default.bmp','assets/icons/terminal.bmp','assets/icons/calculator.bmp','assets/icons/clock.bmp','assets/icons/files.bmp','assets/icons/launcher.bmp','assets/icons/wallpaper.bmp','assets/icons/settings.bmp','docs/ANDROID_UI.md','tests/ui_image_host_test.cpp','linux/run-ui.sh','windows/run-ui.ps1','linux/run-terminal.sh','windows/run-terminal.ps1','docs/PIXEL_UI.md','tests/ui_host_test.cpp','apps/terminal.rpk','apps/calculator.rpk','apps/clock.rpk','apps/files.rpk','apps/launcher.rpk']
 for name in required: assert (root/name).is_file(), f'missing {name}'
+# Guard the platform-oriented entry-point layout against regression.
+expected_root_files = ['.gitignore', 'README.md']
+root_files = sorted(p.name for p in root.iterdir() if p.is_file())
+assert root_files == expected_root_files, f'only README.md and .gitignore should be root-level files, got: {root_files}'
+
+platform_scripts = {
+    'linux': ('build.sh', 'run.sh', 'run-terminal.sh', 'run-ui.sh'),
+    'termux': ('build.sh', 'run.sh', 'run-terminal.sh', 'run-ui.sh'),
+    'macos': ('build.sh', 'run.sh', 'run-terminal.sh', 'run-ui.sh'),
+    'windows': ('build.ps1', 'run.ps1', 'run-terminal.ps1', 'run-ui.ps1'),
+}
+for platform, scripts in platform_scripts.items():
+    for script in scripts:
+        assert (root / platform / script).is_file(), f'missing platform entry point: {platform}/{script}'
+assert (root / 'boot/linker.ld').is_file(), 'linker script must remain at boot/linker.ld'
+assert (root / 'docs/LICENSE').is_file(), 'MIT license file is missing'
+assert (root / 'docs/PORTABLE_BUILD.md').is_file(), 'portable build guide is missing'
 assert kernel.is_file() and kernel.stat().st_size>0
 assert user.is_file() and user.stat().st_size>0
 assert disk.is_file() and disk.stat().st_size==32768*512
@@ -265,7 +282,7 @@ assert 'current_directory = data_home' in vfs_src, 'VFS writable-home fallback i
 assert 'cmn x0, #2' in nano_src and 'b.eq load_empty' in nano_src, 'nano must only treat ENOENT as a new file'
 assert 'load_failed:' in nano_src and 'msg_denied:' in nano_src, 'nano read/save error handling is missing'
 assert 'state = UI_STATE_HOME;' in ui_src and 'UI: unlocked.' in ui_src, 'lock screen serial unlock path is missing'
-ui_runner=(root/'run-ui.sh').read_text()
+ui_runner=(root/'linux/run-ui.sh').read_text()
 assert 'virtio-keyboard-device' in ui_runner and 'virtio-tablet-device' in ui_runner and 'virtio-mouse-device' in ui_runner, 'QEMU runner must support keyboard, tablet, and optional wheel-capable mouse devices'
 assert 'MOUSE_DEVICE_ARGS=()' in ui_runner and 'wheel scrolling will be disabled' in ui_runner, 'missing optional mouse must not prevent UI startup'
 input_driver=(root/'drivers/virtio_input.cpp').read_text()
@@ -291,13 +308,13 @@ assert '-dy > fb_get_height() / 14' in ui_src and 'pointer_start_y < 52 && dy > 
 assert 'if (hit >= 0)' in ui_src and 'UI_STATE_APP' in ui_src, 'home-screen pointer hit testing missing'
 assert 'Android-like pixel UI ready' in (root/'ui/ui.cpp').read_text(), 'UI input routing status must be reported'
 assert 'fwcfg_init_ramfb' in fb_src and 'RAMFB_FOURCC_XRGB8888' in fb_src, 'QEMU ramfb pixel output path missing'
-assert 'DISPLAY_BACKEND="${RIOOS_DISPLAY:-gtk}"' in (root/'run-ui.sh').read_text(), 'QEMU UI runner display backend must be configurable'
-terminal_runner=(root/'run-terminal.sh').read_text()
+assert 'DISPLAY_BACKEND="${RIOOS_DISPLAY:-gtk}"' in (root/'linux/run-ui.sh').read_text(), 'QEMU UI runner display backend must be configurable'
+terminal_runner=(root/'linux/run-terminal.sh').read_text()
 assert '-serial vc:100Cx32C' in terminal_runner, 'plain-text runner must use a QEMU virtual serial console'
 assert '-display "$DISPLAY_BACKEND"' in terminal_runner, 'plain-text runner must launch a graphical QEMU window'
 assert '-device ramfb' not in terminal_runner, 'plain-text runner must not activate the pixel UI'
 assert '-fw_cfg name=opt/rioos/start-terminal,string=1' not in terminal_runner, 'plain-text runner must not force the pixel Terminal app to start'
-assert '-serial "vc:100Cx32C"' in (root/'run-terminal.ps1').read_text(), 'Windows plain-text runner must attach the QEMU virtual serial console'
+assert '-serial "vc:100Cx32C"' in (root/'windows/run-terminal.ps1').read_text(), 'Windows plain-text runner must attach the QEMU virtual serial console'
 assert 'opt/rioos/start-terminal' in fb_src and 'fb_boot_terminal_requested' in ui_src, 'kernel must honor the optional graphical-terminal startup request'
 assert 'ui_start();' in boot_src and 'timer_delay_ms(900U)' in ui_src
 assert 'timer_start_periodic(' not in ui_src and 'interrupt_enable();' not in ui_src

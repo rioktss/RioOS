@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd "$(dirname "$0")"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_ROOT"
 
 VERBOSE=0
 RUN_QEMU=0
@@ -12,12 +14,11 @@ for arg in "$@"; do
         --run) RUN_QEMU=1 ;;
         --clean) CLEAN=1 ;;
         -h|--help)
-            cat <<'EOF'
-Usage:
- ./build.sh Build + tests only
- ./build.sh --run Build + tests + start QEMU
- ./build.sh -v Verbose compiler output
- ./build.sh --clean Remove generated build/host-test outputs
+            cat <<EOF
+Usage: bash ${BASH_SOURCE[0]} [options]
+  --run      Build + tests + start the serial QEMU runner
+  -v, --verbose  Show detailed compiler output
+  --clean    Remove generated build/host-test outputs
 EOF
             exit 0
             ;;
@@ -172,7 +173,7 @@ step "2/9" "Building host tools"
 
 step "3/9" "Preparing disk image"
 if [[ ! -f storage/disk.img ]]; then
-    dd if=/dev/zero of=storage/disk.img bs=512 count=32768 status=none
+    dd if=/dev/zero of=storage/disk.img bs=512 count=32768 2>/dev/null
 fi
 
 APP_ELFS=(build/user_init.elf)
@@ -210,7 +211,7 @@ for f in "${MODULES[@]}"; do
 done
 
 step "6/9" "Linking"
-"$LD" -T linker.ld -nostdlib -z max-page-size=0x1000 \
+"$LD" -T boot/linker.ld -nostdlib -z max-page-size=0x1000 \
     build/boot.o build/exception_vectors.o build/user_entry.o build/ctx_switch.o \
     build/kernel.o build/uart.o build/memory.o build/string.o build/fs.o build/vfs.o \
     build/process.o build/sched_policy.o build/scheduler.o build/timer.o build/interrupt.o build/keyboard.o \
@@ -314,7 +315,7 @@ printf 'build success\n'
 
 if [[ "$RUN_QEMU" -eq 1 ]]; then
     if command -v "${QEMU:-qemu-system-aarch64}" >/dev/null 2>&1; then
-        exec ./run.sh
+        exec "$SCRIPT_DIR/run.sh"
     else
         echo "ERROR: QEMU not found." >&2
         exit 1

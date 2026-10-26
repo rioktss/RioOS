@@ -185,7 +185,7 @@ validated kernel operation
 return to userspace
 ```
 
-ELF loading is handled by the process/ELF subsystem. Bundled userspace programs are built as AArch64 ELF artifacts by `build.sh` and copied into the filesystem image.
+ELF loading is handled by the process/ELF subsystem. Bundled userspace programs are built as AArch64 ELF artifacts by `linux/build.sh` and copied into the filesystem image.
 
 ## Filesystem and storage
 
@@ -288,9 +288,9 @@ See [`../tests/TEST_MATRIX.md`](../tests/TEST_MATRIX.md).
 | How are ELF programs loaded? | `process/elf.cpp` |
 | Where is the filesystem? | `fs/` |
 | Where are block/network drivers? | `drivers/virtio_*.cpp`, `drivers/storage.cpp` |
-| How are user programs built? | `userspace/`, `build.sh` |
-| How is the kernel linked? | `linker.ld` |
-| How is QEMU launched? | `run.sh`, `run.ps1` |
+| How are user programs built? | `userspace/`, `linux/build.sh` |
+| How is the kernel linked? | `boot/linker.ld` |
+| How is QEMU launched? | `linux/run.sh`, `windows/run.ps1` |
 
 ## Architectural philosophy
 
@@ -328,4 +328,4 @@ The framebuffer driver is a bounded software RAM surface at the address reserved
 
 `drivers/fb.cpp` now provides clipped pixel primitives, bitmap text drawing, gradients, rounded panels, cache maintenance, and a direct QEMU `ramfb` setup path using the `fw_cfg` DMA interface. The framebuffer is a statically reserved 1024×768 XRGB8888 buffer, avoiding allocator ownership and lifetime problems. The boot splash, lock screen, home screen, app router, and each app have separate translation units under `ui/`.
 
-`run-ui.sh` adds `-device ramfb` and a graphical QEMU display while keeping PL011 UART attached to stdio as a fallback. Normal `run.sh` remains headless and is backward-compatible. The runner attaches VirtIO keyboard and tablet devices; the polled driver reads their advertised identity and absolute-coordinate ranges. The built-in `.rpk` manifests are installed into `/apps` at image-build time and validated before launch; app code is currently built into the kernel. General USB/HID devices, dynamically loaded RPK executables, and a full GNU Bash userspace are not implemented. Runtime rendering and input still need a visual QEMU acceptance run on a host with display support.
+`linux/run-ui.sh` adds `-device ramfb` and a graphical QEMU display while keeping PL011 UART attached to stdio as a fallback. Normal `linux/run.sh` remains headless and is backward-compatible. The runner attaches VirtIO keyboard and tablet devices; the polled driver reads their advertised identity and absolute-coordinate ranges. The built-in `.rpk` manifests are installed into `/apps` at image-build time and validated before launch; app code is currently built into the kernel. General USB/HID devices, dynamically loaded RPK executables, and a full GNU Bash userspace are not implemented. Runtime rendering and input still need a visual QEMU acceptance run on a host with display support.

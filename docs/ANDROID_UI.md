@@ -18,7 +18,7 @@ Supported format is uncompressed BMP (24-bit or 32-bit), maximum file size **1 M
 
 ```sh
 cp ~/Pictures/my-wallpaper.bmp assets/wallpapers/
-bash build.sh
+bash linux/build.sh
 ```
 
 Open RioOS, launch Wallpaper, select the image, and press Enter. The selected path is persisted on the filesystem. The bundled `rioos-default.bmp` is used if no saved choice is available or a saved image cannot be decoded.
@@ -33,6 +33,6 @@ The app packages are metadata manifests (`RIOPKG/1`) for built-in kernel UI modu
 
 ## Input and launch
 
-Use `bash build.sh` to compile and run host tests. Start the interactive QEMU window from a graphical X11/Wayland desktop with `bash run-ui.sh`. Swipe up on the lock screen or press a key to unlock. Click an app, use the keyboard for in-app commands, press `Q` / Escape to go back, and click the small top-left area for a global Home shortcut.
+Use `bash linux/build.sh` to compile and run host tests. Start the interactive QEMU window from a graphical X11/Wayland desktop with `bash linux/run-ui.sh`. Swipe up on the lock screen or press a key to unlock. Click an app, use the keyboard for in-app commands, press `Q` / Escape to go back, and click the small top-left area for a global Home shortcut.
 
 Inter font licensing and attribution are included in `docs/THIRD_PARTY_NOTICES.md`; the original font file is not bundled. This is a best-effort improvement, not a claim that all hardware/backends are bug-free. Host tests cover drawing primitives, manifest checks, filesystem bounds, and release invariants; real QEMU X11 input/rendering should still be checked on the target machine.

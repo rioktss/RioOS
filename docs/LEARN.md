@@ -17,7 +17,7 @@ Start by understanding the environment:
 Read:
 
 - [`../docs/BUILD_AND_RUN.md`](./BUILD_AND_RUN.md)
-- [`../run.sh`](../run.sh)
+- [`../linux/run.sh`](../linux/run.sh)
 - [`../README.md`](../README.md)
 
 Questions to answer:
@@ -33,7 +33,7 @@ Start with:
 ```text
 boot/boot.S
 boot/exceptions.S
-linker.ld
+boot/linker.ld
 ```
 
 The goal is to understand how control reaches the kernel and how low-level exception entry is represented.

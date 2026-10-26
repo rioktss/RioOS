@@ -70,4 +70,4 @@ Because pipes are non-blocking, a read can return `-11` when no bytes are ready.
 
 ## Validation
 
-Run `bash build.sh` to clean-build the AArch64 kernel and run host tests. The expanded host tests cover per-PID descriptor isolation, shared offsets via `dup`/`dup2`, pipe data transfer, non-blocking empty reads, EOF, `EPIPE`, and syscall argument validation. A successful host build does not replace an interactive QEMU boot test. Timer IRQ remains off by default.
+Run `bash linux/build.sh` to clean-build the AArch64 kernel and run host tests. The expanded host tests cover per-PID descriptor isolation, shared offsets via `dup`/`dup2`, pipe data transfer, non-blocking empty reads, EOF, `EPIPE`, and syscall argument validation. A successful host build does not replace an interactive QEMU boot test. Timer IRQ remains off by default.

@@ -1,5 +1,6 @@
 $ErrorActionPreference = "Stop"
-Set-Location $PSScriptRoot
+$ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+Set-Location $ProjectRoot
 $Qemu = if ($env:QEMU) { $env:QEMU } else { "qemu-system-aarch64" }
 $Mem = if ($env:RIOOS_MEM) { $env:RIOOS_MEM } else { "128M" }
 $Cpu = if ($env:RIOOS_CPU) { $env:RIOOS_CPU } else { "cortex-a72" }
@@ -8,7 +9,7 @@ if (-not (Get-Command $Qemu -ErrorAction SilentlyContinue)) {
     throw "qemu-system-aarch64 not found. Install a QEMU build with SDL/GTK display support."
 }
 if (-not (Test-Path "build/kernel.elf") -or -not (Test-Path "storage/disk.img")) {
-    throw "Build artifacts missing. Run .\build.ps1 first."
+    throw "Build artifacts missing. Run .\windows\build.ps1 first."
 }
 $DeviceHelp = (& $Qemu -device help 2>&1 | Out-String)
 foreach ($RequiredDevice in @("ramfb", "virtio-keyboard-device", "virtio-tablet-device")) {

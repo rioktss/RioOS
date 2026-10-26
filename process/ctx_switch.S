@@ -1,6 +1,6 @@
 /* Kernel thread context switch (AArch64).
    Saves/restores the AAPCS64 callee-saved registers x19-x30 plus SP.
-   Placed in plain .text so linker.ld's *(.text) picks it up. */
+   Placed in plain .text so boot/linker.ld's *(.text) picks it up. */
 .section .text, "ax"
 .global thread_context_switch
 .global thread_trampoline

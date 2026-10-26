@@ -10,11 +10,11 @@ This package makes the RioOS build/run workflow portable across:
 
 ## Files
 
-- `build.sh` — portable Bash build script
-- `build.ps1` — native Windows PowerShell build script
-- `run.sh` — QEMU runner for Unix-like systems
-- `run.ps1` — QEMU runner for Windows
-- `PORTABLE_BUILD.md` — this documentation
+- `linux/` — `build.sh`, `run.sh`, `run-terminal.sh`, `run-ui.sh` for Linux and WSL
+- `termux/` — the same four Bash entry points for Android Termux
+- `macos/` — the same four Bash entry points with macOS Cocoa display defaults
+- `windows/` — `build.ps1`, `run.ps1`, `run-terminal.ps1`, `run-ui.ps1`
+- `docs/PORTABLE_BUILD.md` — this documentation
 
 ## Important
 
@@ -32,7 +32,7 @@ fs/
 net/
 tests/
 userspace/
-linker.ld
+boot/linker.ld
 ```
 
 ## Dependencies
@@ -73,59 +73,62 @@ Install LLVM/Clang + LLD, Python 3 and QEMU. Run PowerShell as a normal user.
 
 ## Build
 
-### Termux / Linux / macOS / WSL
+### Linux / WSL
 
 ```bash
-chmod +x build.sh run.sh
-./build.sh
+chmod +x linux/*.sh
+./linux/build.sh
+./linux/build.sh --run
+./linux/build.sh --verbose
+./linux/build.sh --clean
 ```
 
-Build and immediately boot:
+### Termux on Android
 
 ```bash
-./build.sh --run
+bash termux/build.sh
+bash termux/run.sh
 ```
 
-Verbose build:
+For the window runners, start Termux:X11 first and make sure QEMU has SDL or GTK support.
+
+### macOS
 
 ```bash
-./build.sh --verbose
+bash macos/build.sh
+bash macos/run.sh
 ```
 
-Clean generated compiler/test outputs:
-
-```bash
-./build.sh --clean
-```
+The macOS graphical runners default to QEMU's Cocoa backend. Set `RIOOS_DISPLAY=sdl` to select SDL when supported.
 
 ### Windows PowerShell
 
 ```powershell
-.\build.ps1
+.\windows\build.ps1
 ```
 
 Build and boot:
 
 ```powershell
-.\build.ps1 --run
+.\windows\build.ps1 --run
 ```
 
 Verbose:
 
 ```powershell
-.\build.ps1 --verbose
+.\windows\build.ps1 --verbose
 ```
 
 Clean generated compiler/test outputs:
 
 ```powershell
-.\build.ps1 --clean
+.\windows\build.ps1 --clean
 ```
 
 Run QEMU separately:
 
 ```powershell
-.\run.ps1
+.\windows\run.ps1
 ```
 
 ## Output
@@ -148,7 +151,7 @@ CLANG=/path/to/clang \
 CXX=/path/to/clang++ \
 LD=/path/to/ld.lld \
 QEMU=/path/to/qemu-system-aarch64 \
-./build.sh
+./linux/build.sh
 ```
 
 Optional runner settings:
@@ -165,7 +168,7 @@ $env:CLANG="C:\LLVM\bin\clang.exe"
 $env:CXX="C:\LLVM\bin\clang++.exe"
 $env:LD="C:\LLVM\bin\ld.lld.exe"
 $env:QEMU="C:\Program Files\qemu\qemu-system-aarch64.exe"
-.\build.ps1
+.\windows\build.ps1
 ```
 
 ## Design goal

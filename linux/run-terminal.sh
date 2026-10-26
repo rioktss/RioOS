@@ -3,7 +3,9 @@
 # This runner deliberately does NOT attach ramfb, fw_cfg start-terminal, or
 # VirtIO GUI input devices, so the pixel UI and its .rpk Terminal app stay off.
 set -euo pipefail
-cd "$(dirname "$0")"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_ROOT"
 
 QEMU="${QEMU:-qemu-system-aarch64}"
 KERNEL="${KERNEL:-build/kernel.elf}"
@@ -19,8 +21,8 @@ command -v "$QEMU" >/dev/null 2>&1 || {
     echo "  Termux: use a QEMU build with GTK or SDL display support." >&2
     exit 1
 }
-[[ -f "$KERNEL" ]] || { echo "ERROR: $KERNEL not found. Run ./build.sh first." >&2; exit 1; }
-[[ -f "$DISK" ]] || { echo "ERROR: $DISK not found. Run ./build.sh first." >&2; exit 1; }
+[[ -f "$KERNEL" ]] || { echo "ERROR: $KERNEL not found. Run the build script for this platform first." >&2; exit 1; }
+[[ -f "$DISK" ]] || { echo "ERROR: $DISK not found. Run the build script for this platform first." >&2; exit 1; }
 
 # Linux/X11/Wayland and Termux:X11 need a graphical session. Native Windows
 # can open the SDL window without DISPLAY; WSLg provides DISPLAY/WAYLAND_DISPLAY.

@@ -11,7 +11,7 @@
 
 ## Verification
 
-`bash build.sh --clean` compiles the kernel with warnings treated as errors and runs the host test suite. File descriptor tests exercise separate owner tables, shared offsets, descriptor replacement, empty-pipe `EAGAIN`-style return, successful transfer, EOF after writer closure, and `EPIPE` after reader closure. Syscall tests verify the added syscall dispatch and reject invalid `pipe()` user output pointers. Release verification checks that the new syscall paths and userspace wrappers remain present.
+`bash linux/build.sh --clean` compiles the kernel with warnings treated as errors and runs the host test suite. File descriptor tests exercise separate owner tables, shared offsets, descriptor replacement, empty-pipe `EAGAIN`-style return, successful transfer, EOF after writer closure, and `EPIPE` after reader closure. Syscall tests verify the added syscall dispatch and reject invalid `pipe()` user output pointers. Release verification checks that the new syscall paths and userspace wrappers remain present.
 
 ## Explicit limitations
 
