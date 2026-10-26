@@ -42,7 +42,8 @@ int main(){
     if(fs_write_data("/storage/home/test.bin",root,src,900)!=0)fail("write");
     uint64_t got=0; if(fs_read_file("/storage/home/test.bin",root,dst,900,&got)!=0||got!=900||!same(src,dst,900))fail("read");
     fs_init();
-    for(int i=0;i<900;i++)dst[i]=0; got=0;
+    for(int i=0;i<900;i++)dst[i]=0;
+    got=0;
     if(fs_read_file("/storage/home/test.bin",fs_get_root(),dst,900,&got)!=0||got!=900||!same(src,dst,900))fail("remount persistence");
     if(fs_get_mode(fs_resolve("/storage/home/test.bin",fs_get_root())) != 0644U) fail("default file mode");
     {
@@ -153,6 +154,28 @@ int main(){
         owned_id = fs_resolve(owned, fs_get_root());
         CHECK(owned_id >= 0 && fs_get_uid(owned_id) == 2000U && fs_get_gid(owned_id) == 2000U);
         CHECK(fs_stat_path(owned, fs_get_root(), &st) == 0 && st.uid == 2000U && st.gid == 2000U);
+    }
+
+    /* Root editing inside a user's home must not lock the user out of the file. */
+    {
+        int root = fs_get_root();
+        uint8_t data[3] = {1, 2, 3};
+        fs_set_credentials(0U, 0U);
+        CHECK(fs_write_data("/home/user/rootmade.txt", root, data, 3) == 0);
+        int id = fs_resolve("/home/user/rootmade.txt", root);
+        CHECK(id >= 0 && fs_get_uid(id) == 1000U && fs_get_gid(id) == 1000U);
+        CHECK(fs_set_owner(id, 0U, 0U) == 0);            /* simulate an old root-owned file */
+        CHECK(fs_get_uid(id) == 0U);
+        fs_init();                                        /* remount repairs it */
+        fs_set_credentials(0U, 0U);
+        root = fs_get_root();
+        id = fs_resolve("/home/user/rootmade.txt", root);
+        CHECK(id >= 0 && fs_get_uid(id) == 1000U);
+        fs_set_credentials(1000U, 1000U);
+        CHECK(fs_write_data("/home/user/rootmade.txt", root, data, 3) == 0);
+        fs_set_credentials(0U, 0U);
+        CHECK(fs_touch("/rootonly.txt", root) >= 0);      /* outside home stays root-owned */
+        CHECK(fs_get_uid(fs_resolve("/rootonly.txt", root)) == 0U);
     }
 
     /* A corrupted UINT64_MAX file size must be rejected rather than wrapping

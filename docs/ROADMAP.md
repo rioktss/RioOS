@@ -52,7 +52,7 @@ Implemented in this increment:
 - executable permission required by the ELF loader; raw-disk reads/writes/cache flush require root
 - regression tests for denied access, owner chmod, metadata persistence/migration, truncate zero-fill, and syscall credential restoration
 
-The root password `rioos-root` is a development/demo credential embedded in source; it is not suitable for a security-sensitive deployment. This educational OS still has a single global shell role rather than separate per-process credential structures. Timer IRQ remains disabled during normal boot.
+The root password `123` is a development/demo credential embedded in source; it is not suitable for a security-sensitive deployment. This educational OS still has a single global shell role rather than separate per-process credential structures. Timer IRQ remains disabled during normal boot.
 
 ## Medium-term goals
 

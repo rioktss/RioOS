@@ -553,6 +553,13 @@ static int create_node(int type, const char* name, int parent)
     nodes[id].mode = default_mode_for_type(type);
     nodes[id].uid = current_uid;
     nodes[id].gid = current_gid;
+    /* Root working inside a user's home keeps that home's owner, so a file
+       root creates in /home/user stays editable by the user afterwards. */
+    if (current_uid == 0U && nodes[parent].uid != 0U)
+    {
+        nodes[id].uid = nodes[parent].uid;
+        nodes[id].gid = nodes[parent].gid;
+    }
     nodes[id].mtime = rtc_now();
     str_copy(nodes[id].name, name, FS_NAME_SIZE);
     if (save_inode(id) != 0)
@@ -794,6 +801,17 @@ void fs_init()
     int storage_home = fs_resolve("/storage/home", root_id);
     if (home_user >= 0) (void)fs_set_owner(home_user, 1000U, 1000U);
     if (storage_home >= 0) (void)fs_set_owner(storage_home, 1000U, 1000U);
+
+    /* Repair files that root created inside a user home before this rule
+       existed (they would otherwise be read-only for the user). */
+    for (int i = 0; i < FS_MAX_NODES; ++i)
+    {
+        if (!nodes[i].used || i == home_user || i == storage_home) continue;
+        if (nodes[i].uid != 0U) continue; /* only root-created leftovers; keep explicit owners */
+        if ((home_user >= 0 && fs_is_descendant_of(i, home_user)) ||
+            (storage_home >= 0 && fs_is_descendant_of(i, storage_home)))
+            (void)fs_set_owner(i, 1000U, 1000U);
+    }
 }
 
 int fs_get_root() { return root_id; }

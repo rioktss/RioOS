@@ -162,13 +162,6 @@ int elf_load(const char* path, uint64_t* entry_out)
         if (!range_valid(ph->vaddr, ph->memsz, MMU_USER_BASE, MMU_USER_LIMIT))
             return -8;
 
-        uint32_t mode = 0;
-        if (ph->flags & PF_R) mode |= 1U;
-        if (ph->flags & PF_W) mode |= 2U;
-        if (ph->flags & PF_X) mode |= 4U;
-        if ((mode & 1U) == 0 && (mode & 2U) == 0 && (mode & 4U) == 0)
-            mode = 1U;
-
         uint64_t end = ph->vaddr + ph->memsz;
         uint64_t page_end = (end + MMU_PAGE_SIZE - 1ULL) & ~(MMU_PAGE_SIZE - 1ULL);
 

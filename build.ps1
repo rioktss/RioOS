@@ -58,7 +58,7 @@ if ($Clean) {
     foreach ($artifact in @("kernel.elf","user_init.elf","nano.elf","calc.elf")) {
         Remove-Item (Join-Path "build" $artifact) -Force -ErrorAction SilentlyContinue
     }
-    foreach ($name in @("fs_host_test","net_host_test","mem_host_test","syscall_host_test","diag_host_test","vfs_host_test","sched_host_test","env_host_test","fd_host_test","process_host_test","scheduler_process_host_test","smp_host_test","fb_host_test","ui_host_test")) {
+    foreach ($name in @("fs_host_test","net_host_test","mem_host_test","syscall_host_test","diag_host_test","vfs_host_test","sched_host_test","env_host_test","fd_host_test","process_host_test","scheduler_process_host_test","smp_host_test","fb_host_test","ui_host_test","ui_image_host_test")) {
         Remove-Item (Join-Path $HostTools $name), (Join-Path $HostTools "$name.exe") -Force -ErrorAction SilentlyContinue
     }
 }
@@ -69,7 +69,8 @@ function Source-Of([string]$name) {
         ui_home_screen = "ui/home_screen.cpp"; ui_apps = "ui/apps.cpp";
         ui_terminal = "ui/terminal.cpp"; ui_calculator = "ui/calculator.cpp";
         ui_clock = "ui/clock.cpp"; ui_file_manager = "ui/file_manager.cpp";
-        ui_launcher = "ui/launcher.cpp"; ui_core = "ui/ui.cpp"
+        ui_launcher = "ui/launcher.cpp"; ui_wallpaper = "ui/wallpaper.cpp";
+        ui_settings = "ui/settings.cpp"; ui_image = "ui/image.cpp"; ui_core = "ui/ui.cpp"
     }
     if ($uiFiles.ContainsKey($name)) { return $uiFiles[$name] }
     foreach ($dir in @("kernel","drivers","memory","process","fs","net","ui")) {
@@ -90,8 +91,8 @@ $AsmFlags = @("-Iinclude", "--target=aarch64-none-elf", "-mcpu=cortex-a72", "-ff
 $Modules = @(
     "uart","memory","string","fs","vfs","process","sched_policy","scheduler","timer","interrupt","keyboard",
     "commands","version","shell","history","env","rtc","exceptions","syscall","user","mmu","virtio_mmio","virtio_input","virtio_blk",
-    "storage","thread","fd","fb","font","elf","virtio_net","netstack","page_alloc","fault","diag","security","smp",
-    "ui_boot","ui_lock_screen","ui_home_screen","ui_apps","ui_terminal","ui_calculator","ui_clock","ui_file_manager","ui_launcher","ui_core","kernel"
+    "storage","thread","fd","fb","font","ui_font_data","elf","virtio_net","netstack","page_alloc","fault","diag","security","smp",
+    "ui_boot","ui_lock_screen","ui_home_screen","ui_apps","ui_terminal","ui_calculator","ui_clock","ui_file_manager","ui_launcher","ui_wallpaper","ui_settings","ui_image","ui_core","kernel"
 )
 
 Write-Host "[1/9] Bundling userspace (init + nano + calc)"
@@ -117,7 +118,18 @@ if (-not (Test-Path $DiskPath)) {
     $fs.SetLength(32768L * 512L)
     $fs.Dispose()
 }
-Invoke-Tool (Join-Path $HostTools "mkfs_myfs.exe") @("storage/disk.img","build/user_init.elf","build/nano.elf","build/calc.elf","apps/terminal.rpk","apps/calculator.rpk","apps/clock.rpk","apps/files.rpk","apps/launcher.rpk")
+$AppPackages = @("apps/terminal.rpk","apps/calculator.rpk","apps/clock.rpk","apps/files.rpk","apps/launcher.rpk","apps/wallpaper.rpk","apps/pengaturan.rpk")
+foreach ($package in $AppPackages) {
+    if (-not (Test-Path $package)) { throw "Required UI package missing: $package" }
+}
+$AppElfs = @("build/user_init.elf")
+if (Test-Path build/nano.elf) { $AppElfs += "build/nano.elf" }
+if (Test-Path build/calc.elf) { $AppElfs += "build/calc.elf" }
+$LocalAssets = @()
+foreach ($dir in @("assets/wallpapers","assets/icons")) {
+    if (Test-Path $dir) { $LocalAssets += (Get-ChildItem $dir -Filter *.bmp -File | Sort-Object Name | ForEach-Object { "$dir/$($_.Name)" }) }
+}
+Invoke-Tool (Join-Path $HostTools "mkfs_myfs.exe") (@("storage/disk.img") + $AppElfs + $AppPackages + $LocalAssets)
 
 Write-Host "[4/9] Compiling boot and context-switch assembly"
 Invoke-Tool $Clang ($AsmFlags + @("-c","boot/boot.S","-o","build/boot.o"))
@@ -141,9 +153,9 @@ $linkObjects = @(
     "build/commands.o","build/version.o","build/shell.o","build/history.o","build/env.o","build/rtc.o","build/exceptions.o",
     "build/syscall.o","build/user.o","build/mmu.o","build/virtio_mmio.o","build/virtio_input.o","build/virtio_blk.o","build/storage.o","build/elf.o",
     "build/virtio_net.o","build/netstack.o","build/page_alloc.o","build/fault.o","build/diag.o","build/security.o",
-    "build/fb.o","build/font.o","build/thread.o","build/fd.o","build/smp.o",
+    "build/fb.o","build/font.o","build/ui_font_data.o","build/thread.o","build/fd.o","build/smp.o",
     "build/ui_boot.o","build/ui_lock_screen.o","build/ui_home_screen.o","build/ui_apps.o",
-    "build/ui_terminal.o","build/ui_calculator.o","build/ui_clock.o","build/ui_file_manager.o","build/ui_launcher.o","build/ui_core.o"
+    "build/ui_terminal.o","build/ui_calculator.o","build/ui_clock.o","build/ui_file_manager.o","build/ui_launcher.o","build/ui_wallpaper.o","build/ui_settings.o","build/ui_image.o","build/ui_core.o"
 )
 Invoke-Tool $Ld (@("-T","linker.ld","-nostdlib","-z","max-page-size=0x1000") + $linkObjects + @("-o","build/kernel.elf"))
 
@@ -160,7 +172,7 @@ function Invoke-HostTest([string]$name, [string[]]$sources, [bool]$strict = $fal
     & $exe
     if ($LASTEXITCODE -ne 0) { throw "$name failed" }
 }
-Write-Host "[8/9] Running 14 host tests plus pixel UI regressions"
+Write-Host "[8/9] Running 15 host tests plus pixel UI regressions"
 Invoke-HostTest "fs_host_test" @("tests/fs_host_test.cpp","fs/fs.cpp","kernel/string.cpp","kernel/rtc.cpp")
 Invoke-HostTest "net_host_test" @("tests/net_host_test.cpp","net/netstack.cpp") $true
 Invoke-HostTest "mem_host_test" @("tests/mem_host_test.cpp","memory/page_alloc.cpp","kernel/fault.cpp")
@@ -173,8 +185,9 @@ Invoke-HostTest "fd_host_test" @("tests/fd_host_test.cpp","kernel/fd.cpp","fs/fs
 Invoke-HostTest "process_host_test" @("tests/process_host_test.cpp","process/process.cpp","kernel/string.cpp") $true
 Invoke-HostTest "scheduler_process_host_test" @("tests/scheduler_process_host_test.cpp","process/scheduler.cpp","process/process.cpp","kernel/string.cpp") $true
 Invoke-HostTest "smp_host_test" @("tests/smp_host_test.cpp","kernel/smp.cpp") $true
-Invoke-HostTest "fb_host_test" @("tests/fb_host_test.cpp","drivers/fb.cpp","drivers/font.cpp") $true
-Invoke-HostTest "ui_host_test" @("tests/ui_host_test.cpp","drivers/fb.cpp","drivers/font.cpp","ui/boot.cpp","ui/lock_screen.cpp","ui/home_screen.cpp") $true
+Invoke-HostTest "fb_host_test" @("tests/fb_host_test.cpp","drivers/fb.cpp","drivers/font.cpp","drivers/ui_font_data.cpp") $true
+Invoke-HostTest "ui_host_test" @("tests/ui_host_test.cpp","drivers/fb.cpp","drivers/font.cpp","drivers/ui_font_data.cpp","ui/boot.cpp","ui/lock_screen.cpp","ui/home_screen.cpp") $true
+Invoke-HostTest "ui_image_host_test" @("tests/ui_image_host_test.cpp","drivers/fb.cpp","drivers/font.cpp","drivers/ui_font_data.cpp","ui/image.cpp","ui/settings.cpp","kernel/string.cpp") $true
 
 Write-Host "[9/9] Release verification"
 if ($Python -eq "py") { & py -3 tests/verify_release.py } else { & $Python tests/verify_release.py }
@@ -186,9 +199,9 @@ Write-Host "       BUILD SUCCESS (v1.11.0)"
 Write-Host "=================================="
 Write-Host "  Kernel: build/kernel.elf (AArch64)"
 Write-Host "  Disk  : storage/disk.img"
-Write-Host "  Tests : 14 host tests passed"
+Write-Host "  Tests : 15 host tests passed"
 Write-Host "  Pixel UI : QEMU ramfb backend (run-ui.ps1)"
-Write-Host "  RPK apps : terminal, calculator, clock, files, launcher"
+Write-Host "  RPK apps : terminal, calculator, clock, files, launcher, wallpaper, pengaturan"
 Write-Host "  Timer IRQ: remains disabled during normal boot"
 Write-Host ""
 if ($RunAfterBuild) { & (Join-Path $PSScriptRoot "run.ps1") }

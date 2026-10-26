@@ -412,7 +412,6 @@ void ui_terminal_render(uint64_t epoch)
         fb_draw_ui_text(term_lines[slot], 28, y, 0xA9F4D0U, 1);
         y += 23;
     }
-    if (y > h - 70) y = h - 70;
     fb_draw_rect(24, h - 79, w - 48, 1, 0x28434BU);
     fb_draw_ui_text("rio@rioos:", 28, h - 61, 0x7DE1B1U, 1);
     fb_draw_ui_text(term_cwd, 108, h - 61, 0xB8D6FFU, 1);

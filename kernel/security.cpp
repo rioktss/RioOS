@@ -7,7 +7,7 @@
 
 static SecurityRole current_role = SECURITY_USER;
 static const char USER_PASSWORD[] = "123";
-static const char ROOT_PASSWORD[] = "rioos-root";
+static const char ROOT_PASSWORD[] = "123";
 
 static int security_get_char()
 {

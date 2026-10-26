@@ -109,9 +109,9 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
         return;
     }
 
-    uint32_t saved_fs_uid = fs_current_uid();
-    uint32_t saved_fs_gid = fs_current_gid();
-    if (from_user) fs_set_credentials(1000U, 1000U);
+    /* EL0 programs (nano, calc, ...) act with the credentials of the shell
+       that launched them: UID 1000 after 'user', UID 0 after 'su root'.
+       Forcing UID 1000 here made root's nano fail with "permission denied". */
 
     uint64_t number = frame->x[8];
     uint64_t result = (uint64_t)-38;
@@ -656,5 +656,4 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
        kernel eret one instruction past the caller's true return address,
        corrupting control flow on every syscall. */
     frame->x[0] = result;
-    if (from_user) fs_set_credentials(saved_fs_uid, saved_fs_gid);
 }

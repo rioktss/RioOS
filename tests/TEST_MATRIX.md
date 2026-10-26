@@ -50,7 +50,7 @@ the release build container when `qemu-system-aarch64` is unavailable.
 
 ## P2 known limitations
 
-- The root password `rioos-root` is compiled into the source for this development release. It only protects casual shell switching and is not secure against someone with the binary/source.
+- The root password `123` is compiled into the source for this development release. It only protects casual shell switching and is not secure against someone with the binary/source.
 - Credentials are global to the current shell/syscall path, not stored in independent process credential structures; concurrent processes are not supported.
 - The on-disk inode layout remains v1 and uses reserved bytes for UID/GID/tag. The migration path is regression-tested with host tests but still requires a real QEMU persistent-disk boot test.
 - Full durability under sudden power loss, journaled transactions, symlinks/inodes beyond the current table, and open-file unlink semantics remain unimplemented.

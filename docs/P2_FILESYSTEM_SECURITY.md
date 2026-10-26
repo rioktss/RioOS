@@ -20,7 +20,7 @@ chmod 600 /storage/home/demo.txt
 truncate /storage/home/demo.txt 8
 cat /storage/home/demo.txt
 su root
-# enter the development password: rioos-root
+# enter the development password: 123
 chown 0 0 /storage/home/demo.txt
 logout
 ```

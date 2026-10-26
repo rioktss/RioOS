@@ -206,7 +206,14 @@ int main()
     CHECK(stat_result.inode == 1 && stat_result.type == FS_FILE && stat_result.size == 3);
     CHECK(stat_result.mode == 0644U && stat_result.uid == 1000U && stat_result.gid == 1000U);
     CHECK(call(SYS_FS_STAT, 0x1000, 0x1000, 1) == ERR(14));
-    CHECK(fake_uid == 0 && fake_gid == 0); /* EL0's temporary credentials do not leak to EL1 */
+    CHECK(fake_uid == 0 && fake_gid == 0); /* EL0 syscalls keep the launching shell's credentials (root stays root) */
+    fs_set_credentials(0U, 0U);
+    (void)call(SYS_PING, 0, 0, 1);
+    CHECK(fake_uid == 0 && fake_gid == 0);   /* root shell: EL0 stays root */
+    fs_set_credentials(1000U, 1000U);
+    (void)call(SYS_PING, 0, 0, 1);
+    CHECK(fake_uid == 1000U && fake_gid == 1000U); /* user shell: EL0 stays user */
+    fs_set_credentials(0U, 0U);
     CHECK(call(SYS_FS_TRUNCATE, (uint64_t)kpath, 8, 0) == 0 && fake_size == 8);
     CHECK(fake_file[3] == 0 && fake_file[7] == 0);
     CHECK(call(SYS_FS_TRUNCATE, (uint64_t)kpath, 1048577ULL, 0) == ERR(27));

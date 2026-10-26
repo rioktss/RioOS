@@ -328,7 +328,7 @@ Version 1.7.0 adds process-PID-scoped descriptor tables, shared open-file descri
 
 ## P2 filesystem and permissions (v1.8.0)
 
-The filesystem persists owner UID/GID in unused inode metadata bytes and migrates older images without changing their inode size. Standard user identity is UID/GID `1000`; root is UID/GID `0`. The development root password is `rioos-root` (embedded demo credential; not production security).
+The filesystem persists owner UID/GID in unused inode metadata bytes and migrates older images without changing their inode size. Standard user identity is UID/GID `1000`; root is UID/GID `0`. The development root password is `123` (embedded demo credential; not production security).
 
 New commands: `stat <path>`, `chown <uid> <gid> <path>` (root only), and `truncate <path> <size>` (up to 262144 bytes; extension is zero-filled). `chmod` now requires file ownership or root. File reads/writes, parent-directory mutations, path traversal, and ELF execution check mode bits. `diskread`, `diskwrite`, and `diskflush` require root.
 
