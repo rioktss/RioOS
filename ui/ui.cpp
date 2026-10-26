@@ -164,14 +164,24 @@ void ui_start()
     ui_draw_boot_screen();
     timer_delay_ms(900U); /* Polling counter only; keep timer IRQ disabled. */
 
-    int state = UI_STATE_LOCKED;
-    int selected = 0;
-    int active_app = -1;
+    const int start_in_terminal = fb_boot_terminal_requested();
+    int state = start_in_terminal ? UI_STATE_APP : UI_STATE_LOCKED;
+    int selected = UI_APP_TERMINAL;
+    int active_app = start_in_terminal ? UI_APP_TERMINAL : -1;
     uint64_t last_render_minute = rtc_get_epoch() / 60ULL;
     int pointer_down = 0;
     int pointer_start_x = 0;
     int pointer_start_y = 0;
-    ui_draw_lock_screen(rtc_get_epoch());
+    if (start_in_terminal)
+    {
+        ui_apps_init(UI_APP_TERMINAL);
+        ui_apps_render(UI_APP_TERMINAL, rtc_get_epoch());
+        uart_puts("UI: starting directly in the pixel Terminal (QEMU fw_cfg request).\r\n");
+    }
+    else
+    {
+        ui_draw_lock_screen(rtc_get_epoch());
+    }
 
     for (;;)
     {

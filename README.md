@@ -58,7 +58,7 @@ Some subsystems are already implemented and tested, while others are still being
 
 ## Current capabilities
 
-**Current source baseline: 1.11.0 (QEMU pixel UI foundation).** This increment retains the previous kernel features and adds a QEMU `ramfb` pixel backend, a RioOS boot splash, Android-inspired lock/home screens, built-in pixel-rendered Terminal, Calculator, Clock, Files, Launcher, Wallpaper and Settings apps, seven `.rpk` manifests installed under `/apps`, local BMP wallpaper/icon assets, and an MIUI-inspired Control Centre. The GUI is launched through `run-ui.sh` (or `run-ui.ps1`); the existing `run.sh` / `run.ps1` serial-only path is preserved. The graphical runner attaches VirtIO keyboard and tablet devices for QEMU-window keyboard/pointer control, while UART remains a fallback. The pixel Terminal calls the same `execute_command()` dispatcher as the serial shell; it is a RioOS shell interface, not GNU Bash. SMP stays disabled and timer IRQ remains off during normal boot. Process scheduling is still logical metadata, while CPU context switching is currently for cooperative kernel threads. See [Android-like UI customization](./docs/ANDROID_UI.md), [Pixel UI documentation](./docs/PIXEL_UI.md), the [P4 notes](./docs/P4_SMP_DRIVER_HARDENING.md), and earlier P0-P3 documents for scope and limitations.
+**Current source baseline: 1.11.0 (QEMU pixel UI foundation).** This increment retains the previous kernel features and adds a QEMU `ramfb` pixel backend, a RioOS boot splash, Android-inspired lock/home screens, built-in pixel-rendered Terminal, Calculator, Clock, Files, Launcher, Wallpaper and Settings apps, seven `.rpk` manifests installed under `/apps`, local BMP wallpaper/icon assets, and an MIUI-inspired Control Centre. The full graphical UI is launched through `run-ui.sh` (or `run-ui.ps1`). For a separate plain black text-console window, `run-terminal.sh` (or `run-terminal.ps1` on Windows) shows the original UART command shell directly in QEMU; it does not attach `ramfb`, start the pixel UI, or open the Terminal `.rpk` app. The existing `run.sh` / `run.ps1` serial-only path is preserved. The graphical UI runner attaches VirtIO keyboard and tablet devices for QEMU-window control. The pixel Terminal app calls the same `execute_command()` dispatcher as the serial shell; it is a RioOS shell interface, not GNU Bash. SMP stays disabled and timer IRQ remains off during normal boot. Process scheduling is still logical metadata, while CPU context switching is currently for cooperative kernel threads. See [Android-like UI customization](./docs/ANDROID_UI.md), [Pixel UI documentation](./docs/PIXEL_UI.md), the [P4 notes](./docs/P4_SMP_DRIVER_HARDENING.md), and earlier P0-P3 documents for scope and limitations.
 
 | Area | Current focus |
 |---|---|
@@ -79,7 +79,7 @@ Some subsystems are already implemented and tested, while others are still being
 | Filesystem | Custom filesystem/VFS + persistent disk image |
 | Storage | VirtIO block device |
 | Networking | VirtIO-Net, ARP/IPv4/ICMP, UDP datagrams, bounded owner-scoped UDP sockets, DNS A lookup |
-| Graphics/input | Pixel renderer via QEMU `ramfb`; polled VirtIO keyboard/tablet input in `run-ui.sh`; UART fallback |
+| Graphics/input | Pixel renderer via QEMU `ramfb`; polled VirtIO keyboard/tablet input in `run-ui.sh`; serial virtual-console input in the plain-text `run-terminal.sh`; UART fallback in `run-ui.sh` |
 | Shell | Environment expansion, `export`/`unset`, and in-memory `cat`/`echo` pipes to `grep`/`wc` |
 | Validation | 15 host-side test executables + release verification + GitHub Actions CI |
 
@@ -92,10 +92,15 @@ Build, then launch the graphical QEMU runner:
 ```bash
 bash build.sh --clean
 ./run-ui.sh
-# For an SDL-enabled QEMU build: RIOOS_DISPLAY=sdl ./run-ui.sh
+# Open the plain black text shell directly in a QEMU window (not the pixel UI app):
+./run-terminal.sh
+# For an SDL-enabled QEMU build:
+RIOOS_DISPLAY=sdl ./run-terminal.sh
+# Launch the full graphical desktop separately:
+./run-ui.sh
 ```
 
-On Windows PowerShell, use `.\build.ps1 --clean` and `.\run-ui.ps1`. Focus the QEMU window to use its VirtIO keyboard/tablet input: swipe or drag upward to unlock, click an app icon, and type in the pixel Terminal. Serial input remains available as a fallback; home navigation also supports **A/D**, **W/S**, arrow keys, **Enter**, **1–7**, **C** for Control Centre, and **X** to return to the serial shell. Inside apps, **Esc** requests back. Shell commands including `exit` and `logout` keep the serial shell's normal meaning inside the Terminal.
+On Windows PowerShell, use `.\build.ps1 --clean` and `.\run-ui.ps1` for the graphical desktop, or `.\run-terminal.ps1` for the plain black text shell. The text-shell runner sends keyboard input and UART output through QEMU's virtual console; it does not launch the `.rpk` Terminal app. In the full UI, focus the QEMU window to use VirtIO keyboard/tablet input: swipe or drag upward to unlock, click an app icon, and type in the pixel Terminal. Home navigation also supports **A/D**, **W/S**, arrow keys, **Enter**, **1–7**, **C** for Control Centre, and **X** to return to the serial shell. Inside apps, **Esc** requests back.
 
 The local BMP format currently supports uncompressed 24-bit or 32-bit BMP images up to 1 MiB; add wallpaper files to `assets/wallpapers/` and app icons to `assets/icons/`, then rebuild to install them under `/wallpapers` and `/icons`. The `.rpk` files are versioned built-in-app manifests under `/apps`, not general-purpose executable packages. The app implementations are statically linked into the kernel until RioOS has a safe, stable app ABI. QEMU runtime display and interaction must still be verified on the target host; this source change has been build/host-test checked but cannot honestly be described as proven bug-free without a QEMU visual run.
 
@@ -160,7 +165,9 @@ RioOS/
 ├── userspace/       # Bundled AArch64 user programs
 ├── build.sh         # Unix-like build entry point
 ├── build.ps1        # Windows PowerShell build entry point
-├── run.sh           # QEMU runner for Unix-like systems
+├── run.sh           # QEMU runner for Unix-like systems (serial shell)
+├── run-terminal.sh  # QEMU window for the plain black UART text shell
+├── run-terminal.ps1 # Windows QEMU window for the plain black UART text shell
 ├── run.ps1          # QEMU runner for Windows
 ├── linker.ld        # Kernel linker script
 └── README.md        # Project overview
@@ -241,7 +248,7 @@ Type 'help' to get started.
 
 The exact boot log can change as development continues. A normal unprivileged shell now starts in `/home/user`, a writable home directory, so `nano note.txt` works without making the system root writable.
 
-For the graphical UI, focus the QEMU window. Use the window keyboard to navigate/type, swipe upward or drag upward on the lock screen to unlock, and click a home-screen app icon. `run-ui.sh`/`run-ui.ps1` attach VirtIO keyboard and tablet devices; the serial terminal remains a fallback. This input path is implemented in source but needs runtime validation with the QEMU version and Termux:X11/desktop environment you use.
+For the graphical UI, focus the QEMU window. Use the window keyboard to navigate/type, swipe upward or drag upward on the lock screen to unlock, and click a home-screen app icon. `run-ui.sh`/`run-ui.ps1` attach VirtIO keyboard and tablet devices; the serial terminal remains a fallback. On Linux/Termux:X11/WSLg, `./run-terminal.sh` opens the original UART shell in a plain QEMU text-console window with a black background. This runner intentionally omits `ramfb` and the `start-terminal` firmware flag, so the Android-like UI and Terminal `.rpk` app do not start. Runtime appearance still depends on the QEMU display backend available on the target host.
 
 ### Cooperative threads and timer safety
 

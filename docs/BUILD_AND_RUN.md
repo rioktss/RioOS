@@ -178,6 +178,8 @@ The source of truth is the runner script itself:
 - [`run.sh`](../run.sh)
 - [`run.ps1`](../run.ps1)
 
+To open the original RioOS shell in a plain black QEMU text-console window on Linux or Termux:X11, run `./run-terminal.sh`. Choose SDL with `RIOOS_DISPLAY=sdl ./run-terminal.sh` when GTK is unavailable. This requires a desktop/X11/Wayland session and QEMU with GTK or SDL display support; it does not require `ramfb` or VirtIO GUI input devices. UART input/output is handled by QEMU's virtual console, not the host terminal. On Windows PowerShell, use `./run-terminal.ps1`. `run.sh` remains the host serial-console option and `run-ui.sh` remains the normal lock/home UI option.
+
 ## 9. Build outputs
 
 After a successful build, the important generated files are:

@@ -30,6 +30,8 @@ static int cur_x = 0;
 static int cur_y = 0;
 static int fb_ready = 0;
 static int fb_display_ready = 0;
+/* Optional QEMU fw_cfg flag used by run-terminal.sh. Disabled by default. */
+static int fb_terminal_boot_requested_value = 0;
 
 #ifndef HOST_TEST
 struct FwCfgDma
@@ -181,22 +183,42 @@ static int fwcfg_init_ramfb()
     }
 
     uint16_t ramfb_selector = 0;
+    uint16_t terminal_mode_selector = 0;
     for (uint32_t i = 0; i < count; ++i)
     {
         uint8_t entry[64];
         fwcfg_read_next(entry, sizeof(entry));
-        const char expected[] = "etc/ramfb";
-        int match = 1;
-        for (uint32_t c = 0; c < sizeof(expected); ++c)
+
+        const char ramfb_name[] = "etc/ramfb";
+        int ramfb_match = 1;
+        for (uint32_t c = 0; c < sizeof(ramfb_name); ++c)
         {
-            if (entry[8U + c] != (uint8_t)expected[c]) { match = 0; break; }
+            if (entry[8U + c] != (uint8_t)ramfb_name[c]) { ramfb_match = 0; break; }
         }
-        if (match)
+        if (ramfb_match) ramfb_selector = read_be16(entry + 4);
+
+        /* QEMU runner may request starting straight in the pixel Terminal.
+           Missing this optional file deliberately keeps the normal lock screen. */
+        const char terminal_mode_name[] = "opt/rioos/start-terminal";
+        int terminal_match = 1;
+        for (uint32_t c = 0; c < sizeof(terminal_mode_name); ++c)
         {
-            ramfb_selector = read_be16(entry + 4);
-            break;
+            if (entry[8U + c] != (uint8_t)terminal_mode_name[c])
+            { terminal_match = 0; break; }
         }
+        if (terminal_match) terminal_mode_selector = read_be16(entry + 4);
     }
+
+    if (terminal_mode_selector != 0)
+    {
+        uint8_t terminal_mode = 0;
+        fwcfg_select(terminal_mode_selector);
+        fwcfg_read_next(&terminal_mode, 1U);
+        fb_terminal_boot_requested_value =
+            (terminal_mode == (uint8_t)'1' || terminal_mode == (uint8_t)'y' ||
+             terminal_mode == (uint8_t)'Y');
+    }
+
     if (ramfb_selector == 0)
     {
         ramfb_fail_reason = "etc/ramfb not found (start QEMU with -device ramfb)";
@@ -615,6 +637,7 @@ int fb_get_width() { return fb_w; }
 int fb_get_height() { return fb_h; }
 int fb_is_ready() { return fb_ready && fb_base != 0; }
 int fb_has_display() { return fb_display_ready; }
+int fb_boot_terminal_requested() { return fb_terminal_boot_requested_value; }
 
 #ifdef HOST_TEST
 int fb_test_attach(uint32_t* pixels, int width, int height)

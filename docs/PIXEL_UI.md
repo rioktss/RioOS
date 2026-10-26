@@ -18,7 +18,7 @@ Windows PowerShell:
 .\run-ui.ps1
 ```
 
-The Linux runner defaults to GTK; override it with `RIOOS_DISPLAY=sdl ./run-ui.sh` when SDL is supported, or set `RIOOS_DISPLAY` to another QEMU display backend available on your host. The graphical runner requests a 1024x768 XRGB8888 ram framebuffer. The firmware config interface is probed at boot; if no compatible ramfb device is found, RioOS reports that fact over UART and continues into the existing serial shell rather than hanging while waiting for a display.
+The graphical UI runner defaults to GTK; override it with `RIOOS_DISPLAY=sdl ./run-ui.sh` when SDL is supported. `./run-ui.sh` opens the RioOS lock/home UI and its built-in apps. For a separate plain black text shell, run `./run-terminal.sh` (or `RIOOS_DISPLAY=sdl ./run-terminal.sh` when SDL is preferred); on Windows PowerShell use `./run-terminal.ps1`. This text-only runner sends the original UART shell to QEMU's virtual console and deliberately does not attach `ramfb` or request the pixel Terminal app. The graphical UI runner requests a 1024x768 XRGB8888 ram framebuffer. The firmware config interface is probed at boot; if no compatible ramfb device is found, RioOS reports that fact over UART and continues into the existing serial shell rather than hanging while waiting for a display.
 
 ## Screens
 
@@ -79,3 +79,8 @@ The guest filesystem has `/wallpapers`, `/icons`, and `/settings` directories. W
 The Terminal `.rpk` uses the same `execute_command()` dispatcher as the serial shell, with command output captured into the pixel terminal. This keeps command availability, filesystem changes, environment expansion, pipes, and redirection on the shared RioOS implementation rather than maintaining a second partial command list. `Esc` returns from the Terminal app to the home screen. Commands such as `exit` and `logout` are dispatched normally through the shared shell implementation, preserving their serial-shell semantics.
 
 QEMU builds need the `virtio-keyboard-device` and `virtio-tablet-device` device models enabled. On Windows, `run-ui.ps1` attaches the same devices.
+
+
+## Plain black text-console runner
+
+`run-terminal.sh` opens QEMU’s virtual serial console as a black, monospace text window. It attaches the original RioOS UART shell to `-serial vc:100Cx32C`, but intentionally omits `ramfb`, VirtIO GUI input devices, and the `opt/rioos/start-terminal=1` flag. As a result, the pixel UI and its Terminal `.rpk` app do not launch; shell output and keyboard input are handled by the original serial shell inside the QEMU window. Use `run-ui.sh` when you want the lock/home UI and built-in apps, including the pixel Terminal. Use `run.sh` when you specifically want UART shell I/O in the host terminal. On Windows PowerShell, `run-terminal.ps1` provides the same text-console mode.
