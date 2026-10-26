@@ -248,7 +248,7 @@ Type 'help' to get started.
 
 The exact boot log can change as development continues. A normal unprivileged shell now starts in `/home/user`, a writable home directory, so `nano note.txt` works without making the system root writable.
 
-For the graphical UI, focus the QEMU window. Use the window keyboard to navigate/type, swipe upward or drag upward on the lock screen to unlock, and click a home-screen app icon. `run-ui.sh`/`run-ui.ps1` attach VirtIO keyboard and tablet devices; the serial terminal remains a fallback. On Linux/Termux:X11/WSLg, `./run-terminal.sh` opens the original UART shell in a plain QEMU text-console window with a black background. This runner intentionally omits `ramfb` and the `start-terminal` firmware flag, so the Android-like UI and Terminal `.rpk` app do not start. Runtime appearance still depends on the QEMU display backend available on the target host.
+For the graphical UI, focus the QEMU window. Use the window keyboard to navigate/type, swipe upward or drag upward on the lock screen to unlock, and click a home-screen app icon. `run-ui.sh`/`run-ui.ps1` attach VirtIO keyboard and tablet devices and add a mouse device when supported, allowing wheel scroll in X11 while preserving tablet-only compatibility; the serial terminal remains a fallback. On Linux/Termux:X11/WSLg, `./run-terminal.sh` opens the original UART shell in a plain QEMU text-console window with a black background. This runner intentionally omits `ramfb` and the `start-terminal` firmware flag, so the Android-like UI and Terminal `.rpk` app do not start. Runtime appearance still depends on the QEMU display backend available on the target host.
 
 ### Cooperative threads and timer safety
 

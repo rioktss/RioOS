@@ -58,6 +58,18 @@ int ui_launcher_key(char key)
     return 0;
 }
 
+int ui_launcher_scroll(int delta)
+{
+    if (delta == 0) return 0;
+    int next = launcher_selected;
+    next -= delta;
+    if (next < 0) next = 0;
+    if (next >= UI_APP_COUNT) next = UI_APP_COUNT - 1;
+    if (next == launcher_selected) return 0;
+    launcher_selected = next;
+    return 1;
+}
+
 int ui_launcher_get_target()
 {
     (void)launcher_open_requested;

@@ -133,6 +133,34 @@ int ui_wallpaper_key(char key)
     return 0;
 }
 
+int ui_wallpaper_scroll(int delta)
+{
+    int count = ui_wallpaper_count();
+    if (delta == 0 || count <= 0) return 0;
+    int next = wallpaper_selected;
+    int steps = delta > 0 ? delta : -delta;
+    if (steps > 12) steps = 12;
+    for (int step = 0; step < steps; ++step)
+    {
+        if (delta > 0)
+        {
+            if (next >= 3) next -= 3;
+            else if (next > 0) next = 0;
+        }
+        else
+        {
+            if (next + 3 < count) next += 3;
+            else if (next + 1 < count) ++next;
+        }
+    }
+    if (next < 0) next = 0;
+    if (next >= count) next = count - 1;
+    if (next == wallpaper_selected) return 0;
+    wallpaper_selected = next;
+    wallpaper_notice = 0;
+    return 1;
+}
+
 int ui_wallpaper_pointer(int x, int y)
 {
     int count = ui_wallpaper_count();

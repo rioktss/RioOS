@@ -6,7 +6,8 @@
 #include "history.h"
 #include "string.h"
 
-#define TERM_LINES 23
+#define TERM_LINES 160
+#define TERM_VISIBLE_ROWS 23
 #define TERM_COLS  116
 #define TERM_INPUT_CAP 256
 #define TERM_TTY_ROWS 44
@@ -15,6 +16,7 @@
 static char term_lines[TERM_LINES][TERM_COLS];
 static int term_start = 0;
 static int term_count = 0;
+static int term_view_offset = 0; /* 0 follows the newest output. */
 static char term_input[TERM_INPUT_CAP];
 static int term_input_len = 0;
 static int term_history_cursor = 0;
@@ -36,6 +38,7 @@ static void term_clear()
     for (int i = 0; i < TERM_LINES; ++i) term_lines[i][0] = '\0';
     term_start = 0;
     term_count = 0;
+    term_view_offset = 0;
     term_output_len = 0;
     term_output_line[0] = '\0';
 }
@@ -43,6 +46,7 @@ static void term_clear()
 static void term_add_piece(const char* text, int length)
 {
     if (text == 0) return;
+    term_view_offset = 0;
     if (term_count < TERM_LINES)
     {
         int slot = (term_start + term_count) % TERM_LINES;
@@ -403,10 +407,16 @@ void ui_terminal_render(uint64_t epoch)
     fb_draw_circle(38, 18, 5, 0xF5C451U);
     fb_draw_circle(56, 18, 5, 0x5BD79AU);
     fb_draw_ui_text("RioOS Terminal", 78, 12, 0xE9F4F7U, 1);
-    fb_draw_ui_text("RPK / BUILT-IN", w - 178, 12, 0x80A7B0U, 1);
+    fb_draw_ui_text("WHEEL / DRAG TO SCROLL", w - 218, 12, 0x80A7B0U, 1);
 
+    int max_offset = term_count > TERM_VISIBLE_ROWS ? term_count - TERM_VISIBLE_ROWS : 0;
+    if (term_view_offset > max_offset) term_view_offset = max_offset;
+    if (term_view_offset < 0) term_view_offset = 0;
+    int end = term_count - term_view_offset;
+    int begin = end - TERM_VISIBLE_ROWS;
+    if (begin < 0) begin = 0;
     int y = 61;
-    for (int i = 0; i < term_count; ++i)
+    for (int i = begin; i < end; ++i)
     {
         int slot = (term_start + i) % TERM_LINES;
         fb_draw_ui_text(term_lines[slot], 28, y, 0xA9F4D0U, 1);
@@ -423,6 +433,19 @@ void ui_terminal_render(uint64_t epoch)
     fb_draw_ui_text("READY", 42, h - 31, 0x81BFB0U, 1);
     fb_draw_ui_text("ESC: HOME", w - 108, h - 31, 0x81BFB0U, 1);
     fb_present();
+}
+
+int ui_terminal_scroll(int delta)
+{
+    int max_offset = term_count > TERM_VISIBLE_ROWS ? term_count - TERM_VISIBLE_ROWS : 0;
+    int next = term_view_offset;
+    if (delta > 0) next += delta;
+    else if (delta < 0) next += delta;
+    if (next < 0) next = 0;
+    if (next > max_offset) next = max_offset;
+    if (next == term_view_offset) return 0;
+    term_view_offset = next;
+    return 1;
 }
 
 int ui_terminal_key(char key)

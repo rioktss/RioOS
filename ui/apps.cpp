@@ -182,3 +182,16 @@ int ui_apps_get_target(int app_id)
     if (app_id == UI_APP_SETTINGS) return ui_settings_get_target();
     return UI_APP_TERMINAL;
 }
+
+int ui_apps_scroll(int app_id, int delta)
+{
+    if (delta == 0) return 0;
+    switch (app_id)
+    {
+        case UI_APP_TERMINAL: return ui_terminal_scroll(delta);
+        case UI_APP_FILES: return ui_file_manager_scroll(delta);
+        case UI_APP_LAUNCHER: return ui_launcher_scroll(delta);
+        case UI_APP_WALLPAPER: return ui_wallpaper_scroll(delta);
+        default: return 0;
+    }
+}

@@ -194,6 +194,12 @@ void ui_start()
             {
                 input = (int)(unsigned char)gui_event.key;
             }
+            else if (gui_event.kind == RIO_INPUT_SCROLL)
+            {
+                if (state == UI_STATE_APP && active_app >= 0 &&
+                    ui_apps_scroll(active_app, gui_event.scroll))
+                    redraw = 1;
+            }
             else if (gui_event.kind == RIO_INPUT_POINTER)
             {
                 int max_x = fb_get_width() - 1;
@@ -257,6 +263,15 @@ void ui_start()
                         int tile = ui_control_tile_hit(px, py);
                         if (tile >= 0) ui_control_action(tile, &state, &active_app, &selected, &redraw);
                         else { state = UI_STATE_HOME; redraw = 1; }
+                    }
+                    else if (state == UI_STATE_APP &&
+                             (dy > fb_get_height() / 16 || dy < -fb_get_height() / 16))
+                    {
+                        /* Touch/trackpad drag fallback for backends that do not
+                           forward a discrete wheel event to QEMU. */
+                        int scroll_delta = dy < 0 ? -1 : 1;
+                        if (active_app >= 0 && ui_apps_scroll(active_app, scroll_delta))
+                            redraw = 1;
                     }
                     else if (state == UI_STATE_APP && py < 36 && px < 48)
                     {

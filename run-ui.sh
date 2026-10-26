@@ -51,11 +51,20 @@ for required_device in ramfb virtio-keyboard-device virtio-tablet-device; do
     fi
 done
 
+# A relative mouse carries X11 / trackpad wheel events. Keep tablet-only QEMU
+# builds working too; touch/click controls remain usable without wheel support.
+MOUSE_DEVICE_ARGS=()
+if grep -Fq 'name "virtio-mouse-device"' <<<"$DEVICE_HELP"; then
+    MOUSE_DEVICE_ARGS=(-device virtio-mouse-device)
+else
+    echo "WARNING: virtio-mouse-device is unavailable; wheel scrolling will be disabled, but tablet input remains enabled." >&2
+fi
+
 echo "RioOS UI: window = QEMU ($DISPLAY_BACKEND)." >&2
-echo "Use the QEMU window keyboard and mouse/touch: swipe up to unlock, click an app, type in Terminal." >&2
+echo "Use keyboard, touch/tablet, or mouse wheel: swipe up to unlock, click an app, scroll lists/output." >&2
 echo "Serial input remains available in this terminal as a fallback (U unlocks, WASD moves, Enter opens)." >&2
 
-# ramfb is the framebuffer; VirtIO input transports deliver window keyboard/tablet events.
+# ramfb is the framebuffer; VirtIO input transports deliver keyboard/tablet and, when available, mouse-wheel events.
 exec "$QEMU" \
     -M virt,gic-version=2,virtualization=on \
     -global virtio-mmio.force-legacy=false \
@@ -71,4 +80,5 @@ exec "$QEMU" \
     -netdev user,id=n1,ipv4=on,ipv6=off \
     -device virtio-net-device,netdev=n1 \
     -device virtio-keyboard-device \
-    -device virtio-tablet-device
+    -device virtio-tablet-device \
+    "${MOUSE_DEVICE_ARGS[@]}"

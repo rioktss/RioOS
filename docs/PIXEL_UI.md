@@ -29,7 +29,7 @@ The graphical UI runner defaults to GTK; override it with `RIOOS_DISPLAY=sdl ./r
 
 ## Input
 
-The graphical runner attaches a VirtIO keyboard and absolute-position VirtIO tablet. Focus the QEMU window in Termux:X11 to send keyboard input to RioOS. Swipe/drag upward on the lock screen to unlock, click a home-screen app icon to open it; the Wallpaper picker, Settings, Launcher and Calculator controls, and File Manager rows also accept pointer clicks; type directly in the pixel Terminal. UART/serial input remains enabled as a fallback.
+The graphical runner attaches a VirtIO keyboard and absolute-position tablet; when supported by the QEMU build, it also attaches a relative mouse so desktop or Termux:X11 trackpad wheel events reach the guest. Focus the QEMU window to send keyboard input. Swipe/drag upward on the lock screen to unlock, click app controls, and use the wheel or vertical drag gestures to move through File Manager entries, Wallpaper choices, Launcher selection, and Terminal output. If QEMU lacks the relative mouse device, the runner warns but keeps the existing keyboard/tablet UI working. UART/serial input remains enabled as a fallback.
 
 | Screen | QEMU-window / fallback input | Action |
 |---|---|---|
@@ -47,7 +47,7 @@ The graphical runner attaches a VirtIO keyboard and absolute-position VirtIO tab
 | Files | `W` / `S`, `Enter`, `Backspace` | Browse folders, preview files, and go up one level |
 | Launcher | `W` / `S`, `Enter` | Select and open a built-in app |
 
-Termux:X11 / desktop touch gestures depend on the QEMU display backend forwarding the touch as a pointer event. If pointer input is not passed through by the host, use a mouse/trackpad, and check that the log reports `VirtIO input: tablet/mouse ready.` The command prompt remains backed by the kernel shell dispatcher; it is not a separate limited parser.
+Termux:X11 / desktop touch gestures depend on the QEMU display backend forwarding touch as pointer events. The UI runner uses a tablet for absolute touch/clicks and adds a mouse device for relative movement and wheel events when QEMU provides it. If that optional device is unavailable or the host does not forward gestures, use a mouse/trackpad or the keyboard. The command prompt remains backed by the kernel shell dispatcher; it is not a separate limited parser.
 
 ## `.rpk` packages
 

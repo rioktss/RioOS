@@ -266,13 +266,19 @@ assert 'cmn x0, #2' in nano_src and 'b.eq load_empty' in nano_src, 'nano must on
 assert 'load_failed:' in nano_src and 'msg_denied:' in nano_src, 'nano read/save error handling is missing'
 assert 'state = UI_STATE_HOME;' in ui_src and 'UI: unlocked.' in ui_src, 'lock screen serial unlock path is missing'
 ui_runner=(root/'run-ui.sh').read_text()
-assert 'virtio-keyboard-device' in ui_runner and 'virtio-tablet-device' in ui_runner, 'QEMU window keyboard and tablet devices must be attached'
+assert 'virtio-keyboard-device' in ui_runner and 'virtio-tablet-device' in ui_runner and 'virtio-mouse-device' in ui_runner, 'QEMU runner must support keyboard, tablet, and optional wheel-capable mouse devices'
+assert 'MOUSE_DEVICE_ARGS=()' in ui_runner and 'wheel scrolling will be disabled' in ui_runner, 'missing optional mouse must not prevent UI startup'
 input_driver=(root/'drivers/virtio_input.cpp').read_text()
 assert 'virtio_input_poll' in input_driver and 'INPUT_SYN_REPORT' in input_driver, 'VirtIO input events must be polled and synchronized'
+assert 'ui_apps_scroll(active_app, gui_event.scroll)' in ui_src, 'pixel UI must route wheel events to scrollable apps'
+assert 'term_view_offset' in (root/'ui/terminal.cpp').read_text(), 'pixel Terminal must preserve scrollback history'
 assert '&d->queue_size' in input_driver and 'event_avail[i].idx % d->queue_size' in input_driver, 'VirtIO input must honor the negotiated queue size'
 assert 'virtio_input_keyboard_ready' in input_driver and 'virtio_input_pointer_ready' in input_driver, 'keyboard/tablet readiness must be distinguished'
 assert 'INPUT_CFG_ID_NAME' in input_driver and 'read_device_config(d, index)' in input_driver, 'input devices must be identified by their advertised name, not only MMIO order'
 assert 'normalize_axis' in input_driver and 'INPUT_CFG_ABS_INFO' in input_driver, 'tablet coordinates must use device-reported absolute ranges'
+assert 'INPUT_REL_WHEEL' in input_driver and 'RIO_INPUT_SCROLL' in input_driver, 'mouse wheel scrolling must be translated into UI scroll events'
+assert 'INPUT_DEVICE_COUNT    4U' in input_driver, 'VirtIO input scan must support keyboard, tablet, and mouse concurrently'
+assert 'name_len(2), name(name_len)' in fb_src and 'fwcfg_read_next(entry_header, sizeof(entry_header))' in fb_src, 'fw_cfg ramfb parser must honor variable-length directory entries'
 ui_terminal=(root/'ui/terminal.cpp').read_text()
 assert 'execute_command(command_line)' in ui_terminal, 'RPK terminal must use the shared RioOS shell dispatcher'
 assert 'term_equal(command_line, \"logout\")' not in ui_terminal, 'RPK terminal must preserve shared logout/exit command semantics'

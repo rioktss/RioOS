@@ -66,6 +66,12 @@ int ui_wallpaper_pointer(int x, int y);
 int ui_settings_key(char key);
 int ui_settings_pointer(int x, int y);
 int ui_apps_pointer(int app_id, int x, int y);
+/* Positive delta scrolls toward older/upward content; negative scrolls down. */
+int ui_apps_scroll(int app_id, int delta);
+int ui_terminal_scroll(int delta);
+int ui_file_manager_scroll(int delta);
+int ui_launcher_scroll(int delta);
+int ui_wallpaper_scroll(int delta);
 int ui_apps_get_target(int app_id);
 void ui_wallpaper_init();
 void ui_wallpaper_render(uint64_t epoch);

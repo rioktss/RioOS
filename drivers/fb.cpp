@@ -186,27 +186,56 @@ static int fwcfg_init_ramfb()
     uint16_t terminal_mode_selector = 0;
     for (uint32_t i = 0; i < count; ++i)
     {
-        uint8_t entry[64];
-        fwcfg_read_next(entry, sizeof(entry));
-
-        const char ramfb_name[] = "etc/ramfb";
-        int ramfb_match = 1;
-        for (uint32_t c = 0; c < sizeof(ramfb_name); ++c)
+        /* fw_cfg directory entries are variable-length records:
+           size(4), selector(2), reserved(2), name_len(2), name(name_len).
+           Reading a fixed 64-byte block desynchronizes the next record, and
+           the name starts at byte 10, not byte 8. */
+        uint8_t entry_header[10];
+        fwcfg_read_next(entry_header, sizeof(entry_header));
+        uint16_t selector = read_be16(entry_header + 4);
+        uint16_t name_len = read_be16(entry_header + 8);
+        char entry_name[96];
+        int keep_name = name_len < sizeof(entry_name);
+        if (keep_name)
         {
-            if (entry[8U + c] != (uint8_t)ramfb_name[c]) { ramfb_match = 0; break; }
+            fwcfg_read_next((uint8_t*)entry_name, name_len);
+            entry_name[name_len] = '\0';
         }
-        if (ramfb_match) ramfb_selector = read_be16(entry + 4);
-
-        /* QEMU runner may request starting straight in the pixel Terminal.
-           Missing this optional file deliberately keeps the normal lock screen. */
-        const char terminal_mode_name[] = "opt/rioos/start-terminal";
-        int terminal_match = 1;
-        for (uint32_t c = 0; c < sizeof(terminal_mode_name); ++c)
+        else
         {
-            if (entry[8U + c] != (uint8_t)terminal_mode_name[c])
-            { terminal_match = 0; break; }
+            /* Consume even unusually long names so the following header is
+               still read at the correct offset. */
+            uint8_t discard[32];
+            uint32_t remaining = name_len;
+            while (remaining > 0U)
+            {
+                uint32_t chunk = remaining < sizeof(discard) ? remaining : sizeof(discard);
+                fwcfg_read_next(discard, chunk);
+                remaining -= chunk;
+            }
         }
-        if (terminal_match) terminal_mode_selector = read_be16(entry + 4);
+
+        if (keep_name && entry_name[0] != '\0')
+        {
+            const char ramfb_name[] = "etc/ramfb";
+            const char terminal_mode_name[] = "opt/rioos/start-terminal";
+            int ramfb_match = 1;
+            int terminal_match = 1;
+            uint32_t c = 0;
+            while (ramfb_name[c] || entry_name[c])
+            {
+                if (ramfb_name[c] != entry_name[c]) { ramfb_match = 0; break; }
+                ++c;
+            }
+            c = 0;
+            while (terminal_mode_name[c] || entry_name[c])
+            {
+                if (terminal_mode_name[c] != entry_name[c]) { terminal_match = 0; break; }
+                ++c;
+            }
+            if (ramfb_match) ramfb_selector = selector;
+            if (terminal_match) terminal_mode_selector = selector;
+        }
     }
 
     if (terminal_mode_selector != 0)

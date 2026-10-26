@@ -29,6 +29,13 @@
 #define STATUS_FAILED         0x80U
 #define DESC_WRITE            2U
 #define QUEUE_COUNT           8U
+#define INPUT_DEVICE_COUNT    4U
+#define INPUT_EV_REL          2U
+#define INPUT_REL_X           0U
+#define INPUT_REL_Y           1U
+#define INPUT_REL_WHEEL       8U
+#define INPUT_SCREEN_WIDTH    1024
+#define INPUT_SCREEN_HEIGHT   768
 #define INPUT_EV_SYN          0U
 #define INPUT_EV_KEY          1U
 #define INPUT_EV_ABS          3U
@@ -52,6 +59,7 @@ struct InputDevice
     uint64_t base;
     int ready;
     int is_pointer;
+    int is_relative_pointer;
     uint16_t last_used;
     uint16_t queue_size;
     int32_t pointer_x;
@@ -63,16 +71,19 @@ struct InputDevice
     char name[64];
     uint32_t pointer_down;
     uint32_t pointer_dirty;
+    int32_t scroll_delta;
+    uint32_t scroll_dirty;
+    uint32_t scroll_ready;
 };
 
-static InputDevice devices[2];
-static VirtqDesc event_desc[2][QUEUE_COUNT] __attribute__((aligned(16), section(".bss.virtio_input")));
-static VirtqAvail event_avail[2] __attribute__((aligned(16), section(".bss.virtio_input")));
-static VirtqUsed event_used[2] __attribute__((aligned(16), section(".bss.virtio_input")));
-static VirtioInputEvent event_buffers[2][QUEUE_COUNT] __attribute__((aligned(16), section(".bss.virtio_input")));
-static VirtqDesc status_desc[2][1] __attribute__((aligned(16), section(".bss.virtio_input")));
-static VirtqAvail status_avail[2] __attribute__((aligned(16), section(".bss.virtio_input")));
-static VirtqUsed status_used[2] __attribute__((aligned(16), section(".bss.virtio_input")));
+static InputDevice devices[INPUT_DEVICE_COUNT];
+static VirtqDesc event_desc[INPUT_DEVICE_COUNT][QUEUE_COUNT] __attribute__((aligned(16), section(".bss.virtio_input")));
+static VirtqAvail event_avail[INPUT_DEVICE_COUNT] __attribute__((aligned(16), section(".bss.virtio_input")));
+static VirtqUsed event_used[INPUT_DEVICE_COUNT] __attribute__((aligned(16), section(".bss.virtio_input")));
+static VirtioInputEvent event_buffers[INPUT_DEVICE_COUNT][QUEUE_COUNT] __attribute__((aligned(16), section(".bss.virtio_input")));
+static VirtqDesc status_desc[INPUT_DEVICE_COUNT][1] __attribute__((aligned(16), section(".bss.virtio_input")));
+static VirtqAvail status_avail[INPUT_DEVICE_COUNT] __attribute__((aligned(16), section(".bss.virtio_input")));
+static VirtqUsed status_used[INPUT_DEVICE_COUNT] __attribute__((aligned(16), section(".bss.virtio_input")));
 static uint32_t shift_down = 0;
 static uint32_t ctrl_down = 0;
 static uint32_t next_device = 0;
@@ -125,13 +136,19 @@ static void read_device_config(InputDevice* d, uint32_t fallback_index)
     d->name[name_size] = '\0';
 
     /* Device order varies between QEMU releases; use its advertised name. */
+    d->is_relative_pointer = 0;
     if (name_contains(d->name, "Keyboard")) d->is_pointer = 0;
-    else if (name_contains(d->name, "Tablet") || name_contains(d->name, "Mouse")) d->is_pointer = 1;
+    else if (name_contains(d->name, "Tablet")) d->is_pointer = 1;
+    else if (name_contains(d->name, "Mouse"))
+    {
+        d->is_pointer = 1;
+        d->is_relative_pointer = 1;
+    }
     else d->is_pointer = (fallback_index == 0U) ? 1 : 0;
 
     d->abs_min_x = 0; d->abs_max_x = 32767;
     d->abs_min_y = 0; d->abs_max_y = 32767;
-    if (d->is_pointer)
+    if (d->is_pointer && !d->is_relative_pointer)
     {
         uint32_t size = 0;
         uint32_t min_x = config_read_u32(d, INPUT_CFG_ABS_INFO, INPUT_ABS_X, 0, &size);
@@ -194,8 +211,9 @@ static int init_one(uint32_t index)
     InputDevice* d = &devices[index];
     uint64_t size = 0; int irq = -1;
     d->ready = 0; d->regs = 0; d->base = 0; d->last_used = 0; d->queue_size = 0;
-    d->is_pointer = 0;
+    d->is_pointer = 0; d->is_relative_pointer = 0;
     d->pointer_x = 16384; d->pointer_y = 16384; d->pointer_down = 0; d->pointer_dirty = 0;
+    d->scroll_delta = 0; d->scroll_dirty = 0; d->scroll_ready = 0;
     d->name[0] = '\0';
     if (!virtio_mmio_find_device_instance(VIRTIO_INPUT_ID, index, &d->base, &size, &irq)) return 0;
     (void)size; (void)irq;
@@ -306,10 +324,10 @@ static int event_pop(uint32_t i, struct VirtioInputEvent* out)
 
 void virtio_input_init()
 {
-    for (uint32_t i = 0; i < 2; ++i) devices[i].ready = 0;
+    for (uint32_t i = 0; i < INPUT_DEVICE_COUNT; ++i) devices[i].ready = 0;
     shift_down = 0; ctrl_down = 0; next_device = 0;
     int found = 0;
-    for (uint32_t i = 0; i < 2; ++i) found += init_one(i);
+    for (uint32_t i = 0; i < INPUT_DEVICE_COUNT; ++i) found += init_one(i);
 
     int keys = virtio_input_keyboard_ready();
     int pointer = virtio_input_pointer_ready();
@@ -322,19 +340,21 @@ void virtio_input_init()
 
 int virtio_input_ready()
 {
-    return devices[0].ready || devices[1].ready;
+    for (uint32_t i = 0; i < INPUT_DEVICE_COUNT; ++i)
+        if (devices[i].ready) return 1;
+    return 0;
 }
 
 int virtio_input_keyboard_ready()
 {
-    for (uint32_t i = 0; i < 2; ++i)
+    for (uint32_t i = 0; i < INPUT_DEVICE_COUNT; ++i)
         if (devices[i].ready && !devices[i].is_pointer) return 1;
     return 0;
 }
 
 int virtio_input_pointer_ready()
 {
-    for (uint32_t i = 0; i < 2; ++i)
+    for (uint32_t i = 0; i < INPUT_DEVICE_COUNT; ++i)
         if (devices[i].ready && devices[i].is_pointer) return 1;
     return 0;
 }
@@ -342,10 +362,34 @@ int virtio_input_pointer_ready()
 int virtio_input_poll(struct RioInputEvent* event)
 {
     if (!event) return 0;
-    event->kind = RIO_INPUT_NONE; event->key = 0; event->x = 0; event->y = 0; event->pressed = 0;
-    for (uint32_t attempt = 0; attempt < 32U; ++attempt)
+    event->kind = RIO_INPUT_NONE;
+    event->key = 0;
+    event->x = 0;
+    event->y = 0;
+    event->pressed = 0;
+    event->scroll = 0;
+
+    for (uint32_t attempt = 0; attempt < 48U; ++attempt)
     {
-        uint32_t i = next_device++ & 1U;
+        /* A wheel and pointer movement can occur in the same SYN frame. Keep
+           both reports instead of silently dropping one of them. */
+        for (uint32_t pending = 0; pending < INPUT_DEVICE_COUNT; ++pending)
+        {
+            InputDevice* d = &devices[pending];
+            if (d->ready && d->is_pointer && d->scroll_ready)
+            {
+                event->kind = RIO_INPUT_SCROLL;
+                event->x = d->pointer_x;
+                event->y = d->pointer_y;
+                event->scroll = d->scroll_delta;
+                d->scroll_delta = 0;
+                d->scroll_dirty = 0;
+                d->scroll_ready = 0;
+                return 1;
+            }
+        }
+
+        uint32_t i = next_device++ & (INPUT_DEVICE_COUNT - 1U);
         if (!devices[i].ready) continue;
         struct VirtioInputEvent raw;
         if (!event_pop(i, &raw)) continue;
@@ -360,27 +404,66 @@ int virtio_input_poll(struct RioInputEvent* event)
             if (key == 0) continue;
             if (ctrl_down && key >= 'a' && key <= 'z') key = (char)(key - 'a' + 1);
             else if (ctrl_down && key >= 'A' && key <= 'Z') key = (char)(key - 'A' + 1);
-            event->kind = RIO_INPUT_KEY; event->key = key;
+            event->kind = RIO_INPUT_KEY;
+            event->key = key;
             return 1;
         }
-        if (!device->is_pointer) continue;
-        if (raw.type == INPUT_EV_ABS)
+
+        if (raw.type == INPUT_EV_ABS && !device->is_relative_pointer)
         {
             if (raw.code == INPUT_ABS_X) { device->pointer_x = normalize_axis(raw.value, device->abs_min_x, device->abs_max_x); device->pointer_dirty = 1; }
             else if (raw.code == INPUT_ABS_Y) { device->pointer_y = normalize_axis(raw.value, device->abs_min_y, device->abs_max_y); device->pointer_dirty = 1; }
+        }
+        else if (raw.type == INPUT_EV_REL)
+        {
+            if (device->is_relative_pointer && raw.code == INPUT_REL_X)
+            {
+                int64_t delta = ((int64_t)raw.value * 32767LL) / (INPUT_SCREEN_WIDTH - 1);
+                int64_t next = (int64_t)device->pointer_x + delta;
+                if (next < 0) next = 0;
+                if (next > 32767) next = 32767;
+                device->pointer_x = (int32_t)next;
+                device->pointer_dirty = 1;
+            }
+            else if (device->is_relative_pointer && raw.code == INPUT_REL_Y)
+            {
+                int64_t delta = ((int64_t)raw.value * 32767LL) / (INPUT_SCREEN_HEIGHT - 1);
+                int64_t next = (int64_t)device->pointer_y + delta;
+                if (next < 0) next = 0;
+                if (next > 32767) next = 32767;
+                device->pointer_y = (int32_t)next;
+                device->pointer_dirty = 1;
+            }
+            else if (raw.code == INPUT_REL_WHEEL && raw.value != 0)
+            {
+                device->scroll_delta += raw.value > 0 ? 1 : -1;
+                if (device->scroll_delta > 12) device->scroll_delta = 12;
+                if (device->scroll_delta < -12) device->scroll_delta = -12;
+                device->scroll_dirty = 1;
+            }
         }
         else if (raw.type == INPUT_EV_KEY && (raw.code == INPUT_BTN_LEFT || raw.code == INPUT_BTN_TOUCH))
         {
             device->pointer_down = raw.value != 0 ? 1U : 0U;
             device->pointer_dirty = 1;
         }
-        else if (raw.type == INPUT_EV_SYN && raw.code == INPUT_SYN_REPORT && device->pointer_dirty)
+        else if (raw.type == INPUT_EV_SYN && raw.code == INPUT_SYN_REPORT)
         {
-            event->kind = RIO_INPUT_POINTER;
-            event->x = device->pointer_x; event->y = device->pointer_y;
-            event->pressed = device->pointer_down;
-            device->pointer_dirty = 0;
-            return 1;
+            if (device->pointer_dirty)
+            {
+                event->kind = RIO_INPUT_POINTER;
+                event->x = device->pointer_x;
+                event->y = device->pointer_y;
+                event->pressed = device->pointer_down;
+                device->pointer_dirty = 0;
+                if (device->scroll_dirty) device->scroll_ready = 1;
+                return 1;
+            }
+            if (device->scroll_dirty)
+            {
+                device->scroll_ready = 1;
+                continue;
+            }
         }
     }
     return 0;

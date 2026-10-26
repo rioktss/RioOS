@@ -16,7 +16,13 @@ foreach ($RequiredDevice in @("ramfb", "virtio-keyboard-device", "virtio-tablet-
         throw "This QEMU build lacks '$RequiredDevice'. Install a QEMU system-aarch64 build with ramfb and VirtIO input devices."
     }
 }
-Write-Host "RioOS UI: use QEMU-window keyboard and mouse/tablet (swipe up to unlock; click an app)."
+$MouseDeviceArgs = @()
+if ($DeviceHelp.Contains('name "virtio-mouse-device"')) {
+    $MouseDeviceArgs = @("-device", "virtio-mouse-device")
+} else {
+    Write-Warning "virtio-mouse-device is unavailable; wheel scrolling is disabled, but tablet input remains enabled."
+}
+Write-Host "RioOS UI: keyboard and tablet input, with mouse-wheel scrolling when QEMU supports it."
 Write-Host "Serial keyboard remains available as a fallback."
 & $Qemu `
     -M "virt,gic-version=2,virtualization=on" `
@@ -33,5 +39,6 @@ Write-Host "Serial keyboard remains available as a fallback."
     -netdev "user,id=n1,ipv4=on,ipv6=off" `
     -device "virtio-net-device,netdev=n1" `
     -device "virtio-keyboard-device" `
-    -device "virtio-tablet-device"
+    -device "virtio-tablet-device" `
+    @MouseDeviceArgs
 if ($LASTEXITCODE -ne 0) { throw "QEMU UI session failed ($LASTEXITCODE)" }

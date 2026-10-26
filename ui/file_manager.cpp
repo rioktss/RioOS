@@ -187,6 +187,22 @@ int ui_file_manager_key(char key)
     return 0;
 }
 
+int ui_file_manager_scroll(int delta)
+{
+    if (delta == 0 || file_preview) return 0;
+    int dir = current_dir_id();
+    if (dir < 0) return 0;
+    int count = fs_get_child_count(dir);
+    int next = file_selected;
+    next -= delta;
+    if (next < 0) next = 0;
+    if (next >= count) next = count > 0 ? count - 1 : 0;
+    if (next == file_selected) return 0;
+    file_selected = next;
+    file_notice = 0;
+    return 1;
+}
+
 int ui_file_manager_pointer(int x, int y)
 {
     if (file_preview)
