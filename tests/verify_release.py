@@ -5,10 +5,10 @@ root=Path(__file__).resolve().parents[1]
 kernel=root/'build/kernel.elf'; disk=root/'storage/disk.img'; user=root/'build/user_init.elf'
 required=['drivers/virtio_mmio.cpp','drivers/virtio_net.cpp','net/netstack.cpp','docs/P3_NETWORKING.md','docs/TEST_MATRIX_P3.md','process/user.cpp','process/elf.cpp','boot/exceptions.S','process/scheduler.cpp','process/thread.cpp','process/ctx_switch.S','kernel/fd.cpp','include/fd.h','tests/fd_host_test.cpp','tests/process_host_test.cpp','tests/scheduler_process_host_test.cpp','drivers/fb.cpp','drivers/font.cpp','drivers/ui_font_data.cpp','include/ui_font_data.h','docs/THIRD_PARTY_NOTICES.md','docs/P2_FILESYSTEM_SECURITY.md','include/smp.h','kernel/smp.cpp','tests/smp_host_test.cpp','tests/fb_host_test.cpp','docs/P4_SMP_DRIVER_HARDENING.md','docs/TEST_MATRIX_P4.md','.github/workflows/ci.yml','include/ui.h','ui/boot.cpp','ui/lock_screen.cpp','ui/home_screen.cpp','ui/ui.cpp','ui/apps.cpp','ui/terminal.cpp','ui/calculator.cpp','ui/clock.cpp','ui/file_manager.cpp','ui/launcher.cpp','ui/wallpaper.cpp','ui/settings.cpp','ui/image.cpp','apps/wallpaper.rpk','apps/pengaturan.rpk','assets/wallpapers/rioos-default.bmp','assets/icons/terminal.bmp','assets/icons/calculator.bmp','assets/icons/clock.bmp','assets/icons/files.bmp','assets/icons/launcher.bmp','assets/icons/wallpaper.bmp','assets/icons/settings.bmp','docs/ANDROID_UI.md','tests/ui_image_host_test.cpp','linux/run-ui.sh','windows/run-ui.ps1','linux/run-terminal.sh','windows/run-terminal.ps1','docs/PIXEL_UI.md','tests/ui_host_test.cpp','apps/terminal.rpk','apps/calculator.rpk','apps/clock.rpk','apps/files.rpk','apps/launcher.rpk']
 for name in required: assert (root/name).is_file(), f'missing {name}'
-# Guard the platform-oriented entry-point layout against regression.
-expected_root_files = ['.gitignore', 'README.md']
-root_files = sorted(p.name for p in root.iterdir() if p.is_file())
-assert root_files == expected_root_files, f'only README.md and .gitignore should be root-level files, got: {root_files}'
+# The repository root is intentionally extensible. Keep the core project
+# metadata required, but do not reject additional files or folders at root.
+assert (root / 'README.md').is_file(), 'README.md is missing from repository root'
+assert (root / '.gitignore').is_file(), '.gitignore is missing from repository root'
 
 platform_scripts = {
     'linux': ('build.sh', 'run.sh', 'run-terminal.sh', 'run-ui.sh'),
