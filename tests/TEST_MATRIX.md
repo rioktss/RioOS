@@ -10,7 +10,7 @@
 - Persistent filesystem host create/write/read/remount/delete test
 - VFS host test (`tests/vfs_host_test.cpp`): writable `/home/user` startup, user can save there while root remains protected, `ls <dir>` with sizes, cwd path, `rm .` keeps cwd valid, VFS recursive remove path
 - Filesystem host test also covers `fs_rename` (mv), mkdir-p, recursive remove, hidden files/default modes, UID/GID persistence/migration, owner/group/other permission denial, stat metadata, truncate zero-fill, and rejection of a corrupt `UINT64_MAX` inode size
-- Network host test (`tests/net_host_test.cpp`): IPv4 parsing, ARP neighbor learning, UDP owner isolation, port conflicts, checksum handling, and DNS A lookup with a fake resolver peer
+- Network host test (`tests/net_host_test.cpp`): IPv4 parsing, ARP neighbor learning, UDP owner isolation/checksums, DNS A lookup, and TCP handshake/send/receive/FIN with a fake peer
 - File-descriptor host test (`tests/fd_host_test.cpp`): read/write/seek/append/truncate, access modes, per-PID table isolation, shared offsets across `dup`/`dup2`, pipe transfer/ring semantics, non-blocking empty reads, EOF, and `EPIPE`
 - Process manager host test (`tests/process_host_test.cpp`): valid states, bounded EL0 metadata, unique RUNNING record, protected built-ins, zombie/exit-code lifecycle, and refusing to destroy a running process
 - Scheduler/process integration host test (`tests/scheduler_process_host_test.cpp`): logical-current selection, removal/cleanup, zombie compaction, and fallback selection
@@ -34,6 +34,7 @@
 - `cp a.txt b.txt`, `cp a.txt /storage/home`, `mv b.txt c.txt`, `mv c.txt /storage/home`, `ls /storage`; prompt shows the current directory
 - `nano` with no argument prints usage; `nano <directory>` is refused
 - `net` and `ping 10.0.2.2`
+- `nslookup example.com` and `httpget neverssl.com /` to test real DNS and outbound plain HTTP
 - Create a file under `/storage/home`, reboot QEMU, and confirm it remains
 
 The release does not claim these QEMU runtime checks were executed inside
@@ -61,5 +62,6 @@ the release build container when `qemu-system-aarch64` is unavailable.
 - UDP handles use their own owner-PID-scoped namespace; they are not ordinary file descriptors yet.
 - UDP receive and DNS lookup are polling-based. There is no IRQ-driven receive path.
 - DNS supports A records only and uses a configured static DNS server (default `10.0.2.3`).
-- TCP, DHCP, IPv6, fragment reassembly, and ARP cache expiry are not implemented.
-- Actual QEMU networking tests (`ping 10.0.2.2`, `nslookup example.com`) must be run outside the host-test environment.
+- TCP is a bounded outbound client: no passive listen/accept, congestion control, MSS negotiation, or out-of-order reassembly. HTTPS/TLS is not implemented; `httpget` is plain HTTP on port 80.
+- DHCP, IPv6, fragment reassembly, and ARP cache expiry are not implemented.
+- Actual QEMU networking tests (`ping 10.0.2.2`, `nslookup example.com`, `httpget neverssl.com /`) must be run outside the host-test environment.

@@ -5,6 +5,8 @@
 
 #define NET_UDP_MAX_PAYLOAD 1200U
 #define NET_UDP_MAX_TIMEOUT_MS 10000U
+#define NET_TCP_MAX_TIMEOUT_MS 10000U
+#define NET_TCP_MAX_IO 4096U
 
 void net_init();
 int net_ready();
@@ -26,6 +28,18 @@ int net_udp_recvfrom(int owner_pid, int socket_handle, uint32_t* source_ip,
                      uint32_t timeout_ms);
 int net_udp_close(int owner_pid, int socket_handle);
 void net_udp_close_all_for(int owner_pid);
+
+/* Bounded outbound TCP client API. TCP is polling-based and targets ordinary
+   IPv4 services such as HTTP; TLS/HTTPS is not implemented by this stack. */
+int net_tcp_socket(int owner_pid);
+int net_tcp_connect(int owner_pid, int socket_handle, uint32_t target_ip,
+                    uint16_t target_port, uint32_t timeout_ms);
+int net_tcp_send(int owner_pid, int socket_handle, const void* data,
+                 uint32_t length, uint32_t timeout_ms);
+int net_tcp_recv(int owner_pid, int socket_handle, void* data,
+                 uint32_t capacity, uint32_t timeout_ms);
+int net_tcp_close(int owner_pid, int socket_handle);
+void net_tcp_close_all_for(int owner_pid);
 
 /* DNS A-record lookup; IP addresses use the same 0xAABBCCDD representation
    as net_parse_ipv4(). The default DNS server is QEMU user-net (10.0.2.3). */

@@ -34,6 +34,12 @@ int net_udp_recvfrom(int, int, uint32_t* ip, uint16_t* port, void*, uint32_t, ui
 int net_udp_close(int, int) { return 0; }
 void net_udp_close_all_for(int) {}
 int net_dns_resolve(const char*, uint32_t* ip, uint32_t) { if (ip) *ip = 0x5DB8D822U; return 0; }
+int net_tcp_socket(int owner_pid) { return owner_pid >= 0 ? 2 : -22; }
+int net_tcp_connect(int, int, uint32_t, uint16_t, uint32_t) { return 0; }
+int net_tcp_send(int, int, const void*, uint32_t length, uint32_t) { return (int)length; }
+int net_tcp_recv(int, int, void*, uint32_t, uint32_t) { return -110; }
+int net_tcp_close(int, int) { return 0; }
+void net_tcp_close_all_for(int) {}
 
 /* Fake single-file filesystem: only "/storage/home/hello" exists after a write. */
 static uint8_t fake_file[4096]; static uint64_t fake_size = 0; static int fake_exists = 0;
@@ -144,6 +150,11 @@ static uint64_t call6(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2,
 int main()
 {
     CHECK(call(SYS_PING) == 0x4D594B56ULL);
+    CHECK(call(SYS_NET_TCP_SOCKET) == 2);
+    CHECK(call6(SYS_NET_TCP_CONNECT, 1, 0x5DB8D822U, 80, 1000, 0, 0, 1) == 0);
+    CHECK(call6(SYS_NET_TCP_SEND, 1, 0x1000, 4, 1000, 0, 0, 1) == ((uint64_t)(-14)));
+    CHECK(call6(SYS_NET_TCP_RECV, 1, 0x47000000, 16, 1000, 0, 0, 1) == ((uint64_t)(-14)));
+    CHECK(call(SYS_NET_TCP_CLOSE, 1) == 0);
     CHECK(call(SYS_GETPID, 0, 0, 1) == 5 && call(SYS_GETPID, 0, 0, 0) == 1);
     CHECK(call(99) == ERR(38));
 

@@ -128,10 +128,11 @@ Implemented in this increment:
 - receive queues are bounded; full queues drop newest datagrams and track drops internally; timeout is polling-based
 - DNS A-record queries over UDP with QNAME validation, compressed-name bounds/loop handling, response ID/source checks, configurable DNS server, and QEMU's default `10.0.2.3` resolver
 - UDP and DNS syscall wrappers for EL0 with userspace pointer validation
-- shell commands `ifconfig`, `nslookup`, and root-only `dnsserver <ipv4>`
-- host tests exercise ARP neighbor learning, malformed IPv4 rejection, owner isolation, UDP send/receive, and a fake DNS A response
+- shell commands `ifconfig`, `nslookup`, `httpget` (plain HTTP over outbound TCP), and root-only `dnsserver <ipv4>`
+- outbound TCP connect/send/receive/close API and syscall wrappers for EL0
+- host tests exercise ARP neighbor learning, malformed IPv4 rejection, UDP send/receive and DNS, TCP handshake/ACK/data/FIN, and owner isolation
 
-Not implemented here: TCP, UDP socket handles are a dedicated networking handle namespace rather than ordinary file descriptors, DNS currently resolves A records only, DNS configuration is static (QEMU user-net default), IPv4 fragments are rejected, and runtime QEMU packet exchange must still be tested on a host with `qemu-system-aarch64`. No timer IRQ is enabled by default.
+Still limited: TCP is a bounded client only (no listen/accept, congestion control, options negotiation, or out-of-order reassembly); HTTPS/TLS is not implemented; UDP/TCP handles are separate from file descriptors; DNS resolves A records only; configuration is static (QEMU user-net default); IPv4 fragments are rejected; and real QEMU packet exchange must still be tested on a host with `qemu-system-aarch64`. No timer IRQ is enabled by default.
 
 
 ## P4 SMP, driver and framebuffer foundations (v1.10.0)

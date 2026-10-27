@@ -37,7 +37,12 @@ enum SyscallNumber
     SYS_NET_UDP_SENDTO   = 28, /* udp_sendto(handle, ip, port, data, length) */
     SYS_NET_UDP_RECVFROM = 29, /* udp_recvfrom(handle, &ip, &port, data, cap, timeout_ms) */
     SYS_NET_UDP_CLOSE    = 30, /* udp_close(handle) */
-    SYS_NET_DNS_LOOKUP   = 31  /* dns_lookup(name, &ip, timeout_ms) */
+    SYS_NET_DNS_LOOKUP   = 31, /* dns_lookup(name, &ip, timeout_ms) */
+    SYS_NET_TCP_SOCKET   = 32, /* tcp_socket() -> owner-scoped handle */
+    SYS_NET_TCP_CONNECT  = 33, /* tcp_connect(handle, ip, port, timeout_ms) */
+    SYS_NET_TCP_SEND     = 34, /* tcp_send(handle, data, length, timeout_ms) */
+    SYS_NET_TCP_RECV     = 35, /* tcp_recv(handle, data, capacity, timeout_ms) */
+    SYS_NET_TCP_CLOSE    = 36  /* tcp_close(handle) */
 };
 
 void syscall_init();

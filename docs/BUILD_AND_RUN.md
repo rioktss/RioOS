@@ -337,11 +337,11 @@ New commands: `stat <path>`, `chown <uid> <gid> <path>` (root only), and `trunca
 
 P2 userspace syscall helpers are `user_fs_stat`, `user_fs_truncate`, and `user_fs_chmod` in `include/user_api.h`. Run `bash linux/build.sh --clean` to rebuild and execute filesystem permission/migration and syscall regression tests. The kernel still uses a single global shell credential context, so this is educational access control rather than a hardened multi-user security boundary. Timer IRQ stays off at boot.
 
-## P3 UDP and DNS networking (v1.9.0)
+## P3 networking (UDP/DNS and outbound TCP)
 
-P3 adds owner-PID-scoped UDP handles, bound/ephemeral ports, bounded receive queues, IPv4/UDP validation and UDP transmit checksum, DNS A-record queries, network syscall helpers, and the `ifconfig`, `nslookup`, and root-only `dnsserver` commands. The default DNS address is `10.0.2.3` for QEMU user-mode networking. See [P3 networking notes](./P3_NETWORKING.md) for API use and limits.
+The networking stack retains owner-PID-scoped UDP handles, IPv4/UDP validation, DNS A-record queries and their EL0 syscall helpers, and adds four bounded outbound TCP client sockets with ACK-based send, receive buffering, close handling, and userspace syscall helpers. The `httpget <hostname> [path]` command fetches up to 4096 bytes from a **plain HTTP** service on port 80. The default DNS address is `10.0.2.3` for QEMU user-mode networking. HTTPS/TLS is not implemented. See [P3 networking notes](./P3_NETWORKING.md) for API use and limits.
 
-Run `bash linux/build.sh --clean` for the AArch64 clean build and host regressions. On a machine with `qemu-system-aarch64`, also run `net`, `ping 10.0.2.2`, and `nslookup example.com`. Host tests use a fake NIC/DNS peer and are not a replacement for that QEMU runtime test. TCP, DHCP, IPv6, and IP fragment reassembly are not included, and timer IRQ remains disabled at boot.
+Run `bash linux/build.sh --clean` for the AArch64 clean build and host regressions. On a machine with `qemu-system-aarch64`, run `net`, `ping 10.0.2.2`, `nslookup example.com`, and `httpget neverssl.com /`. Host tests use a fake NIC/peer and are not a replacement for the real QEMU runtime test. DHCP, IPv6, IP fragment reassembly, full TCP congestion/reassembly, and TLS remain out of scope; timer IRQ stays disabled at boot.
 
 
 ## P4 SMP/driver foundations (v1.10.0)

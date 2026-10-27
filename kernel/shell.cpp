@@ -15,7 +15,7 @@ static const char* command_names[] = {
     "elf","syscall","user","userdemo","su","logout","exit","level","mmu","disk","diskread",
     "diskwrite","diskflush","apps","uname","whoami","net","ping","selftest","pages","tasks",
     "mount","stats","log","irq","grep","find","history","date","du","df","wc","chmod","env","export",
-    "ifconfig","nslookup","dnsserver","smp","fbinfo"
+    "ifconfig","nslookup","httpget","dnsserver","smp","fbinfo"
 };
 
 static void shell_prompt_text()

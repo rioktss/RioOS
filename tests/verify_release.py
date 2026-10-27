@@ -238,13 +238,18 @@ assert 'int net_udp_socket(int owner_pid)' in net_src
 assert 'udp_checksum_ipv4' in net_src and 'checksum16((const uint8_t*)ip, ihl) != 0' in net_src
 assert 'int net_dns_resolve(' in net_src and 'dns_parse_a_response' in net_src
 assert 'int net_dns_set_server(' in net_src and 'DNS_DEFAULT_SERVER' in net_src
+assert 'int net_tcp_socket(int owner_pid)' in net_src and 'int net_tcp_connect(' in net_src
+assert 'int net_tcp_send(' in net_src and 'int net_tcp_recv(' in net_src and 'tcp_checksum_ipv4' in net_src
 assert 'net_udp_close_all_for(pid)' in user_src, 'EL0 UDP sockets must close at process exit'
 assert 'SYS_NET_UDP_SOCKET' in syscall_src and 'SYS_NET_DNS_LOOKUP' in syscall_src
+assert 'SYS_NET_TCP_SOCKET' in syscall_src and 'SYS_NET_TCP_CONNECT' in syscall_src
 assert 'user_udp_socket' in user_api and 'user_udp_sendto' in user_api and 'user_udp_recvfrom' in user_api
 assert 'user_dns_lookup' in user_api
-assert 'command_nslookup' in commands_src and 'dnsserver' in commands_src and 'ifconfig' in commands_src
+assert 'user_tcp_socket' in user_api and 'user_tcp_connect' in user_api and 'user_tcp_recv' in user_api
+assert 'command_nslookup' in commands_src and 'command_httpget' in commands_src
+assert 'dnsserver' in commands_src and 'ifconfig' in commands_src
 net_test=(root/'tests/net_host_test.cpp').read_text()
-for marker in ('cross-owner socket access', 'corrupt IPv4 checksum', 'bad UDP checksum not delivered', 'outgoing UDP pseudo-header checksum validates', 'DNS A lookup end-to-end', 'close-all releases process sockets'):
+for marker in ('cross-owner socket access', 'corrupt IPv4 checksum', 'bad UDP checksum not delivered', 'outgoing UDP pseudo-header checksum validates', 'DNS A lookup end-to-end', 'TCP three-way handshake', 'TCP receives HTTP response', 'TCP socket close succeeds', 'close-all releases process sockets'):
     assert marker in net_test, f'P3 networking regression missing: {marker}'
 assert 'timer_start_periodic(' not in boot_src and 'interrupt_enable();' not in boot_src
 print('P3 NETWORK STATIC CHECK: PASS')

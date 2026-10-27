@@ -1,6 +1,6 @@
 # P3 Networking — RioOS 1.9.0
 
-P3 expands the existing VirtIO-Net + ARP/IPv4/ICMP code into a bounded UDP and DNS path. It deliberately does not enable timer IRQs and does not claim TCP support.
+P3 preserves the existing VirtIO-Net + ARP/IPv4/ICMP path and adds bounded UDP/DNS support plus an outbound TCP client. The stack remains polling-based and deliberately does not enable timer IRQs.
 
 ## Added capabilities
 
@@ -13,7 +13,9 @@ P3 expands the existing VirtIO-Net + ARP/IPv4/ICMP code into a bounded UDP and D
 - DNS A-record resolution over UDP. DNS message parsing bounds counts and offsets and protects compressed-name pointer traversal against out-of-range pointers and loops.
 - DNS server configuration. The default is `10.0.2.3`, expected with QEMU user-mode networking.
 - Syscalls `SYS_NET_UDP_SOCKET` through `SYS_NET_DNS_LOOKUP` (26–31) and `user_udp_*` / `user_dns_lookup` helpers.
-- Shell commands `ifconfig`, `nslookup <hostname>`, and root-only `dnsserver <ipv4>`; `net` remains available.
+- Four owner-scoped outbound TCP client sockets with SYN/SYN-ACK/ACK setup, TCP/IP checksums, bounded ACK/retransmission waits, a 4096-byte receive ring per socket, in-order data delivery, FIN/EOF handling, and process-exit cleanup.
+- TCP syscalls 32–36 and `user_tcp_*` helpers for user ELFs.
+- `httpget <hostname> [path]` resolves a name and fetches up to 4096 response bytes from a plain HTTP server on port 80. Existing `ifconfig`, `nslookup <hostname>`, root-only `dnsserver <ipv4>`, `ping`, and `net` commands remain.
 
 ## Shell examples
 
@@ -22,6 +24,7 @@ net
 ifconfig
 ping 10.0.2.2
 nslookup example.com
+httpget neverssl.com /
 dnsserver 10.0.2.3
 ```
 
@@ -43,17 +46,32 @@ user_udp_close(sock);
 
 The IPv4 address integer follows the `0xAABBCCDD` representation used by `net_parse_ipv4`. Return values are raw kernel results: a non-negative `sendto` result is bytes sent; receive returns bytes received; negative values are errno-like errors (`-19` unavailable, `-22` invalid input, `-24` resources exhausted, `-90` too large, `-98` port busy, `-110` timeout).
 
-The socket handle namespace is separate from file descriptors in P3; handles are not valid arguments to `user_fd_read`/`user_fd_write`. This is a small teaching API, not a complete POSIX sockets ABI.
+TCP handles share a separate namespace from UDP handles and file descriptors; they are not valid arguments to `user_fd_read`/`user_fd_write`. The TCP API is a bounded teaching client API, not a complete POSIX sockets ABI.
+
+Example TCP use from EL0:
+
+```cpp
+int64_t sock = user_tcp_socket();
+if (sock >= 0 && user_tcp_connect(sock, 0x5DB8D822U, 80, 5000) == 0) {
+    const char request[] = "GET / HTTP/1.0\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+    user_tcp_send(sock, request, sizeof(request) - 1, 5000);
+    char response[1024];
+    int64_t count = user_tcp_recv(sock, response, sizeof(response), 2500);
+    user_tcp_close(sock);
+}
+```
 
 ## Validation
 
-`tests/net_host_test.cpp` uses a fake VirtIO peer and covers IPv4 input parsing, ARP neighbor learning, UDP owner isolation, port conflict, receive payload/source, rejection of corrupt IPv4 headers, transmit UDP checksum, DNS A-record parsing via a fake DNS responder, invalid hostnames, and socket cleanup. `tests/verify_release.py` checks the network syscall and API wiring.
+`tests/net_host_test.cpp` uses a fake VirtIO peer and covers IPv4 input parsing, ARP neighbor learning, UDP owner isolation/checksums, DNS A-record parsing, TCP three-way handshake, ACK-based sending, HTTP-like response delivery, EOF handling, owner isolation, and socket cleanup. `tests/verify_release.py` checks the network syscall and API wiring.
 
-A successful host test and AArch64 link do not prove packet interoperability in QEMU. Run `net`, `ping 10.0.2.2`, and `nslookup example.com` on a host with QEMU AArch64 and user-mode networking before treating runtime behavior as verified.
+A successful host test and AArch64 link do not prove packet interoperability on a real QEMU host. The provided Linux/Termux runners already attach VirtIO-Net to QEMU user-mode networking (`10.0.2.15`, gateway `10.0.2.2`, DNS `10.0.2.3`) which permits outbound connections when the host has internet access. After starting the kernel, run `ping 10.0.2.2`, `nslookup example.com`, and `httpget neverssl.com /`.
 
 ## Deliberate limitations
 
-- TCP, retransmission, stream semantics, listen/connect/accept, and DNS AAAA/CNAME-follow-up behavior are not implemented.
+- TCP is client-only. Passive listen/accept, concurrent TCP streams beyond the four bounded sockets, congestion control, TCP options/MSS negotiation, out-of-order reassembly, and robust close-state recovery are not implemented. Retransmission is bounded best-effort, not a full congestion-controlled TCP implementation.
+- TLS/SSL and HTTPS are not implemented; `httpget` handles plain HTTP on port 80 only. Modern HTTPS-only sites will not return their content through this command.
+- DNS AAAA/CNAME-follow-up behavior is not implemented.
 - UDP is polling-based; it does not sleep a process or use an IRQ-driven receive path. A receive syscall can occupy the CPU until data arrives or its timeout expires.
 - Static IPv4 settings only; no DHCP, route table, VLAN, IPv6, IP fragmentation/reassembly, multicast, or broadcast sockets.
 - ARP cache expiry and comprehensive anti-spoofing policy are future work.

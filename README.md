@@ -106,7 +106,7 @@ To customize QEMU or tool paths, use the existing environment overrides such as 
 - **Processes and threads:** process metadata and scheduling policy, ELF loading, system calls, and cooperative kernel-thread context switching. This is not full preemptive process multitasking.
 - **File descriptors and IPC:** bounded per-process descriptor tables, standard streams, `open/read/write/close/seek`, `dup/dup2`, and bounded non-blocking kernel pipes.
 - **Filesystem and storage:** custom filesystem/VFS and a persistent disk image attached through VirtIO block.
-- **Networking:** VirtIO-Net foundations with Ethernet, ARP/IPv4/ICMP, UDP datagrams, owner-scoped UDP sockets, and DNS A-record lookup. TCP, DHCP, and IPv6 are not currently included.
+- **Networking:** VirtIO-Net with Ethernet, ARP/IPv4/ICMP, owner-scoped UDP/DNS, and a bounded outbound TCP client. The `httpget <host> [path]` command tests real plain-HTTP access through QEMU user networking; HTTPS/TLS, DHCP, and IPv6 are not included.
 - **Shell:** environment expansion, `export`/`unset`, basic filesystem commands, and in-memory `cat`/`echo` pipelines to `grep`/`wc`.
 - **Pixel UI:** QEMU `ramfb` rendering, boot splash, Android/MIUI-inspired lock screen and launcher, Control Centre, settings, local BMP wallpapers/icons, and seven built-in `.rpk` app manifests: Terminal, Calculator, Clock, Files, Launcher, Wallpaper, and Pengaturan.
 - **Input:** the graphical runner attaches VirtIO keyboard/tablet devices, and a VirtIO mouse device when available. UART remains a fallback.

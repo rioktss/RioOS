@@ -85,6 +85,7 @@ void user_execute(const char* path, const char* args)
 
     user_enter(entry,mmu_user_stack_top());
     net_udp_close_all_for(pid);
+    net_tcp_close_all_for(pid);
     fd_close_all();
     fd_release_process(pid);
 

@@ -57,19 +57,48 @@ static uint8_t mac_address[6];
 static uint16_t tx_last_used = 0;
 static uint16_t rx_last_used = 0;
 
-static VirtqDesc rx_desc[QUEUE_MAX] __attribute__((aligned(16), section(".bss.virtio_net")));
-static VirtqAvail rx_avail __attribute__((aligned(16), section(".bss.virtio_net")));
-static VirtqUsed rx_used __attribute__((aligned(16), section(".bss.virtio_net")));
-static uint8_t rx_buffers[QUEUE_MAX][RX_BUFFER_SIZE] __attribute__((aligned(16), section(".bss.virtio_net")));
+static VirtqDesc rx_desc[QUEUE_MAX] __attribute__((aligned(64), section(".bss.virtio_net")));
+static VirtqAvail rx_avail __attribute__((aligned(64), section(".bss.virtio_net")));
+static VirtqUsed rx_used __attribute__((aligned(64), section(".bss.virtio_net")));
+static uint8_t rx_buffers[QUEUE_MAX][RX_BUFFER_SIZE] __attribute__((aligned(64), section(".bss.virtio_net")));
 
-static VirtqDesc tx_desc[1] __attribute__((aligned(16), section(".bss.virtio_net")));
-static VirtqAvail tx_avail __attribute__((aligned(16), section(".bss.virtio_net")));
-static VirtqUsed tx_used __attribute__((aligned(16), section(".bss.virtio_net")));
-static uint8_t tx_buffer[TX_BUFFER_SIZE] __attribute__((aligned(16), section(".bss.virtio_net")));
+static VirtqDesc tx_desc[1] __attribute__((aligned(64), section(".bss.virtio_net")));
+static VirtqAvail tx_avail __attribute__((aligned(64), section(".bss.virtio_net")));
+static VirtqUsed tx_used __attribute__((aligned(64), section(".bss.virtio_net")));
+static uint8_t tx_buffer[TX_BUFFER_SIZE] __attribute__((aligned(64), section(".bss.virtio_net")));
 
 static void barrier()
 {
     asm volatile("dmb osh\n dsb sy\n" ::: "memory");
+}
+
+/* VirtIO DMA accesses cacheable guest RAM. Keep descriptor/ring/buffer state
+   coherent with the device when the MMU enables the data cache. */
+static void dma_clean(const void* ptr, uint64_t bytes)
+{
+    uint64_t start = (uint64_t)ptr & ~63ULL;
+    uint64_t end = ((uint64_t)ptr + bytes + 63ULL) & ~63ULL;
+    for (uint64_t p = start; p < end; p += 64ULL)
+        asm volatile("dc cvac, %0" :: "r"(p) : "memory");
+    asm volatile("dsb sy" ::: "memory");
+}
+
+static void dma_invalidate(const void* ptr, uint64_t bytes)
+{
+    uint64_t start = (uint64_t)ptr & ~63ULL;
+    uint64_t end = ((uint64_t)ptr + bytes + 63ULL) & ~63ULL;
+    for (uint64_t p = start; p < end; p += 64ULL)
+        asm volatile("dc ivac, %0" :: "r"(p) : "memory");
+    asm volatile("dsb sy" ::: "memory");
+}
+
+static void dma_clean_invalidate(const void* ptr, uint64_t bytes)
+{
+    uint64_t start = (uint64_t)ptr & ~63ULL;
+    uint64_t end = ((uint64_t)ptr + bytes + 63ULL) & ~63ULL;
+    for (uint64_t p = start; p < end; p += 64ULL)
+        asm volatile("dc civac, %0" :: "r"(p) : "memory");
+    asm volatile("dsb sy" ::: "memory");
 }
 
 static void mmio_write(uint32_t off, uint32_t value)
@@ -112,20 +141,12 @@ static int setup_queue(uint16_t index, VirtqDesc* d, VirtqAvail* a, VirtqUsed* u
     mmio_write(V_QUEUE_DRIVER_HIGH, (uint32_t)(aa >> 32));
     mmio_write(V_QUEUE_DEVICE_LOW, (uint32_t)ua);
     mmio_write(V_QUEUE_DEVICE_HIGH, (uint32_t)(ua >> 32));
+    dma_clean(d, (uint64_t)n * sizeof(VirtqDesc));
+    dma_clean(a, sizeof(VirtqAvail));
+    dma_clean(u, sizeof(VirtqUsed));
     barrier();
     mmio_write(V_QUEUE_READY, 1);
     return mmio_read(V_QUEUE_READY) == 1;
-}
-
-static int wait_used(VirtqUsed* used, uint16_t old_idx)
-{
-    uint64_t start = timer_millis();
-    while (used->idx == old_idx)
-    {
-        barrier();
-        if (timer_millis() - start >= REQUEST_TIMEOUT_MS) return -110;
-    }
-    return 0;
 }
 
 void virtio_net_init()
@@ -201,12 +222,16 @@ void virtio_net_init()
         rx_desc[i].next = 0;
         rx_avail.ring[i] = (uint16_t)i;
     }
+    dma_clean(rx_desc, sizeof(rx_desc));
+    dma_clean_invalidate(rx_buffers, sizeof(rx_buffers));
+    dma_clean(rx_avail.ring, sizeof(rx_avail.ring));
     barrier();
     rx_avail.idx = (uint16_t)queue_size;
+    dma_clean(&rx_avail.idx, sizeof(rx_avail.idx));
     barrier();
-    mmio_write(V_QUEUE_SEL, 0);
-    mmio_write(V_QUEUE_NOTIFY, 0);
 
+    /* Kick RX only after DRIVER_OK: some VirtIO devices ignore queue
+       notifications before the driver is fully operational. */
     mmio_write(V_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
     barrier();
     if ((mmio_read(V_STATUS) & STATUS_DRIVER_OK) == 0)
@@ -216,6 +241,17 @@ void virtio_net_init()
         return;
     }
     ready = 1;
+
+    /* Re-publish RX descriptors and notify after DRIVER_OK so the device
+       starts consuming the receive queue reliably. */
+    dma_clean(rx_desc, sizeof(rx_desc));
+    dma_clean(rx_avail.ring, sizeof(rx_avail.ring));
+    dma_clean(&rx_avail.idx, sizeof(rx_avail.idx));
+    barrier();
+    mmio_write(V_QUEUE_SEL, 0);
+    mmio_write(V_QUEUE_NOTIFY, 0);
+    barrier();
+
     uart_puts("VirtIO Net: ready.\r\n");
 }
 
@@ -236,13 +272,25 @@ int virtio_net_send(const void* frame, uint32_t length)
     tx_desc[0].flags = 0;
     tx_desc[0].next = 0;
     uint16_t old = tx_avail.idx;
-    barrier();
     tx_avail.ring[old % 1] = 0;
+    dma_clean(tx_buffer, NET_HDR_SIZE + length);
+    dma_clean(tx_desc, sizeof(tx_desc));
+    dma_clean(tx_avail.ring, sizeof(tx_avail.ring));
+    barrier();
     tx_avail.idx = (uint16_t)(old + 1U);
+    dma_clean(&tx_avail.idx, sizeof(tx_avail.idx));
     barrier();
     mmio_write(V_QUEUE_SEL, 1);
     mmio_write(V_QUEUE_NOTIFY, 1);
-    if (wait_used(&tx_used, tx_last_used) < 0) return -110;
+    uint64_t wait_start = timer_millis();
+    while (1)
+    {
+        dma_invalidate(&tx_used, sizeof(tx_used));
+        if (tx_used.idx != tx_last_used) break;
+        barrier();
+        if (timer_millis() - wait_start >= REQUEST_TIMEOUT_MS) return -110;
+    }
+    dma_invalidate(&tx_used, sizeof(tx_used));
     if (tx_used.ring[tx_last_used % 1].id != 0) return -5;
     tx_last_used = (uint16_t)(tx_last_used + 1U);
     return 0;
@@ -252,9 +300,12 @@ int virtio_net_send(const void* frame, uint32_t length)
 static void recycle_rx_buffer(uint32_t descriptor_id)
 {
     if (!ready || queue_size <= 0 || descriptor_id >= (uint32_t)queue_size) return;
-    rx_avail.ring[rx_avail.idx % (uint16_t)queue_size] = (uint16_t)descriptor_id;
+    uint16_t slot = (uint16_t)(rx_avail.idx % (uint16_t)queue_size);
+    rx_avail.ring[slot] = (uint16_t)descriptor_id;
+    dma_clean(&rx_avail.ring[slot], sizeof(uint16_t));
     barrier();
     rx_avail.idx = (uint16_t)(rx_avail.idx + 1U);
+    dma_clean(&rx_avail.idx, sizeof(rx_avail.idx));
     barrier();
     mmio_write(V_QUEUE_SEL, 0);
     mmio_write(V_QUEUE_NOTIFY, 0);
@@ -263,6 +314,7 @@ static void recycle_rx_buffer(uint32_t descriptor_id)
 int virtio_net_receive(void* frame, uint32_t capacity)
 {
     if (!ready || !frame || capacity == 0) return -22;
+    dma_invalidate(&rx_used, sizeof(rx_used));
     if (rx_used.idx == rx_last_used) return 0;
     uint16_t slot = (uint16_t)(rx_last_used % (uint16_t)queue_size);
     volatile VirtqUsedElem* elem = &rx_used.ring[slot];
@@ -285,6 +337,7 @@ int virtio_net_receive(void* frame, uint32_t capacity)
         rx_last_used = (uint16_t)(rx_last_used + 1U);
         return -90; /* EMSGSIZE */
     }
+    dma_invalidate(&rx_buffers[elem->id][0], elem->len);
     const uint8_t* src = &rx_buffers[elem->id][NET_HDR_SIZE];
     uint8_t* dst = (uint8_t*)frame;
     for (uint32_t i = 0; i < frame_len; ++i) dst[i] = src[i];

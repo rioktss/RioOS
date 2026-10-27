@@ -17,6 +17,7 @@ static unsigned rx_head = 0, rx_count = 0;
 static uint8_t last_tx[1600];
 static uint32_t last_tx_length = 0;
 static int fake_present = 1, fake_ready = 1;
+static int tcp_response_sent = 0;
 
 static void fail(const char* message)
 {
@@ -98,6 +99,85 @@ static void make_ipv4_udp_frame(uint8_t* out, uint32_t* out_len,
     if (payload_len && payload) memcpy(udp + 8, payload, payload_len);
     *out_len = 14U + ip_len;
 }
+static uint16_t tcp_checksum_value(uint32_t source_ip, uint32_t target_ip,
+                                   const uint8_t* tcp, uint32_t tcp_len)
+{
+    uint8_t pseudo[12U + 1600U];
+    if (!tcp || tcp_len > 1600U) return 0;
+    put32(pseudo, source_ip); put32(pseudo + 4, target_ip);
+    pseudo[8] = 0; pseudo[9] = 6; put16(pseudo + 10, (uint16_t)tcp_len);
+    memcpy(pseudo + 12, tcp, tcp_len);
+    return checksum(pseudo, 12U + tcp_len);
+}
+static void make_ipv4_tcp_frame(uint8_t* out, uint32_t* out_len,
+                                uint32_t source_ip, uint16_t source_port,
+                                uint32_t target_ip, uint16_t target_port,
+                                uint32_t sequence, uint32_t acknowledgement,
+                                uint8_t flags, const uint8_t* payload, uint32_t payload_len)
+{
+    memset(out, 0, 1600);
+    memcpy(out, LOCAL_MAC, 6); memcpy(out + 6, DNS_MAC, 6); put16(out + 12, 0x0800U);
+    uint8_t* ip = out + 14;
+    uint16_t tcp_len = (uint16_t)(20U + payload_len);
+    uint16_t ip_len = (uint16_t)(20U + tcp_len);
+    ip[0] = 0x45; ip[8] = 64; ip[9] = 6;
+    put16(ip + 2, ip_len); put16(ip + 4, 2); put16(ip + 6, 0x4000U);
+    put32(ip + 12, source_ip); put32(ip + 16, target_ip);
+    put16(ip + 10, 0); put16(ip + 10, checksum(ip, 20));
+    uint8_t* tcp = ip + 20;
+    put16(tcp, source_port); put16(tcp + 2, target_port);
+    put32(tcp + 4, sequence); put32(tcp + 8, acknowledgement);
+    tcp[12] = 0x50; tcp[13] = flags; put16(tcp + 14, 4096);
+    put16(tcp + 16, 0); put16(tcp + 18, 0);
+    if (payload_len && payload) memcpy(tcp + 20, payload, payload_len);
+    put16(tcp + 16, tcp_checksum_value(source_ip, target_ip, tcp, tcp_len));
+    *out_len = 14U + ip_len;
+}
+static void maybe_reply_to_tcp(const uint8_t* frame, uint32_t length)
+{
+    if (!frame || length < 14U + 20U + 20U || be16(frame + 12) != 0x0800U) return;
+    const uint8_t* ip = frame + 14U;
+    if ((ip[0] >> 4) != 4 || ip[9] != 6 || be16(ip + 2) > length - 14U) return;
+    uint32_t ihl = (uint32_t)(ip[0] & 0x0FU) * 4U;
+    if (ihl < 20U || length < 14U + ihl + 20U) return;
+    const uint8_t* tcp = ip + ihl;
+    uint32_t thl = (uint32_t)(tcp[12] >> 4) * 4U;
+    if (thl < 20U || 14U + ihl + thl > length) return;
+    uint8_t flags = tcp[13];
+    uint32_t local_sequence = be16(tcp + 4U) << 16 | be16(tcp + 6U);
+    uint32_t payload_len = be16(ip + 2U) - ihl - thl;
+    uint32_t remote_ip = (uint32_t)ip[16] << 24 | (uint32_t)ip[17] << 16 |
+                         (uint32_t)ip[18] << 8 | ip[19];
+    uint16_t local_port = be16(tcp);
+    uint16_t remote_port = be16(tcp + 2U);
+    uint32_t remote_sequence = 7000U;
+    uint8_t response[1600]; uint32_t response_len = 0;
+    if ((flags & 0x02U) && !(flags & 0x10U))
+    {
+        make_ipv4_tcp_frame(response, &response_len, remote_ip, remote_port, LOCAL_IP,
+                            local_port, remote_sequence, local_sequence + 1U, 0x12U, 0, 0);
+        (void)enqueue_frame(response, response_len);
+    }
+    else if ((flags & 0x08U) && payload_len && !tcp_response_sent)
+    {
+        tcp_response_sent = 1;
+        make_ipv4_tcp_frame(response, &response_len, remote_ip, remote_port, LOCAL_IP,
+                            local_port, remote_sequence + 1U,
+                            local_sequence + payload_len, 0x10U, 0, 0);
+        (void)enqueue_frame(response, response_len);
+        const char body[] = "HTTP/1.0 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello";
+        make_ipv4_tcp_frame(response, &response_len, remote_ip, remote_port, LOCAL_IP,
+                            local_port, remote_sequence + 1U,
+                            local_sequence + payload_len, 0x18U,
+                            (const uint8_t*)body, (uint32_t)sizeof(body) - 1U);
+        (void)enqueue_frame(response, response_len);
+        make_ipv4_tcp_frame(response, &response_len, remote_ip, remote_port, LOCAL_IP,
+                            local_port, remote_sequence + 1U + (uint32_t)sizeof(body) - 1U,
+                            local_sequence + payload_len, 0x11U, 0, 0);
+        (void)enqueue_frame(response, response_len);
+    }
+}
+
 static void make_arp_reply(uint8_t* out, uint32_t* out_len, uint32_t sender_ip)
 {
     memset(out, 0, 1600);
@@ -159,6 +239,7 @@ int virtio_net_send(const void* frame, uint32_t length)
     if (!frame || length > sizeof(last_tx)) return -22;
     memcpy(last_tx, frame, length); last_tx_length = length;
     maybe_reply_to_dns((const uint8_t*)frame, length);
+    maybe_reply_to_tcp((const uint8_t*)frame, length);
     return 0;
 }
 int virtio_net_receive(void* frame, uint32_t capacity)
@@ -259,12 +340,32 @@ int main()
     CHECK(net_dns_set_server(0) == -22, "reject invalid DNS server");
     CHECK(net_dns_server() == DNS_IP, "default DNS server retained");
 
+    int tcp_socket = net_tcp_socket(77);
+    int foreign_tcp_socket = net_tcp_socket(88);
+    CHECK(tcp_socket > 0 && foreign_tcp_socket > 0, "allocate owner-scoped TCP sockets");
+    CHECK(net_tcp_connect(88, tcp_socket, DNS_IP, 80, 1000) == -9,
+          "reject TCP socket cross-owner connect");
+    CHECK(net_tcp_connect(77, tcp_socket, DNS_IP, 80, 1000) == 0,
+          "complete TCP three-way handshake with test peer");
+    const char request[] = "GET / HTTP/1.0\r\n\r\n";
+    CHECK(net_tcp_send(77, tcp_socket, request, (uint32_t)sizeof(request) - 1U, 1000) ==
+          (int)sizeof(request) - 1, "TCP send waits for ACK");
+    char http_response[256]; memset(http_response, 0, sizeof(http_response));
+    int http_bytes = net_tcp_recv(77, tcp_socket, http_response, sizeof(http_response), 1000);
+    CHECK(http_bytes > 0 && strstr(http_response, "HTTP/1.0 200 OK") != 0,
+          "TCP receives HTTP response from peer");
+    CHECK(net_tcp_recv(77, tcp_socket, http_response, sizeof(http_response), 1000) == 0,
+          "TCP FIN is exposed as EOF");
+    CHECK(net_tcp_close(88, tcp_socket) == -9, "TCP close enforces socket ownership");
+    CHECK(net_tcp_close(77, tcp_socket) == 0, "TCP socket close succeeds");
+    net_tcp_close_all_for(88);
+
     CHECK(net_udp_close(88, socket) == -9, "wrong owner cannot close socket");
     CHECK(net_udp_close(77, socket) == 0, "close UDP socket");
     CHECK(net_udp_sendto(77, socket, DNS_IP, 9000, outgoing, 4) == -9, "closed socket rejected");
     net_udp_close_all_for(88);
     CHECK(net_udp_bind(88, other, 0) == -9, "close-all releases process sockets");
 
-    puts("NET HOST TEST: PASS (IPv4, ARP, UDP sockets/checksum, DNS A lookup)");
+    puts("NET HOST TEST: PASS (IPv4, ARP, UDP/DNS, TCP handshake/send/receive/close)");
     return 0;
 }

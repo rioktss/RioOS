@@ -644,6 +644,73 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
             break;
         }
 
+        case SYS_NET_TCP_SOCKET:
+        {
+            int owner_pid = from_user ? user_current_pid() : scheduler_current_pid();
+            if (owner_pid < 0) owner_pid = 0;
+            result = (uint64_t)(int64_t)net_tcp_socket(owner_pid);
+            break;
+        }
+
+        case SYS_NET_TCP_CONNECT:
+        {
+            int owner_pid = from_user ? user_current_pid() : scheduler_current_pid();
+            if (owner_pid < 0) owner_pid = 0;
+            if (frame->x[0] > 0x7FFFFFFFULL || frame->x[1] > 0xFFFFFFFFULL ||
+                frame->x[2] > 65535ULL || frame->x[3] == 0 ||
+                frame->x[3] > NET_TCP_MAX_TIMEOUT_MS)
+                result = (uint64_t)-22;
+            else
+                result = (uint64_t)(int64_t)net_tcp_connect(owner_pid, (int)frame->x[0],
+                    (uint32_t)frame->x[1], (uint16_t)frame->x[2], (uint32_t)frame->x[3]);
+            break;
+        }
+
+        case SYS_NET_TCP_SEND:
+        {
+            int owner_pid = from_user ? user_current_pid() : scheduler_current_pid();
+            if (owner_pid < 0) owner_pid = 0;
+            const void* buffer = (const void*)frame->x[1];
+            uint64_t length = frame->x[2];
+            uint64_t timeout_ms = frame->x[3];
+            if (frame->x[0] > 0x7FFFFFFFULL || length > NET_TCP_MAX_IO ||
+                timeout_ms == 0 || timeout_ms > NET_TCP_MAX_TIMEOUT_MS)
+                result = (uint64_t)-22;
+            else if (length && (!buffer || (from_user && !syscall_user_pointer_ok(buffer, length))))
+                result = (uint64_t)-14;
+            else
+                result = (uint64_t)(int64_t)net_tcp_send(owner_pid, (int)frame->x[0],
+                    buffer, (uint32_t)length, (uint32_t)timeout_ms);
+            break;
+        }
+
+        case SYS_NET_TCP_RECV:
+        {
+            int owner_pid = from_user ? user_current_pid() : scheduler_current_pid();
+            if (owner_pid < 0) owner_pid = 0;
+            void* buffer = (void*)frame->x[1];
+            uint64_t capacity = frame->x[2];
+            uint64_t timeout_ms = frame->x[3];
+            if (frame->x[0] > 0x7FFFFFFFULL || capacity == 0 ||
+                capacity > NET_TCP_MAX_IO || timeout_ms > NET_TCP_MAX_TIMEOUT_MS)
+                result = (uint64_t)-22;
+            else if (!buffer || (from_user && !syscall_user_pointer_ok_write(buffer, capacity)))
+                result = (uint64_t)-14;
+            else
+                result = (uint64_t)(int64_t)net_tcp_recv(owner_pid, (int)frame->x[0],
+                    buffer, (uint32_t)capacity, (uint32_t)timeout_ms);
+            break;
+        }
+
+        case SYS_NET_TCP_CLOSE:
+        {
+            int owner_pid = from_user ? user_current_pid() : scheduler_current_pid();
+            if (owner_pid < 0) owner_pid = 0;
+            if (frame->x[0] > 0x7FFFFFFFULL) result = (uint64_t)-9;
+            else result = (uint64_t)(int64_t)net_tcp_close(owner_pid, (int)frame->x[0]);
+            break;
+        }
+
         default:
             result = (uint64_t)-38;
             break;

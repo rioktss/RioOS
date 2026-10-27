@@ -59,7 +59,12 @@ enum UserApiSyscall
     USER_SYS_NET_UDP_SENDTO = 28,
     USER_SYS_NET_UDP_RECVFROM = 29,
     USER_SYS_NET_UDP_CLOSE = 30,
-    USER_SYS_NET_DNS_LOOKUP = 31
+    USER_SYS_NET_DNS_LOOKUP = 31,
+    USER_SYS_NET_TCP_SOCKET = 32,
+    USER_SYS_NET_TCP_CONNECT = 33,
+    USER_SYS_NET_TCP_SEND = 34,
+    USER_SYS_NET_TCP_RECV = 35,
+    USER_SYS_NET_TCP_CLOSE = 36
 };
 
 static inline uint64_t user_syscall0(uint64_t nr)
@@ -94,6 +99,18 @@ static inline uint64_t user_syscall3(uint64_t nr, uint64_t a0, uint64_t a1, uint
     register uint64_t x2 asm("x2") = a2;
     register uint64_t x8 asm("x8") = nr;
     asm volatile("svc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x8) :: "memory");
+    return x0;
+}
+
+static inline uint64_t user_syscall4(uint64_t nr, uint64_t a0, uint64_t a1,
+                                     uint64_t a2, uint64_t a3)
+{
+    register uint64_t x0 asm("x0") = a0;
+    register uint64_t x1 asm("x1") = a1;
+    register uint64_t x2 asm("x2") = a2;
+    register uint64_t x3 asm("x3") = a3;
+    register uint64_t x8 asm("x8") = nr;
+    asm volatile("svc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x8) :: "memory");
     return x0;
 }
 
@@ -152,5 +169,14 @@ static inline int64_t user_udp_recvfrom(int64_t socket, uint32_t* source_ip, uin
 static inline int64_t user_udp_close(int64_t socket) { return (int64_t)user_syscall1(USER_SYS_NET_UDP_CLOSE, (uint64_t)socket); }
 static inline int64_t user_dns_lookup(const char* hostname, uint32_t* out_ip, uint32_t timeout_ms)
 { return (int64_t)user_syscall3(USER_SYS_NET_DNS_LOOKUP, (uint64_t)hostname, (uint64_t)out_ip, timeout_ms); }
+static inline int64_t user_tcp_socket(void) { return (int64_t)user_syscall0(USER_SYS_NET_TCP_SOCKET); }
+static inline int64_t user_tcp_connect(int64_t socket, uint32_t ip, uint16_t port, uint32_t timeout_ms)
+{ return (int64_t)user_syscall4(USER_SYS_NET_TCP_CONNECT, (uint64_t)socket, ip, port, timeout_ms); }
+static inline int64_t user_tcp_send(int64_t socket, const void* data, uint32_t length, uint32_t timeout_ms)
+{ return (int64_t)user_syscall4(USER_SYS_NET_TCP_SEND, (uint64_t)socket, (uint64_t)data, length, timeout_ms); }
+static inline int64_t user_tcp_recv(int64_t socket, void* data, uint32_t capacity, uint32_t timeout_ms)
+{ return (int64_t)user_syscall4(USER_SYS_NET_TCP_RECV, (uint64_t)socket, (uint64_t)data, capacity, timeout_ms); }
+static inline int64_t user_tcp_close(int64_t socket)
+{ return (int64_t)user_syscall1(USER_SYS_NET_TCP_CLOSE, (uint64_t)socket); }
 
 #endif

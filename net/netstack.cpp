@@ -12,6 +12,7 @@
 #define ARP_OP_REPLY 2U
 #define IP_PROTO_ICMP 1U
 #define IP_PROTO_UDP 17U
+#define IP_PROTO_TCP 6U
 #define ICMP_ECHO_REPLY 0U
 #define ICMP_ECHO_REQUEST 8U
 #define NET_IP ((10U<<24)|(0U<<16)|(2U<<8)|15U)
@@ -29,6 +30,23 @@
 #define DNS_PORT 53U
 #define UDP_HEADER_SIZE 8U
 #define UDP_FRAME_MAX (sizeof(EthernetHeader) + sizeof(Ipv4Header) + UDP_HEADER_SIZE + NET_UDP_MAX_PAYLOAD)
+#define TCP_SOCKET_COUNT 4U
+#define TCP_RX_BUFFER_SIZE NET_TCP_MAX_IO
+#define TCP_SEGMENT_MAX 536U
+#define TCP_HEADER_SIZE 20U
+#define TCP_RETRY_MS 500U
+#define TCP_MAX_RETRIES 5U
+#define TCP_FLAG_FIN 0x01U
+#define TCP_FLAG_SYN 0x02U
+#define TCP_FLAG_RST 0x04U
+#define TCP_FLAG_PSH 0x08U
+#define TCP_FLAG_ACK 0x10U
+#define TCP_STATE_CLOSED 0U
+#define TCP_STATE_SYN_SENT 1U
+#define TCP_STATE_ESTABLISHED 2U
+#define TCP_STATE_CLOSE_WAIT 3U
+#define TCP_STATE_FIN_WAIT 4U
+#define TCP_STATE_RESET 5U
 
 struct __attribute__((packed)) EthernetHeader
 {
@@ -81,6 +99,19 @@ struct __attribute__((packed)) UdpHeader
     uint16_t checksum;
 };
 
+struct TcpHeader
+{
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint32_t seq;
+    uint32_t ack;
+    uint8_t offset_reserved;
+    uint8_t flags;
+    uint16_t window;
+    uint16_t checksum;
+    uint16_t urgent;
+} __attribute__((packed));
+
 struct UdpDatagram
 {
     uint32_t source_ip;
@@ -100,6 +131,23 @@ struct UdpSocketState
     UdpDatagram queue[UDP_QUEUE_DEPTH];
 };
 
+struct TcpSocketState
+{
+    int used;
+    int owner_pid;
+    uint8_t state;
+    uint8_t peer_closed;
+    uint16_t local_port;
+    uint16_t remote_port;
+    uint32_t remote_ip;
+    uint32_t snd_una;
+    uint32_t snd_nxt;
+    uint32_t rcv_nxt;
+    uint16_t rx_head;
+    uint16_t rx_count;
+    uint8_t rx_buffer[TCP_RX_BUFFER_SIZE];
+};
+
 static int ready_state = 0;
 static uint8_t local_mac[6];
 static uint32_t next_ip_id = 1;
@@ -115,10 +163,17 @@ static uint8_t rx_frame[MAX_FRAME] __attribute__((aligned(16)));
 static uint8_t tx_frame[MAX_FRAME] __attribute__((aligned(16)));
 static UdpSocketState udp_sockets[UDP_SOCKET_COUNT];
 static uint16_t udp_next_ephemeral = UDP_EPHEMERAL_FIRST;
+static uint16_t tcp_next_ephemeral = UDP_EPHEMERAL_FIRST;
+static TcpSocketState tcp_sockets[TCP_SOCKET_COUNT];
 static uint16_t dns_query_id = 0x5249U;
 static uint32_t dns_server_ip = DNS_DEFAULT_SERVER;
 
 static int arp_resolve(uint32_t ip, uint8_t mac[6], uint32_t timeout_ms);
+static void tcp_input(uint32_t source_ip, uint32_t dest_ip,
+                      const uint8_t* bytes, uint32_t length);
+static int tcp_send_segment(TcpSocketState* socket, uint8_t flags,
+                            uint32_t sequence, uint32_t acknowledgement,
+                            const uint8_t* payload, uint32_t payload_length);
 
 // --- helpers be ---
 
@@ -249,6 +304,49 @@ static uint16_t udp_checksum_ipv4(uint32_t source_ip, uint32_t dest_ip,
     for (uint32_t i = 0; i < length; ++i)
         bytes[12U + i] = datagram[i];
     return checksum16(bytes, 12U + length);
+}
+
+static uint16_t tcp_checksum_ipv4(uint32_t source_ip, uint32_t dest_ip,
+                                  const uint8_t* segment, uint32_t length)
+{
+    uint8_t bytes[12U + MAX_FRAME];
+    if (!segment || length < TCP_HEADER_SIZE || length > MAX_FRAME - NET_ETH_HDR - sizeof(Ipv4Header))
+        return 0;
+    write_be32(bytes, source_ip);
+    write_be32(bytes + 4U, dest_ip);
+    bytes[8] = 0;
+    bytes[9] = IP_PROTO_TCP;
+    write_be16(bytes + 10U, (uint16_t)length);
+    for (uint32_t i = 0; i < length; ++i) bytes[12U + i] = segment[i];
+    return checksum16(bytes, 12U + length);
+}
+
+static int tcp_seq_after_eq(uint32_t a, uint32_t b)
+{
+    return (int32_t)(a - b) >= 0;
+}
+
+static TcpSocketState* tcp_get_socket(int owner_pid, int handle)
+{
+    if (owner_pid < 0 || handle < 1 || handle > (int)TCP_SOCKET_COUNT) return 0;
+    TcpSocketState* socket = &tcp_sockets[(uint32_t)(handle - 1)];
+    if (!socket->used || socket->owner_pid != owner_pid) return 0;
+    return socket;
+}
+
+static int tcp_port_in_use(uint16_t port, const TcpSocketState* except)
+{
+    if (port == 0) return 0;
+    for (uint32_t i = 0; i < TCP_SOCKET_COUNT; ++i)
+        if (tcp_sockets[i].used && &tcp_sockets[i] != except && tcp_sockets[i].local_port == port)
+            return 1;
+    return 0;
+}
+
+static uint16_t tcp_receive_window(const TcpSocketState* socket)
+{
+    if (!socket || socket->rx_count >= TCP_RX_BUFFER_SIZE) return 0;
+    return (uint16_t)(TCP_RX_BUFFER_SIZE - socket->rx_count);
 }
 
 static void udp_input(uint32_t source_ip, uint32_t dest_ip,
@@ -561,6 +659,12 @@ int net_poll_once()
             udp_input(source_ip, dest_ip, (const uint8_t*)ip + ihl, total - ihl);
             return 1;
         }
+        if (ip->proto == IP_PROTO_TCP)
+        {
+            if (total < (uint16_t)(ihl + TCP_HEADER_SIZE)) return -5;
+            tcp_input(source_ip, dest_ip, (const uint8_t*)ip + ihl, total - ihl);
+            return 1;
+        }
         if (ip->proto != IP_PROTO_ICMP) return 1;
         if (total < (uint16_t)(ihl + sizeof(IcmpHeader))) return -5;
 
@@ -626,6 +730,387 @@ static int arp_resolve(uint32_t ip, uint8_t mac[6], uint32_t timeout_ms)
     }
 
     return -1;
+}
+
+static int tcp_send_segment(TcpSocketState* socket, uint8_t flags,
+                            uint32_t sequence, uint32_t acknowledgement,
+                            const uint8_t* payload, uint32_t payload_length)
+{
+    if (!socket || !socket->used || socket->remote_ip == 0 || socket->remote_port == 0)
+        return -22;
+    if (payload_length > TCP_SEGMENT_MAX || (payload_length && !payload)) return -90;
+
+    uint32_t next_hop = ((socket->remote_ip & NET_MASK) == (NET_IP & NET_MASK))
+        ? socket->remote_ip : NET_GATEWAY;
+    uint8_t target_mac[6];
+    if (arp_resolve(next_hop, target_mac, 1000U) < 0) return -110;
+
+    uint32_t tcp_length = TCP_HEADER_SIZE + payload_length;
+    uint32_t ip_length = sizeof(Ipv4Header) + tcp_length;
+    uint32_t frame_length = NET_ETH_HDR + ip_length;
+    if (frame_length > sizeof(tx_frame)) return -90;
+
+    EthernetHeader* ethernet = (EthernetHeader*)tx_frame;
+    copy6(ethernet->dst, target_mac);
+    copy6(ethernet->src, local_mac);
+    write_be16(&ethernet->type, ETH_TYPE_IPV4);
+
+    Ipv4Header* ip = (Ipv4Header*)(tx_frame + NET_ETH_HDR);
+    ip->ver_ihl = 0x45;
+    ip->tos = 0;
+    write_be16(&ip->total_len, (uint16_t)ip_length);
+    write_be16(&ip->id, (uint16_t)next_ip_id++);
+    write_be16(&ip->frag, 0x4000U);
+    ip->ttl = 64;
+    ip->proto = IP_PROTO_TCP;
+    write_be16(&ip->checksum, 0);
+    write_be32(&ip->src, NET_IP);
+    write_be32(&ip->dst, socket->remote_ip);
+    write_be16(&ip->checksum, checksum16((const uint8_t*)ip, sizeof(Ipv4Header)));
+
+    uint8_t* tcp = (uint8_t*)ip + sizeof(Ipv4Header);
+    for (uint32_t i = 0; i < TCP_HEADER_SIZE; ++i) tcp[i] = 0;
+    write_be16(tcp, socket->local_port);
+    write_be16(tcp + 2U, socket->remote_port);
+    write_be32(tcp + 4U, sequence);
+    write_be32(tcp + 8U, acknowledgement);
+    tcp[12] = 0x50U; /* 20-byte TCP header, no options */
+    tcp[13] = flags;
+    write_be16(tcp + 14U, tcp_receive_window(socket));
+    write_be16(tcp + 16U, 0);
+    write_be16(tcp + 18U, 0);
+    for (uint32_t i = 0; i < payload_length; ++i) tcp[TCP_HEADER_SIZE + i] = payload[i];
+    write_be16(tcp + 16U, tcp_checksum_ipv4(NET_IP, socket->remote_ip, tcp, tcp_length));
+
+    return virtio_net_send(tx_frame, frame_length) == 0 ? 0 : -5;
+}
+
+static void tcp_input(uint32_t source_ip, uint32_t dest_ip,
+                      const uint8_t* bytes, uint32_t length)
+{
+    if (!bytes || length < TCP_HEADER_SIZE || dest_ip != NET_IP) return;
+    uint16_t source_port = read_be16(bytes);
+    uint16_t dest_port = read_be16(bytes + 2U);
+    uint32_t sequence = read_be32(bytes + 4U);
+    uint32_t acknowledgement = read_be32(bytes + 8U);
+    uint32_t header_length = (uint32_t)(bytes[12] >> 4) * 4U;
+    uint8_t flags = bytes[13];
+    if (source_port == 0 || dest_port == 0 || header_length < TCP_HEADER_SIZE ||
+        header_length > length || tcp_checksum_ipv4(source_ip, dest_ip, bytes, length) != 0)
+        return;
+
+    TcpSocketState* socket = 0;
+    for (uint32_t i = 0; i < TCP_SOCKET_COUNT; ++i)
+    {
+        TcpSocketState* candidate = &tcp_sockets[i];
+        if (candidate->used && candidate->local_port == dest_port &&
+            candidate->remote_ip == source_ip && candidate->remote_port == source_port &&
+            candidate->state != TCP_STATE_CLOSED)
+        {
+            socket = candidate;
+            break;
+        }
+    }
+    if (!socket) return;
+
+    if (flags & TCP_FLAG_RST)
+    {
+        socket->state = TCP_STATE_RESET;
+        socket->peer_closed = 1;
+        return;
+    }
+
+    if (socket->state == TCP_STATE_SYN_SENT)
+    {
+        if ((flags & (TCP_FLAG_SYN | TCP_FLAG_ACK)) == (TCP_FLAG_SYN | TCP_FLAG_ACK) &&
+            acknowledgement == socket->snd_nxt)
+        {
+            socket->rcv_nxt = sequence + 1U;
+            socket->snd_una = acknowledgement;
+            socket->state = TCP_STATE_ESTABLISHED;
+            (void)tcp_send_segment(socket, TCP_FLAG_ACK, socket->snd_nxt,
+                                   socket->rcv_nxt, 0, 0);
+        }
+        return;
+    }
+
+    if (flags & TCP_FLAG_ACK)
+    {
+        if (tcp_seq_after_eq(acknowledgement, socket->snd_una) &&
+            tcp_seq_after_eq(socket->snd_nxt, acknowledgement))
+            socket->snd_una = acknowledgement;
+    }
+
+    uint32_t payload_length = length - header_length;
+    int accepted_payload = 0;
+    int should_ack = 0;
+    if (payload_length != 0)
+    {
+        if (sequence == socket->rcv_nxt &&
+            payload_length <= (uint32_t)(TCP_RX_BUFFER_SIZE - socket->rx_count))
+        {
+            uint32_t tail = (socket->rx_head + socket->rx_count) % TCP_RX_BUFFER_SIZE;
+            for (uint32_t i = 0; i < payload_length; ++i)
+                socket->rx_buffer[(tail + i) % TCP_RX_BUFFER_SIZE] = bytes[header_length + i];
+            socket->rx_count = (uint16_t)(socket->rx_count + payload_length);
+            socket->rcv_nxt += payload_length;
+            accepted_payload = 1;
+        }
+        should_ack = 1; /* ACK duplicates/out-of-order data to request the expected byte. */
+    }
+
+    if (flags & TCP_FLAG_FIN)
+    {
+        uint32_t fin_position = sequence + payload_length;
+        if ((accepted_payload || payload_length == 0) && fin_position == socket->rcv_nxt)
+        {
+            ++socket->rcv_nxt;
+            socket->peer_closed = 1;
+            if (socket->state == TCP_STATE_FIN_WAIT) socket->state = TCP_STATE_CLOSED;
+            else if (socket->state == TCP_STATE_ESTABLISHED) socket->state = TCP_STATE_CLOSE_WAIT;
+            should_ack = 1;
+        }
+    }
+
+    if (should_ack)
+        (void)tcp_send_segment(socket, TCP_FLAG_ACK, socket->snd_nxt,
+                               socket->rcv_nxt, 0, 0);
+}
+
+int net_tcp_socket(int owner_pid)
+{
+    if (!ready_state) return -19;
+    if (owner_pid < 0) return -22;
+    for (uint32_t i = 0; i < TCP_SOCKET_COUNT; ++i)
+    {
+        TcpSocketState* socket = &tcp_sockets[i];
+        if (socket->used) continue;
+        socket->used = 1;
+        socket->owner_pid = owner_pid;
+        socket->state = TCP_STATE_CLOSED;
+        socket->peer_closed = 0;
+        socket->local_port = 0;
+        socket->remote_port = 0;
+        socket->remote_ip = 0;
+        socket->snd_una = socket->snd_nxt = socket->rcv_nxt = 0;
+        socket->rx_head = socket->rx_count = 0;
+        return (int)i + 1;
+    }
+    return -24;
+}
+
+int net_tcp_connect(int owner_pid, int socket_handle, uint32_t target_ip,
+                    uint16_t target_port, uint32_t timeout_ms)
+{
+    TcpSocketState* socket = tcp_get_socket(owner_pid, socket_handle);
+    if (!socket) return -9;
+    if (!ready_state) return -19;
+    if (socket->state != TCP_STATE_CLOSED || target_ip == 0 || target_ip == NET_BROADCAST ||
+        (target_ip & 0xF0000000U) == 0xE0000000U || target_port == 0 ||
+        timeout_ms == 0 || timeout_ms > NET_TCP_MAX_TIMEOUT_MS)
+        return -22;
+
+    uint32_t attempts = (uint32_t)UDP_EPHEMERAL_LAST - UDP_EPHEMERAL_FIRST + 1U;
+    while (attempts--)
+    {
+        uint16_t port = tcp_next_ephemeral;
+        tcp_next_ephemeral = port == UDP_EPHEMERAL_LAST
+            ? (uint16_t)UDP_EPHEMERAL_FIRST : (uint16_t)(port + 1U);
+        if (!tcp_port_in_use(port, socket))
+        {
+            socket->local_port = port;
+            break;
+        }
+    }
+    if (socket->local_port == 0) return -98;
+
+    socket->remote_ip = target_ip;
+    socket->remote_port = target_port;
+    uint32_t initial_sequence = (uint32_t)timer_millis() ^ target_ip ^
+        ((uint32_t)socket->local_port << 16) ^ target_port;
+    if (initial_sequence == 0) initial_sequence = 1;
+    socket->snd_una = initial_sequence;
+    socket->snd_nxt = initial_sequence + 1U;
+    socket->rcv_nxt = 0;
+    socket->state = TCP_STATE_SYN_SENT;
+
+    int rc = tcp_send_segment(socket, TCP_FLAG_SYN, initial_sequence, 0, 0, 0);
+    if (rc != 0)
+    {
+        socket->state = TCP_STATE_CLOSED;
+        socket->local_port = 0;
+        return rc;
+    }
+
+    uint64_t start = timer_millis();
+    uint64_t last_send = start;
+    uint32_t retries = 0;
+    while (timer_millis() - start < timeout_ms)
+    {
+        (void)net_poll_once();
+        if (socket->state == TCP_STATE_ESTABLISHED) return 0;
+        if (socket->state == TCP_STATE_RESET)
+        {
+            socket->state = TCP_STATE_CLOSED;
+            socket->local_port = 0;
+            return -111;
+        }
+        uint64_t now = timer_millis();
+        if (now - last_send >= TCP_RETRY_MS)
+        {
+            if (retries++ >= TCP_MAX_RETRIES) break;
+            rc = tcp_send_segment(socket, TCP_FLAG_SYN, initial_sequence, 0, 0, 0);
+            if (rc != 0) break;
+            last_send = now;
+        }
+    }
+    socket->state = TCP_STATE_CLOSED;
+    socket->local_port = 0;
+    socket->remote_ip = 0;
+    socket->remote_port = 0;
+    return -110;
+}
+
+int net_tcp_send(int owner_pid, int socket_handle, const void* data,
+                 uint32_t length, uint32_t timeout_ms)
+{
+    TcpSocketState* socket = tcp_get_socket(owner_pid, socket_handle);
+    if (!socket) return -9;
+    if (!ready_state) return -19;
+    if ((length && !data) || length > NET_TCP_MAX_IO ||
+        timeout_ms == 0 || timeout_ms > NET_TCP_MAX_TIMEOUT_MS)
+        return -22;
+    if (socket->state != TCP_STATE_ESTABLISHED && socket->state != TCP_STATE_CLOSE_WAIT)
+        return socket->state == TCP_STATE_RESET ? -104 : -107;
+    if (length == 0) return 0;
+
+    const uint8_t* input = (const uint8_t*)data;
+    uint32_t sent_total = 0;
+    uint64_t start = timer_millis();
+    while (sent_total < length)
+    {
+        uint32_t chunk = length - sent_total;
+        if (chunk > TCP_SEGMENT_MAX) chunk = TCP_SEGMENT_MAX;
+        uint32_t sequence = socket->snd_nxt;
+        uint32_t end_sequence = sequence + chunk;
+        socket->snd_nxt = end_sequence;
+        uint32_t retries = 0;
+        uint64_t last_send = timer_millis();
+        int rc = tcp_send_segment(socket, TCP_FLAG_ACK | TCP_FLAG_PSH, sequence,
+                                  socket->rcv_nxt, input + sent_total, chunk);
+        if (rc != 0)
+        {
+            socket->snd_nxt = sequence;
+            return sent_total ? (int)sent_total : rc;
+        }
+
+        while (!tcp_seq_after_eq(socket->snd_una, end_sequence))
+        {
+            if (socket->state == TCP_STATE_RESET) return sent_total ? (int)sent_total : -104;
+            if (socket->peer_closed && socket->state != TCP_STATE_CLOSE_WAIT)
+                return sent_total ? (int)sent_total : -32;
+            uint64_t now = timer_millis();
+            if (now - start >= timeout_ms) return sent_total ? (int)sent_total : -110;
+            if (now - last_send >= TCP_RETRY_MS)
+            {
+                if (retries++ >= TCP_MAX_RETRIES) return sent_total ? (int)sent_total : -110;
+                rc = tcp_send_segment(socket, TCP_FLAG_ACK | TCP_FLAG_PSH, sequence,
+                                     socket->rcv_nxt, input + sent_total, chunk);
+                if (rc != 0) return sent_total ? (int)sent_total : rc;
+                last_send = now;
+            }
+            (void)net_poll_once();
+        }
+        sent_total += chunk;
+    }
+    return (int)sent_total;
+}
+
+int net_tcp_recv(int owner_pid, int socket_handle, void* data,
+                 uint32_t capacity, uint32_t timeout_ms)
+{
+    TcpSocketState* socket = tcp_get_socket(owner_pid, socket_handle);
+    if (!socket) return -9;
+    if (!ready_state) return -19;
+    if (!data || capacity == 0 || capacity > NET_TCP_MAX_IO ||
+        timeout_ms > NET_TCP_MAX_TIMEOUT_MS)
+        return -22;
+
+    uint64_t start = timer_millis();
+    for (;;)
+    {
+        if (socket->rx_count != 0)
+        {
+            uint32_t copy_length = socket->rx_count;
+            if (copy_length > capacity) copy_length = capacity;
+            uint8_t* output = (uint8_t*)data;
+            for (uint32_t i = 0; i < copy_length; ++i)
+                output[i] = socket->rx_buffer[(socket->rx_head + i) % TCP_RX_BUFFER_SIZE];
+            socket->rx_head = (uint16_t)((socket->rx_head + copy_length) % TCP_RX_BUFFER_SIZE);
+            socket->rx_count = (uint16_t)(socket->rx_count - copy_length);
+            if (socket->state == TCP_STATE_ESTABLISHED || socket->state == TCP_STATE_CLOSE_WAIT)
+                (void)tcp_send_segment(socket, TCP_FLAG_ACK, socket->snd_nxt,
+                                       socket->rcv_nxt, 0, 0);
+            return (int)copy_length;
+        }
+        if (socket->state == TCP_STATE_RESET) return -104;
+        if (socket->peer_closed || socket->state == TCP_STATE_CLOSED) return 0;
+        if (socket->state != TCP_STATE_ESTABLISHED && socket->state != TCP_STATE_CLOSE_WAIT)
+            return -107;
+        if (timer_millis() - start >= timeout_ms) return -110;
+        (void)net_poll_once();
+    }
+}
+
+int net_tcp_close(int owner_pid, int socket_handle)
+{
+    TcpSocketState* socket = tcp_get_socket(owner_pid, socket_handle);
+    if (!socket) return -9;
+    int rc = 0;
+    if (socket->state == TCP_STATE_ESTABLISHED || socket->state == TCP_STATE_CLOSE_WAIT)
+    {
+        uint32_t sequence = socket->snd_nxt;
+        rc = tcp_send_segment(socket, TCP_FLAG_FIN | TCP_FLAG_ACK, sequence,
+                              socket->rcv_nxt, 0, 0);
+        if (rc == 0)
+        {
+            ++socket->snd_nxt;
+            socket->state = TCP_STATE_FIN_WAIT;
+            uint64_t start = timer_millis();
+            while (!socket->peer_closed && timer_millis() - start < 250U)
+                (void)net_poll_once();
+        }
+    }
+    socket->used = 0;
+    socket->owner_pid = -1;
+    socket->state = TCP_STATE_CLOSED;
+    socket->peer_closed = 0;
+    socket->local_port = 0;
+    socket->remote_port = 0;
+    socket->remote_ip = 0;
+    socket->rx_head = socket->rx_count = 0;
+    return rc;
+}
+
+void net_tcp_close_all_for(int owner_pid)
+{
+    if (owner_pid < 0) return;
+    for (uint32_t i = 0; i < TCP_SOCKET_COUNT; ++i)
+    {
+        TcpSocketState* socket = &tcp_sockets[i];
+        if (!socket->used || socket->owner_pid != owner_pid) continue;
+        if (socket->state == TCP_STATE_ESTABLISHED || socket->state == TCP_STATE_CLOSE_WAIT)
+            (void)tcp_send_segment(socket, TCP_FLAG_FIN | TCP_FLAG_ACK, socket->snd_nxt,
+                                   socket->rcv_nxt, 0, 0);
+        socket->used = 0;
+        socket->owner_pid = -1;
+        socket->state = TCP_STATE_CLOSED;
+        socket->peer_closed = 0;
+        socket->local_port = 0;
+        socket->remote_port = 0;
+        socket->remote_ip = 0;
+        socket->rx_head = socket->rx_count = 0;
+    }
 }
 
 int net_udp_socket(int owner_pid)
@@ -1082,6 +1567,22 @@ void net_init()
         udp_sockets[i].queue_head = 0;
         udp_sockets[i].queue_count = 0;
         udp_sockets[i].dropped = 0;
+    }
+    tcp_next_ephemeral = UDP_EPHEMERAL_FIRST;
+    for (uint32_t i = 0; i < TCP_SOCKET_COUNT; ++i)
+    {
+        tcp_sockets[i].used = 0;
+        tcp_sockets[i].owner_pid = -1;
+        tcp_sockets[i].state = TCP_STATE_CLOSED;
+        tcp_sockets[i].peer_closed = 0;
+        tcp_sockets[i].local_port = 0;
+        tcp_sockets[i].remote_port = 0;
+        tcp_sockets[i].remote_ip = 0;
+        tcp_sockets[i].snd_una = 0;
+        tcp_sockets[i].snd_nxt = 0;
+        tcp_sockets[i].rcv_nxt = 0;
+        tcp_sockets[i].rx_head = 0;
+        tcp_sockets[i].rx_count = 0;
     }
     for (int i = 0; i < ARP_CACHE_SIZE; i++)
     {
