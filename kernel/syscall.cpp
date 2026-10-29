@@ -226,6 +226,9 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
             }
             for (uint64_t i = 0; i < len; ++i)
                 uart_putc(buf[i]);
+#ifndef HOST_TEST
+            uart_flush_output(); /* show the program's output right away */
+#endif
             result = len;
             break;
         }

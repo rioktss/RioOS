@@ -14,16 +14,16 @@
 - File-descriptor host test (`tests/fd_host_test.cpp`): read/write/seek/append/truncate, access modes, per-PID table isolation, shared offsets across `dup`/`dup2`, pipe transfer/ring semantics, non-blocking empty reads, EOF, and `EPIPE`
 - Process manager host test (`tests/process_host_test.cpp`): valid states, bounded EL0 metadata, unique RUNNING record, protected built-ins, zombie/exit-code lifecycle, and refusing to destroy a running process
 - Scheduler/process integration host test (`tests/scheduler_process_host_test.cpp`): logical-current selection, removal/cleanup, zombie compaction, and fallback selection
-- Framebuffer/UI host tests, including UI glyph antialiasing, BMP decoding bounds, wallpaper selection persistence, theme persistence, and UI composition
+- Framebuffer terminal host test (`console_host_test`): ANSI handling, scrollback, wheel/page scrolling, snap-to-bottom, font anti-aliasing, hostile escape sequences.
 - Disk image/superblock static verification
 - ELF AArch64/LOAD/W+X/entry-permission static verification; loader rejects files with no execute bit even under root
 - ZIP integrity verification
 
 ## Required on the user's Termux/QEMU host
 
-- Full QEMU boot and visual/input verification (not run in the build container unless `qemu-system-aarch64` is available). `linux/run-ui.sh` wires QEMU-window input through VirtIO keyboard/tablet devices; real input behavior still depends on the installed QEMU build and host display backend.
+- Full QEMU boot and visual/input verification (not run in the build container unless `qemu-system-aarch64` is available): `linux/run-terminal.sh` - type, scroll with the mouse wheel, run `nano`/`calc`, check `irq status` ticks while a program runs.
 - `selftest` command
-- `threads` followed by `thread-demo` (cooperative switching only; IRQ remains off)
+- `threads` followed by `thread-demo` (cooperative switching only; the 100 Hz tick keeps running)
 - `fds` and `syscall fd` (open/write/seek/read/close/dup/pipe smoke tests); userspace wrapper execution still requires QEMU validation
 - `export DEMO=ok`, `echo $DEMO`, `unset DEMO`, `echo $DEMO`
 - `cat /etc/example | wc -l` against an existing file (or create a test file first)
@@ -46,7 +46,7 @@ the release build container when `qemu-system-aarch64` is unavailable.
 - Generic pipes are kernel primitives, but the shell pipeline parser still uses its existing in-memory command path; arbitrary ELF-to-ELF pipelines are not yet wired up.
 - `fork()`, `wait()`, descriptor inheritance, and concurrent user ELF processes are not implemented. They require per-process EL0 address spaces and a real process context switch.
 - Pipe I/O is deliberately non-blocking; full/empty conditions return negative errno-like values rather than suspending a thread.
-- Timer IRQ remains disabled during normal boot; none of these tests enables it.
+- The timer IRQ is active (100 Hz) during these tests; `irq selftest` restores it afterwards.
 
 
 ## P2 known limitations

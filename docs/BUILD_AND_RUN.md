@@ -55,7 +55,7 @@ Build and immediately boot the serial/headless runner:
 ./linux/build.sh --run
 ```
 
-For the plain black shell in a QEMU window, use `./linux/run-terminal.sh`. For the lock/home pixel UI, use `./linux/run-ui.sh`.
+For the shell in a QEMU window (mouse-wheel scrollback), use `./linux/run-terminal.sh`.
 
 ## 4. Arch Linux
 
@@ -116,7 +116,7 @@ bash termux/build.sh
 bash termux/run.sh
 ```
 
-For the plain black shell window or pixel UI, use `bash termux/run-terminal.sh` or `bash termux/run-ui.sh`. Start Termux:X11 first for graphical windows and use a QEMU build with SDL or GTK support. If QEMU cannot access the expected acceleration features on a particular Android device, software emulation may still be possible but can be slower or unavailable depending on the Termux/QEMU build.
+For the shell window, use `bash termux/run-terminal.sh`. Start Termux:X11 first for graphical windows and use a QEMU build with SDL or GTK support. If QEMU cannot access the expected acceleration features on a particular Android device, software emulation may still be possible but can be slower or unavailable depending on the Termux/QEMU build.
 
 ## 7. macOS
 
@@ -126,7 +126,6 @@ Use the scripts in `macos/`. Ensure that the installed LLVM/Clang supports `--ta
 bash macos/build.sh
 bash macos/run.sh
 bash macos/run-terminal.sh
-bash macos/run-ui.sh
 ```
 
 ## 8. Windows PowerShell
@@ -179,7 +178,7 @@ The source of truth is the runner script itself:
 - [`linux/run.sh`](../linux/run.sh)
 - [`windows/run.ps1`](../windows/run.ps1)
 
-To open the original RioOS shell in a plain black QEMU text-console window, use `linux/run-terminal.sh` on Linux/WSL, `termux/run-terminal.sh` on Termux:X11, `macos/run-terminal.sh` on macOS, or `windows/run-terminal.ps1` in PowerShell. Linux and Termux can select SDL with `RIOOS_DISPLAY=sdl` when GTK is unavailable; macOS defaults to Cocoa and can select SDL. This mode requires a usable graphical backend but does not require `ramfb` or VirtIO GUI input devices. UART input/output is handled by QEMU's virtual console, not the host terminal. The `run` script stays the serial-console option, while `run-ui` opens the pixel lock/home UI.
+To open the RioOS shell in a QEMU window, use `linux/run-terminal.sh` on Linux/WSL, `termux/run-terminal.sh` on Termux:X11, `macos/run-terminal.sh` on macOS, or `windows/run-terminal.ps1` in PowerShell. Linux and Termux can select SDL with `RIOOS_DISPLAY=sdl` when GTK is unavailable; macOS defaults to Cocoa and can select SDL. The window needs `ramfb` plus VirtIO keyboard/tablet devices (the scripts check for them). The `run` script stays the serial-console option in the host terminal.
 
 ## 10. Build outputs
 
@@ -351,10 +350,8 @@ Run `bash linux/build.sh --clean` (or `.\windows\build.ps1 --clean` in PowerShel
 After launching QEMU on a host with `qemu-system-aarch64`, try `smp` and `fbinfo`. `smp` should report one online CPU and disabled SMP. `fbinfo` explains that the software framebuffer is not yet connected to a QEMU display; the UART remains the interactive console. Keep timer IRQ disabled during ordinary boot.
 
 
-## Pixel UI and RPK apps (v1.11.0)
+## Terminal window and timer IRQ (v1.13.0)
 
-The default `linux/run.sh` / `windows/run.ps1` remains a headless `-nographic` serial shell. To use the graphical framebuffer, build normally and launch `./linux/run-ui.sh` on a QEMU build with GTK/SDL display support (PowerShell: `./windows/run-ui.ps1`). The GUI runner attaches `-device ramfb`; the kernel locates `etc/ramfb` through QEMU `fw_cfg`, configures an XRGB8888 surface, and flushes rendered pixels from cache. The framebuffer is 1024×768.
+`run.sh` / `run.ps1` start RioOS in the host terminal. `run-terminal.sh` / `run-terminal.ps1` start it in a QEMU window (GTK or SDL; Cocoa on macOS) with `-device ramfb`, `virtio-keyboard-device` and `virtio-tablet-device`: the kernel draws the shell with a DejaVu Sans Mono terminal font and you scroll history with the mouse wheel (or Shift+PageUp/PageDown). There is no GUI, launcher or `.rpk` package any more. Details: [TERMINAL.md](./TERMINAL.md).
 
-The graphical runner attaches VirtIO keyboard/tablet devices. Focus the QEMU window to type, swipe/drag upward to unlock, and click a home-screen app icon. Home navigation also supports A/D, W/S, arrow keys, Enter, and 1–5; X returns to the serial shell. UART input is retained as a fallback. The pixel Terminal forwards commands to the same `execute_command()` dispatcher used by the serial shell; it is not a GNU Bash process.
-
-Build installs `/apps/terminal.rpk`, `/apps/calculator.rpk`, `/apps/clock.rpk`, `/apps/files.rpk`, and `/apps/launcher.rpk`. RPK v1 is a manifest format for built-in apps, not a native executable/package loader. The implementations are linked into the kernel. Host tests verify pixel drawing bounds and RPK disk-image installation. They do not replace a visual QEMU runtime test; if `ramfb` is unavailable, RioOS reports that and falls back to the serial shell. Timer IRQ remains disabled.
+The timer IRQ is active (100 Hz) at boot and while EL0 programs run: try `irq status` and `irq selftest`. Details: [TIMER_IRQ.md](./TIMER_IRQ.md).

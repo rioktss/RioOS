@@ -1,6 +1,7 @@
 #include "virtio_input.h"
 #include "virtio_mmio.h"
 #include "uart.h"
+#include "console.h"
 
 #define V_DEVICE_ID          0x008U
 #define V_DEVICE_FEATURES    0x010U
@@ -46,6 +47,9 @@
 #define INPUT_ABS_Y           1U
 #define INPUT_BTN_LEFT        272U
 #define INPUT_BTN_TOUCH       330U
+#define INPUT_BTN_GEAR_UP     336U
+#define INPUT_BTN_GEAR_DOWN   337U
+#define WHEEL_LINES_PER_NOTCH 3
 
 struct VirtqDesc { uint64_t addr; uint32_t len; uint16_t flags; uint16_t next; };
 struct VirtqAvail { uint16_t flags; uint16_t idx; uint16_t ring[QUEUE_COUNT]; uint16_t used_event; };
@@ -300,6 +304,7 @@ static char translate_key(uint16_t code, int shift)
         case 51: return shift ? '<' : ','; case 52: return shift ? '>' : '.'; case 53: return shift ? '?' : '/';
         case 103: return (char)0x80; case 108: return (char)0x81;
         case 105: return (char)0x82; case 106: return (char)0x83;
+        case 104: return (char)0x84; case 109: return (char)0x85; /* PgUp / PgDn */
         default: return 0;
     }
 }
@@ -442,6 +447,17 @@ int virtio_input_poll(struct RioInputEvent* event)
                 device->scroll_dirty = 1;
             }
         }
+        else if (raw.type == INPUT_EV_KEY && (raw.code == INPUT_BTN_GEAR_UP || raw.code == INPUT_BTN_GEAR_DOWN))
+        {
+            /* Wheel reported as buttons when QEMU's wheel-axis is disabled. */
+            if (raw.value != 0)
+            {
+                device->scroll_delta += raw.code == INPUT_BTN_GEAR_UP ? 1 : -1;
+                if (device->scroll_delta > 12) device->scroll_delta = 12;
+                if (device->scroll_delta < -12) device->scroll_delta = -12;
+                device->scroll_dirty = 1;
+            }
+        }
         else if (raw.type == INPUT_EV_KEY && (raw.code == INPUT_BTN_LEFT || raw.code == INPUT_BTN_TOUCH))
         {
             device->pointer_down = raw.value != 0 ? 1U : 0U;
@@ -476,7 +492,18 @@ int virtio_input_try_get_key(char* key)
     for (uint32_t i = 0; i < 32U; ++i)
     {
         if (!virtio_input_poll(&event)) return 0;
-        if (event.kind == RIO_INPUT_KEY) { *key = event.key; return 1; }
+        if (event.kind == RIO_INPUT_SCROLL)
+        {
+            /* Mouse wheel / touchpad: positive = wheel up = older output. */
+            console_scroll_lines(event.scroll * WHEEL_LINES_PER_NOTCH);
+            continue;
+        }
+        if (event.kind != RIO_INPUT_KEY) continue;
+        if ((unsigned char)event.key == 0x84U) { console_scroll_pages(1); continue; }
+        if ((unsigned char)event.key == 0x85U) { console_scroll_pages(-1); continue; }
+        console_snap_to_bottom();
+        *key = event.key;
+        return 1;
     }
     return 0;
 }

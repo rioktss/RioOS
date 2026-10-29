@@ -15,7 +15,7 @@
  *   - history of recent expressions
  *
  * No timer/scheduler syscall is used. Input is polled through SYS_READ,
- * so the application works with timer IRQ kept disabled.
+ * so the application works with the timer tick running in the background.
  */
 
 static const int64_t I64_MIN = (-9223372036854775807LL - 1LL);
@@ -692,7 +692,7 @@ static void interactive()
     write_str("\033[1;36m========================================\033[0m\r\n");
     write_str("\033[1;36m           RioOS CALCULATOR             \033[0m\r\n");
     write_str("\033[1;36m========================================\033[0m\r\n");
-    write_str("Type 'help' for commands. Timer IRQ is not used.\r\n\r\n");
+    write_str("Type 'help' for commands. Timer IRQ is active (100 Hz).\r\n\r\n");
 
     while (1)
     {

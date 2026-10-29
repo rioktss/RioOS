@@ -1,9 +1,0 @@
-RIOPKG/1
-id=terminal
-name=Terminal
-type=builtin
-entry=terminal
-version=1.0.0
-icon=/icons/terminal.bmp
-category=system
-description=Pixel terminal interface for MyKernel built-in commands.

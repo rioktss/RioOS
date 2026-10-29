@@ -86,7 +86,7 @@ The exact initialization order can change as the kernel evolves. The authoritati
 
 `process/thread.cpp` and `process/ctx_switch.S` implement a small AArch64 cooperative thread facility. A thread gives up the CPU explicitly through `thread_yield()`, and the context switch saves/restores the AAPCS64 callee-saved register set and stack pointer. `thread-demo` exercises this path without unmasking CPU IRQs or enabling timer interrupts.
 
-This must not be confused with complete preemptive multitasking: the process table scheduler is still primarily process metadata/policy, and the current EL0 execution path runs one user program synchronously. Periodic timer IRQs remain disabled during boot because interrupt-driven preemption has not been validated for interactive input.
+This must not be confused with complete preemptive multitasking: the process table scheduler is still primarily process metadata/policy, and the current EL0 execution path runs one user program synchronously. The periodic timer IRQ (100 Hz) is active from boot but only counts scheduler ticks; preemptive switching is not enabled.
 
 ## AArch64 exception and interrupt model
 
@@ -324,8 +324,8 @@ The P4 SMP API reads `MPIDR_EL1.Aff0` for diagnostics and provides atomic spinlo
 The framebuffer driver is a bounded software RAM surface at the address reserved by the memory layout. It supports text glyphs, background clearing, and row scrolling, but the default `-nographic` QEMU runner does not connect this RAM to a display device. UART remains the supported interactive console until a real display backend is implemented and tested.
 
 
-## Pixel UI and display path (v1.11.0)
+## Terminal window and live timer IRQ (v1.13.0)
 
-`drivers/fb.cpp` now provides clipped pixel primitives, bitmap text drawing, gradients, rounded panels, cache maintenance, and a direct QEMU `ramfb` setup path using the `fw_cfg` DMA interface. The framebuffer is a statically reserved 1024×768 XRGB8888 buffer, avoiding allocator ownership and lifetime problems. The boot splash, lock screen, home screen, app router, and each app have separate translation units under `ui/`.
+`drivers/fb.cpp` only owns the 1024x768 XRGB8888 surface and its QEMU `ramfb` hand-off through `fw_cfg` DMA. `drivers/console.cpp` is a VT100-subset text terminal with a 2000-line scrollback ring and a lazy cell-diff renderer; `uart_putc()` mirrors every byte into it once active, so the QEMU window shows exactly what the serial shell shows. Mouse-wheel/PageUp events from the VirtIO input driver call `console_scroll_lines()`. There is no GUI layer. See [TERMINAL.md](./TERMINAL.md).
 
-`linux/run-ui.sh` adds `-device ramfb` and a graphical QEMU display while keeping PL011 UART attached to stdio as a fallback. Normal `linux/run.sh` remains headless and is backward-compatible. The runner attaches VirtIO keyboard and tablet devices; the polled driver reads their advertised identity and absolute-coordinate ranges. The built-in `.rpk` manifests are installed into `/apps` at image-build time and validated before launch; app code is currently built into the kernel. General USB/HID devices, dynamically loaded RPK executables, and a full GNU Bash userspace are not implemented. Runtime rendering and input still need a visual QEMU acceptance run on a host with display support.
+The generic timer runs as a 100 Hz periodic system tick from boot; EL0 is entered with the I-bit clear and the lower-EL IRQ vector saves/restores a full frame. See [TIMER_IRQ.md](./TIMER_IRQ.md).

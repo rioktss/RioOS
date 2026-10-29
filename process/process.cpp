@@ -15,6 +15,8 @@ struct Process
     int exit_code;
     uint64_t user_low;
     uint64_t user_high;
+    int context_valid;
+    ProcessCpuContext context;
     char name[PROCESS_NAME_SIZE];
 };
 
@@ -81,6 +83,11 @@ void process_init()
         processes[i].exit_code = 0;
         processes[i].user_low = 0;
         processes[i].user_high = 0;
+        processes[i].context_valid = 0;
+        for (int r = 0; r < 31; ++r) processes[i].context.x[r] = 0;
+        processes[i].context.elr = 0;
+        processes[i].context.spsr = 0;
+        processes[i].context.user_sp = 0;
         processes[i].name[0] = '\0';
     }
     process_irq_restore(flags);
@@ -125,6 +132,11 @@ int process_create(const char* name)
     p->exit_code = 0;
     p->user_low = 0;
     p->user_high = 0;
+    p->context_valid = 0;
+    for (int r = 0; r < 31; ++r) p->context.x[r] = 0;
+    p->context.elr = 0;
+    p->context.spsr = 0;
+    p->context.user_sp = 0;
     str_copy(p->name, name, PROCESS_NAME_SIZE);
     int pid = p->pid;
     process_irq_restore(flags);
@@ -208,6 +220,53 @@ int process_exit_code(int pid)
     return result;
 }
 
+int process_save_context(int pid, const ProcessCpuContext* context)
+{
+    if (context == 0) return -1;
+    uint64_t flags = process_irq_save();
+    int slot = find_slot_locked(pid);
+    if (slot < 0 || processes[slot].kind != PROCESS_USER ||
+        processes[slot].state == PROCESS_ZOMBIE)
+    {
+        process_irq_restore(flags);
+        return -1;
+    }
+    for (int r = 0; r < 31; ++r) processes[slot].context.x[r] = context->x[r];
+    processes[slot].context.elr = context->elr;
+    processes[slot].context.spsr = context->spsr;
+    processes[slot].context.user_sp = context->user_sp;
+    processes[slot].context_valid = 1;
+    process_irq_restore(flags);
+    return 0;
+}
+
+int process_load_context(int pid, ProcessCpuContext* context)
+{
+    if (context == 0) return -1;
+    uint64_t flags = process_irq_save();
+    int slot = find_slot_locked(pid);
+    if (slot < 0 || !processes[slot].context_valid)
+    {
+        process_irq_restore(flags);
+        return -1;
+    }
+    for (int r = 0; r < 31; ++r) context->x[r] = processes[slot].context.x[r];
+    context->elr = processes[slot].context.elr;
+    context->spsr = processes[slot].context.spsr;
+    context->user_sp = processes[slot].context.user_sp;
+    process_irq_restore(flags);
+    return 0;
+}
+
+int process_context_valid(int pid)
+{
+    uint64_t flags = process_irq_save();
+    int slot = find_slot_locked(pid);
+    int valid = slot >= 0 && processes[slot].context_valid;
+    process_irq_restore(flags);
+    return valid;
+}
+
 int process_destroy(int pid)
 {
     if (pid == 0 || pid == 1)
@@ -233,6 +292,11 @@ int process_destroy(int pid)
     processes[slot].exit_code = 0;
     processes[slot].user_low = 0;
     processes[slot].user_high = 0;
+    processes[slot].context_valid = 0;
+    for (int r = 0; r < 31; ++r) processes[slot].context.x[r] = 0;
+    processes[slot].context.elr = 0;
+    processes[slot].context.spsr = 0;
+    processes[slot].context.user_sp = 0;
     processes[slot].name[0] = '\0';
     process_irq_restore(flags);
     return 0;

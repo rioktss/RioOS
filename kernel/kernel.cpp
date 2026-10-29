@@ -18,10 +18,12 @@
 #include "security.h"
 #include "smp.h"
 #include "version.h"
-#include "ui.h"
+#include "fb.h"
+#include "console.h"
 
 extern "C" void kernel_main()
 {
+    uart_init();
     uart_puts(
         "\r\n"
         "============================\r\n"
@@ -71,7 +73,7 @@ extern "C" void kernel_main()
     /* The counter is needed by every timeout path, so bring it up early. */
     uart_puts("[4] Initializing timer...\r\n");
     timer_init();
-    /* Timer starts OFF. Login/authentication never starts timer IRQs. */
+    /* Timer is armed after the interrupt controller is up (step 15). */
 
     uart_puts("[5] Initializing MMU...\r\n");
     mmu_init();
@@ -98,7 +100,7 @@ extern "C" void kernel_main()
     uart_puts("[12] Initializing scheduler...\r\n");
     scheduler_init();
     thread_init();
-    uart_puts("Cooperative thread subsystem initialized (timer preemption remains off).\r\n");
+    uart_puts("Cooperative thread subsystem initialized (no preemption; timer tick only).\r\n");
 
     uart_puts("[13] Initializing interrupt controller...\r\n");
     interrupt_init();
@@ -106,19 +108,34 @@ extern "C" void kernel_main()
     uart_puts("[14] Initializing syscall...\r\n");
     syscall_init();
 
-    uart_puts("[15] Timer IRQ prepared (off by default; use 'irq' to test stages B-D).\r\n");
+    /* System tick: 100 Hz periodic timer IRQ, live for the kernel shell and
+       while EL0 programs run. Line is unmasked at the GIC first, then the
+       timer is armed, then the CPU I-bit is cleared. */
+    uart_puts("[15] System tick (100 Hz) starts before the shell...\r\n");
 
 uart_puts(
     "\r\n"
     "RioOS initialization complete.\r\n"
+    "\r\n"
+);
+
+/* If QEMU provides a display (run-terminal.sh), take over the framebuffer
+       with the text terminal. Everything printed from here on is mirrored to
+       the window; without a display the serial console works unchanged. */
+fb_init();
+if (fb_has_display() && console_start() == 0)
+    uart_puts_serial_only("Console: framebuffer terminal active (mouse wheel / Shift+PageUp scroll).\r\n");
+timer_set_sched_tick(1);
+interrupt_timer_line_enable();
+timer_start_periodic(100U);
+interrupt_enable();
+uart_puts("Timer IRQ active: CPU IRQ unmasked, tick = 100 Hz.\r\n");
+uart_puts(
     "Welcome to RioOS!\r\n"
     "Type 'help' to get started.\r\n"
     "\r\n"
 );
 
-/* Pixel UI starts only when QEMU ramfb is present. The normal headless runner
-       retains its original UART shell, and timer IRQ remains disabled. */
-ui_start();
 shell();
 
     while (1)

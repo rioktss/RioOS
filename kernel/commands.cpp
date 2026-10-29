@@ -2,6 +2,7 @@
 
 #include "uart.h"
 #include "fb.h"
+#include "console.h"
 #include "memory.h"
 #include "string.h"
 
@@ -93,6 +94,16 @@ static void irq_quiesce()
     timer_set_sched_tick(1);
 }
 
+/* Back to the normal running state: 100 Hz system tick, scheduler tick on,
+   GIC line unmasked, CPU IRQ unmasked. */
+static void irq_resume_system_tick()
+{
+    timer_set_sched_tick(1);
+    interrupt_timer_line_enable();
+    timer_start_periodic(100U);
+    interrupt_enable();
+}
+
 static void irq_print_status()
 {
     InterruptStats st;
@@ -141,6 +152,7 @@ static int irq_stage_oneshot()
              timer_mode() == TIMER_MODE_OFF;
 
     irq_quiesce();
+    irq_resume_system_tick();
     return ok;
 }
 
@@ -176,7 +188,10 @@ static int irq_stage_periodic(int hz, int with_sched_tick, int keep_running)
         ok = ok && ticks == 0ULL;
 
     if (!keep_running)
+    {
         irq_quiesce();
+        irq_resume_system_tick();
+    }
 
     return ok;
 }
@@ -192,7 +207,15 @@ static void command_irq(const char* argument)
     if (str_equal(argument, "off"))
     {
         irq_quiesce();
-        uart_puts("Timer IRQ disabled; CPU IRQ masked.\r\n");
+        uart_puts("Timer IRQ disabled; CPU IRQ masked. Use 'irq on' to restart the 100 Hz system tick.\r\n");
+        return;
+    }
+
+    if (str_equal(argument, "on"))
+    {
+        irq_quiesce();
+        irq_resume_system_tick();
+        uart_puts("Timer IRQ enabled: 100 Hz system tick, CPU IRQ unmasked.\r\n");
         return;
     }
 
@@ -256,7 +279,7 @@ static void command_irq(const char* argument)
         return;
     }
 
-    uart_puts("Usage: irq [status|off|oneshot|stagec [hz]|staged [hz]|selftest]\r\n");
+    uart_puts("Usage: irq [status|on|off|oneshot|stagec [hz]|staged [hz]|selftest]\r\n");
 }
 
 /* Allocate, verify zeroing, free, then check double-free is rejected. */
@@ -419,8 +442,8 @@ static const ManualEntry manual_entries[] =
     {"history", "show command history", "history [10|-c]", "-c clear history; N show last N entries; Arrow Up/Down recall"},
     {"threads", "list cooperative kernel threads", "threads", "Shows state, priority, run counts, and context switches"},
     {"smp", "show CPU/SMP bring-up readiness", "smp", "Reports current MPIDR Aff0, online CPU count, and whether SMP is enabled; secondary startup is disabled"},
-    {"fbinfo", "show framebuffer backend status", "fbinfo", "Reports software RAM-surface state; the default QEMU runner remains serial-only"},
-    {"thread-demo", "exercise voluntary context switching", "thread-demo", "Uses yield only; timer IRQ/preemption stays disabled"},
+    {"fbinfo", "show framebuffer backend status", "fbinfo", "Reports the framebuffer terminal state (QEMU window runner)"},
+    {"thread-demo", "exercise voluntary context switching", "thread-demo", "Uses yield only; no preemption (tick keeps running)"},
     {"unset", "remove an environment variable", "unset NAME", "NAME must follow shell identifier rules"},
     {"fds", "list open file descriptors", "fds", "Shows standard streams and currently open descriptors"},
     {"ifconfig", "show the configured network interface", "ifconfig", "Displays static IPv4, gateway, DNS and VirtIO-Net MAC"},
@@ -1241,11 +1264,21 @@ static void command_smp_status()
 
 static void command_fbinfo()
 {
-    uart_puts("Framebuffer diagnostics\r\n------------------------\r\nBackend : reserved RAM surface\r\nStatus  : ");
+    uart_puts("Framebuffer diagnostics\r\n------------------------\r\nBackend : ");
+    uart_puts(fb_has_display() ? "display attached (QEMU window)\r\n" : "none (serial console only)\r\n");
+    uart_puts("Surface : ");
     uart_puts(fb_is_ready() ? "initialized\r\n" : "not initialized\r\n");
     uart_puts("Geometry: "); print_u64((uint64_t)fb_get_width());
     uart_putc('x'); print_u64((uint64_t)fb_get_height());
-    uart_puts(" pixels, 32 bpp\r\nDisplay : no QEMU video device is wired to this surface; UART remains the console\r\n");
+    uart_puts(" pixels, 32 bpp\r\nTerminal: ");
+    if (console_active())
+    {
+        print_u64((uint64_t)console_columns()); uart_putc('x'); print_u64((uint64_t)console_rows());
+        uart_puts(" cells, scrollback ");
+        print_u64((uint64_t)console_scrollback_lines());
+        uart_puts(" lines (mouse wheel / Shift+PageUp / Shift+PageDown scroll)\r\n");
+    }
+    else uart_puts("inactive; UART is the only console\r\n");
 }
 
 static void command_thread_demo()
@@ -1256,7 +1289,7 @@ static void command_thread_demo()
         return;
     }
 
-    uart_puts("Running cooperative context-switch demo; timer IRQ remains off.\r\n");
+    uart_puts("Running cooperative context-switch demo (timer tick keeps running; no preemption).\r\n");
     int a = thread_create("demo-A", thread_demo_worker, (void*)1ULL, 1);
     int b = thread_create("demo-B", thread_demo_worker, (void*)2ULL, 1);
     if (a < 0 || b < 0)
@@ -1341,7 +1374,7 @@ static void command_help()
         "  userdemo             Run preserved EL0 userspace demo\r\n"
         "  su [root|user]       Switch user; root asks for password\r\n"
         "  logout               Return from root to user\r\n"
-        "  level                Show current exception level\r\n"
+        "  level                Show current CPU privilege level\r\n"
         "  mmu                  Show MMU status\r\n"
         "  disk                 Show VirtIO disk status\r\n"
         "  diskread <sector>    Read and inspect a 512-byte sector\r\n"
@@ -1361,13 +1394,13 @@ static void command_help()
         "  tasks                Show scheduler and processes\r\n"
         "  threads              Show cooperative kernel threads\r\n"
         "  smp                  Show CPU topology; SMP remains disabled by default\r\n"
-        "  fbinfo               Show framebuffer RAM-surface status (serial console remains default)\r\n"
+        "  fbinfo               Show framebuffer terminal status\r\n"
         "  fds                  List open file descriptors\r\n"
-        "  thread-demo          Test context switching without timer IRQ\r\n"
+        "  thread-demo          Test cooperative context switching\r\n"
         "  mount                Show storage and filesystem mount\r\n"
         "  stats                Show system statistics\r\n"
         "  log [0-3]            Show/set log level\r\n"
-        "  irq [status|off|oneshot|stagec|staged|selftest] [hz]  Timer IRQ bring-up\r\n"
+        "  irq [status|on|off|oneshot|stagec|staged|selftest] [hz]  Timer IRQ control/tests\r\n"
     );
 }
 
@@ -2120,7 +2153,6 @@ static void command_user_login(const char* argument)
     char password[32];
     uart_puts("user login\r\n");
     uart_puts("Password: ");
-    if (!uart_output_hook_active()) fb_print("Password: ", 0xFFFFFF);
 
     if (security_read_password(password, sizeof(password)) < 0)
     {
@@ -2140,7 +2172,6 @@ static void command_su(const char* argument)
     {
         char password[48];
         uart_puts("root password: ");
-        if (!uart_output_hook_active()) fb_print("root password: ", 0xFFFFFF);
         if (security_read_password(password, sizeof(password)) < 0 ||
             security_login_root(password) != 0)
         {

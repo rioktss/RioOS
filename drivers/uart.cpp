@@ -1,5 +1,6 @@
 #include "types.h"
 #include "uart.h"
+#include "console.h"
 
 #define UART_BASE 0x09000000ULL
 
@@ -8,6 +9,22 @@ static volatile uint32_t* const UART_DR =
 
 static volatile uint32_t* const UART_FR =
     (volatile uint32_t*)(UART_BASE + 0x18);
+
+void uart_init()
+{
+    /* PL011: QEMU only accepts RX bytes once UARTEN is set (reset value 0x300
+       leaves it clear). Program 8N1 + FIFO, mask UART IRQs (polled), enable. */
+    volatile uint32_t* const cr = (volatile uint32_t*)(UART_BASE + 0x30);
+    volatile uint32_t* const lcrh = (volatile uint32_t*)(UART_BASE + 0x2C);
+    volatile uint32_t* const imsc = (volatile uint32_t*)(UART_BASE + 0x38);
+    volatile uint32_t* const icr = (volatile uint32_t*)(UART_BASE + 0x44);
+    *cr = 0;
+    *lcrh = 0x70U;          /* 8 bits, FIFO enabled, no parity */
+    *imsc = 0;
+    *icr = 0x7FFU;
+    *cr = 0x301U;           /* UARTEN | TXE | RXE */
+    asm volatile("dsb sy" ::: "memory");
+}
 
 static uart_output_hook_t output_hook = 0;
 static int output_hook_mirror = 0;
@@ -39,6 +56,25 @@ void uart_set_output_flush_hook(uart_output_flush_hook_t hook)
 void uart_flush_output()
 {
     if (output_flush_hook != 0) output_flush_hook();
+    console_flush();
+}
+
+void uart_putc_serial_only(char c)
+{
+    while ((*UART_FR) & (1U << 5))
+    {
+    }
+
+    *UART_DR = (uint32_t)c;
+}
+
+void uart_puts_serial_only(const char* s)
+{
+    if (s == 0)
+        return;
+
+    while (*s)
+        uart_putc_serial_only(*s++);
 }
 
 void uart_putc(char c)
@@ -48,6 +84,10 @@ void uart_putc(char c)
         output_hook(c);
         if (!output_hook_mirror) return;
     }
+
+    /* Everything printed to the serial console is mirrored to the QEMU
+       window terminal once it is active. */
+    if (console_active()) console_putc(c);
 
     while ((*UART_FR) & (1U << 5))
     {

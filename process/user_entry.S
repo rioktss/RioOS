@@ -21,8 +21,10 @@ user_enter:
 
     msr sp_el0, x1
 
-    /* Return to EL0t, mask asynchronous exceptions during this single task. */
-    mov x10, #0x3c0
+    /* Return to EL0t with IRQ unmasked (I=0) so the 100 Hz timer tick keeps
+       running while the program executes. Debug, SError and FIQ stay masked
+       (D=1 A=1 F=1 -> 0x340). */
+    mov x10, #0x340
     msr spsr_el1, x10
     msr elr_el1, x0
 

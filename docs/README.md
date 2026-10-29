@@ -13,6 +13,8 @@ RioOS is an ARM64/AArch64 bare-metal operating system project built around the M
 | [`LEARN.md`](./LEARN.md) | Follow a practical study path from boot to userspace |
 | [`DEVELOPMENT.md`](./DEVELOPMENT.md) | Tests, debugging, coding workflow, and contributions |
 | [`ROADMAP.md`](./ROADMAP.md) | Current direction and future work |
+| [`P5_PROCESS_ISOLATION.md`](./P5_PROCESS_ISOLATION.md) | Per-PID address spaces, frame ownership, and P5 scope |
+| [`TEST_MATRIX_P5.md`](./TEST_MATRIX_P5.md) | P5 build, regression, and runtime validation checklist |
 | [`FAQ.md`](./FAQ.md) | Common questions about RioOS and bare-metal development |
 
 ## Source of truth

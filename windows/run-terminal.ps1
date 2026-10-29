@@ -1,3 +1,6 @@
+# Run RioOS and show its shell in a QEMU window (framebuffer terminal).
+#   run.ps1           -> RioOS in this PowerShell window (serial, -nographic)
+#   run-terminal.ps1  -> RioOS in a QEMU window: shell only, mouse-wheel scrollback
 $ErrorActionPreference = "Stop"
 $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Set-Location $ProjectRoot
@@ -26,21 +29,29 @@ if (-not $DisplayHelp.Contains($Display)) {
     $Display = $Fallback
 }
 
-Write-Host "RioOS text shell: opening a plain QEMU console window ($Display)."
-Write-Host "This is the original black text shell, not the pixel UI Terminal .rpk app."
+$DeviceHelp = (& $Qemu -device help 2>&1 | Out-String)
+foreach ($RequiredDevice in @("ramfb", "virtio-keyboard-device", "virtio-tablet-device")) {
+    if (-not $DeviceHelp.Contains("name `"$RequiredDevice`"")) {
+        throw "This QEMU build lacks '$RequiredDevice'. Install a QEMU system-aarch64 build with ramfb and VirtIO input devices."
+    }
+}
 
-# Do not add ramfb/fw_cfg/GUI input devices here; those start the pixel UI.
+Write-Host "RioOS terminal window: QEMU ($Display). Type in the window; scroll with the mouse wheel."
+
 & $Qemu `
     -M "virt,gic-version=2,virtualization=on" `
     -global "virtio-mmio.force-legacy=false" `
     -cpu $Cpu `
     -m $Mem `
     -display $Display `
-    -serial "vc:100Cx32C" `
+    -serial stdio `
     -monitor none `
     -kernel $Kernel `
+    -device ramfb `
     -drive "if=none,format=raw,file=$Disk,id=vd0" `
     -device "virtio-blk-device,drive=vd0" `
     -netdev "user,id=n1,ipv4=on,ipv6=off" `
-    -device "virtio-net-device,netdev=n1"
-if ($LASTEXITCODE -ne 0) { throw "QEMU text console exited with code $LASTEXITCODE" }
+    -device "virtio-net-device,netdev=n1" `
+    -device "virtio-keyboard-device" `
+    -device "virtio-tablet-device"
+if ($LASTEXITCODE -ne 0) { throw "QEMU terminal window exited with code $LASTEXITCODE" }

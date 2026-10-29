@@ -34,6 +34,23 @@ int main()
     CHECK(process_user_low(pid) == MMU_USER_BASE);
     CHECK(process_user_high(pid) == MMU_USER_STACK_TOP);
 
+    /* P5: the PCB retains a complete EL0 register frame at an exception
+       boundary and can provide it to a future process-frame scheduler. */
+    ProcessCpuContext saved;
+    ProcessCpuContext restored;
+    for (int r = 0; r < 31; ++r) saved.x[r] = 0xA500ULL + (uint64_t)r;
+    saved.elr = 0x47001234ULL;
+    saved.spsr = 0;
+    saved.user_sp = MMU_USER_STACK_TOP - 16ULL;
+    CHECK(process_context_valid(pid) == 0);
+    CHECK(process_save_context(pid, &saved) == 0);
+    CHECK(process_context_valid(pid) == 1);
+    CHECK(process_load_context(pid, &restored) == 0);
+    for (int r = 0; r < 31; ++r) CHECK(restored.x[r] == saved.x[r]);
+    CHECK(restored.elr == saved.elr);
+    CHECK(restored.spsr == saved.spsr);
+    CHECK(restored.user_sp == saved.user_sp);
+
     /* Only one process-table entry may be RUNNING on a uniprocessor. */
     CHECK(process_set_state(pid, PROCESS_RUNNING) == 0);
     CHECK(process_get_state(pid) == PROCESS_RUNNING);
@@ -57,6 +74,7 @@ int main()
     CHECK(process_mark_exit(0, 1) == -2);
     CHECK(process_mark_exit(1, 1) == -2);
     CHECK(process_destroy(pid) == 0);
+    CHECK(process_context_valid(pid) == 0);
     CHECK(process_destroy(pid) == -1);
     CHECK(process_count() == 2);
 

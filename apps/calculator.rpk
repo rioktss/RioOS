@@ -1,9 +1,0 @@
-RIOPKG/1
-id=calculator
-name=Calculator
-type=builtin
-entry=calculator
-version=1.0.0
-icon=/icons/calculator.bmp
-category=tools
-description=Integer arithmetic calculator with addition, subtraction, multiplication and division.

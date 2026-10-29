@@ -25,7 +25,8 @@
    every GICv2 view: single-state (QEMU virt default), secure and non-secure
    (the reserved bit is ignored). Writing only bit1 would leave the CPU
    interface disabled in a non-secure view. */
-#define GIC_ENABLE_ALL 3U
+#define GIC_ENABLE_ALL 0x3U
+#define GICC_CTLR_VALUE 0x7U /* EnableGrp0 | EnableGrp1 | AckCtl: IAR must return Group 1 IDs in Secure view (else 1022 forever = IRQ storm) */
 
 static volatile uint32_t* const GICD_CTLR_REG =
     (volatile uint32_t*)(GICD_BASE + GICD_CTLR);
@@ -64,6 +65,7 @@ static volatile uint64_t irq_spurious = 0;
 static volatile uint64_t irq_unhandled = 0;
 static volatile uint64_t irq_nested = 0;
 static volatile uint32_t irq_depth = 0;
+static uint32_t spurious_run = 0;
 static volatile uint32_t irq_max_depth = 0;
 
 static void print_hex64(uint64_t value)
@@ -101,7 +103,7 @@ void interrupt_init()
 
     /* Accept all Group 1 priorities and enable only Group 1 at the CPU. */
     *GICC_PMR_REG = 0xFFU;
-    *GICC_CTLR_REG = GIC_ENABLE_ALL;
+    *GICC_CTLR_REG = GICC_CTLR_VALUE;
 
     /* Enable the distributor; the PPI stays disabled until start. */
     *GICD_CTLR_REG = GIC_ENABLE_ALL;
@@ -162,11 +164,19 @@ extern "C" void interrupt_dispatch(ExceptionFrame* frame)
     if (irq >= IRQ_SPURIOUS_BASE)
     {
         ++irq_spurious;
+        /* Safety net: a line that keeps asserting but is never acknowledged
+           would starve the CPU. Mask the tick instead of freezing. */
+        if (++spurious_run > 2000U)
+        {
+            *GICD_ICENABLER0_REG = (1U << TIMER_IRQ);
+            spurious_run = 0;
+        }
         return;
     }
 
     /* IRQs stay masked while we are in the handler, so depth must be 1.
        Track it so a future change that unmasks early is caught. */
+    spurious_run = 0;
     uint32_t depth = irq_depth + 1U;
     irq_depth = depth;
 
@@ -223,6 +233,14 @@ void interrupt_get_stats(InterruptStats* out)
     out->nested = irq_nested;
     out->last_irq = last_irq;
     out->max_depth = irq_max_depth;
+}
+
+void interrupt_idle()
+{
+    /* Sleep until the next tick when the 100 Hz timer is guaranteed to wake
+       us; otherwise (tick stopped via `irq off`, or IRQs masked) just hint. */
+    /* Never sleep: input is polled, so a missing wake-up can't freeze typing. */
+    asm volatile("yield" ::: "memory");
 }
 
 int interrupt_cpu_irq_enabled()

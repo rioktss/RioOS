@@ -1,5 +1,8 @@
 # P4 — SMP, driver, and framebuffer foundations (RioOS 1.10.0)
 
+> **v1.13.0 note:** the timer IRQ is now active (100 Hz tick, also while EL0 programs run) and the GUI was removed. Statements below that say the timer IRQ is disabled/off describe the earlier version this document was written for; see [TIMER_IRQ.md](./TIMER_IRQ.md) and [TERMINAL.md](./TERMINAL.md).
+
+
 ## Included
 
 - A small CPU-identification API based on `MPIDR_EL1.Aff0`.

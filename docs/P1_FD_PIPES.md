@@ -1,5 +1,8 @@
 # P1: File descriptors and generic pipes — RioOS 1.7.0
 
+> **v1.13.0 note:** the timer IRQ is now active (100 Hz tick, also while EL0 programs run) and the GUI was removed. Statements below that say the timer IRQ is disabled/off describe the earlier version this document was written for; see [TIMER_IRQ.md](./TIMER_IRQ.md) and [TERMINAL.md](./TERMINAL.md).
+
+
 ## What changed
 
 - Descriptors now live in bounded tables selected by process PID. A descriptor number from one PID is not automatically valid for another PID.

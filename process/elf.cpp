@@ -70,7 +70,7 @@ static int range_valid(uint64_t start, uint64_t size, uint64_t low, uint64_t hig
     return 1;
 }
 
-int elf_load(const char* path, uint64_t* entry_out)
+static int elf_load_internal(const char* path, uint64_t* entry_out, int pid)
 {
     if (path == 0 || entry_out == 0)
         return -1;
@@ -81,6 +81,8 @@ int elf_load(const char* path, uint64_t* entry_out)
     last_entry = 0;
     last_low = 0;
     last_high = 0;
+    /* P5 always begins with the kernel's baseline table. Per-process tables
+       are created only after the ELF headers have passed validation. */
     if (mmu_user_prepare() != 0)
         return -15;
     int file_id = fs_resolve(path, fs_get_root());
@@ -220,35 +222,76 @@ int elf_load(const char* path, uint64_t* entry_out)
         if (ph->flags & PF_X) mode |= 4U;
         if ((mode & 1U) == 0 && (mode & 2U) == 0 && (mode & 4U) == 0) mode = 1U;
 
-        for (uint64_t j = 0; j < ph->memsz; ++j)
-            ((uint8_t*)ph->vaddr)[j] = 0;
-        for (uint64_t j = 0; j < ph->filesz; ++j)
-            ((uint8_t*)ph->vaddr)[j] = image[ph->offset + j];
-        if (mmu_user_set_range(ph->vaddr, end, mode) != 0)
+        if (pid >= 0)
         {
-            uart_puts("ELF: page permission setup failed.\r\n");
-            mmu_user_prepare();
-            return -9;
+            if (!mmu_user_space_exists(pid) && mmu_user_space_create(pid) != 0)
+            {
+                uart_puts("ELF: could not create isolated address space.\r\n");
+                return -15;
+            }
+            if (mmu_user_space_map(pid, ph->vaddr, end, mode) != 0 ||
+                (ph->filesz != 0 && mmu_user_space_copy_to(pid, ph->vaddr,
+                    image + ph->offset, ph->filesz) != 0))
+            {
+                uart_puts("ELF: isolated image page allocation/copy failed.\r\n");
+                (void)mmu_user_space_destroy(pid);
+                return -9;
+            }
+            /* Physical frames come from the zeroing page allocator, so bytes
+               after p_filesz (including BSS and final-page tail) stay zero. */
+        }
+        else
+        {
+            for (uint64_t j = 0; j < ph->memsz; ++j)
+                ((uint8_t*)ph->vaddr)[j] = 0;
+            for (uint64_t j = 0; j < ph->filesz; ++j)
+                ((uint8_t*)ph->vaddr)[j] = image[ph->offset + j];
+            if (mmu_user_set_range(ph->vaddr, end, mode) != 0)
+            {
+                uart_puts("ELF: page permission setup failed.\r\n");
+                mmu_user_prepare();
+                return -9;
+            }
         }
     }
 
-    /* Give EL0 the private stack and make instruction fetches coherent. */
-    if (mmu_user_finish() != 0)
+    /* Finalize either the legacy single-image table or the new per-process
+       table. P5 pages are independent physical frames and are never loaded by
+       writing through another process's virtual address. */
+    if (pid >= 0)
     {
-        (void)mmu_user_prepare();
-        uart_puts("ELF: failed to activate user mappings.\r\n");
-        return -12;
+        if (mmu_user_space_finish(pid) != 0)
+        {
+            (void)mmu_user_space_destroy(pid);
+            uart_puts("ELF: failed to finalize isolated user mappings.\r\n");
+            return -12;
+        }
+        if (mmu_user_space_sync_code(pid, low, high) != 0)
+        {
+            (void)mmu_user_space_destroy(pid);
+            uart_puts("ELF: instruction cache synchronization failed.\r\n");
+            return -12;
+        }
     }
+    else
+    {
+        if (mmu_user_finish() != 0)
+        {
+            (void)mmu_user_prepare();
+            uart_puts("ELF: failed to activate user mappings.\r\n");
+            return -12;
+        }
 
-    uint64_t flush_end = high > low ? high : low + MMU_PAGE_SIZE;
-    uint64_t begin = low & ~63ULL;
-    uint64_t end = (flush_end + 63ULL) & ~63ULL;
-    for (uint64_t p = begin; p < end; p += 64ULL)
-        asm volatile("dc cvau, %0" :: "r"(p) : "memory");
-    asm volatile("dsb ish" ::: "memory");
-    for (uint64_t p = begin; p < end; p += 64ULL)
-        asm volatile("ic ivau, %0" :: "r"(p) : "memory");
-    asm volatile("dsb ish\nisb" ::: "memory");
+        uint64_t flush_end = high > low ? high : low + MMU_PAGE_SIZE;
+        uint64_t begin = low & ~63ULL;
+        uint64_t end = (flush_end + 63ULL) & ~63ULL;
+        for (uint64_t p = begin; p < end; p += 64ULL)
+            asm volatile("dc cvau, %0" :: "r"(p) : "memory");
+        asm volatile("dsb ish" ::: "memory");
+        for (uint64_t p = begin; p < end; p += 64ULL)
+            asm volatile("ic ivau, %0" :: "r"(p) : "memory");
+        asm volatile("dsb ish\nisb" ::: "memory");
+    }
 
     str_copy(last_path, path, sizeof(last_path));
     last_entry = eh->entry;
@@ -268,4 +311,16 @@ void elf_status()
     uart_puts("Range  : 0x"); print_hex(last_low);
     uart_puts(" - 0x"); print_hex(last_high); uart_puts("\r\n");
     uart_puts("Entry  : 0x"); print_hex(last_entry); uart_puts("\r\n");
+}
+
+
+int elf_load(const char* path, uint64_t* entry_out)
+{
+    return elf_load_internal(path, entry_out, -1);
+}
+
+int elf_load_for_process(const char* path, uint64_t* entry_out, int pid)
+{
+    if (pid < 0) return -1;
+    return elf_load_internal(path, entry_out, pid);
 }

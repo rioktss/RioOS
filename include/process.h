@@ -12,6 +12,16 @@ enum ProcessState
     PROCESS_ZOMBIE = 4
 };
 
+/* EL0 architectural state retained at an exception boundary. This is metadata
+   for a resumable process context; it is distinct from kernel-thread SP state. */
+struct ProcessCpuContext
+{
+    uint64_t x[31];
+    uint64_t elr;
+    uint64_t spsr;
+    uint64_t user_sp;
+};
+
 enum ProcessKind
 {
     PROCESS_KERNEL = 0,
@@ -32,6 +42,9 @@ int process_is_user(int pid);
 uint64_t process_user_low(int pid);
 uint64_t process_user_high(int pid);
 int process_exit_code(int pid);
+int process_save_context(int pid, const ProcessCpuContext* context);
+int process_load_context(int pid, ProcessCpuContext* context);
+int process_context_valid(int pid);
 int process_pid_at(int slot);
 
 #endif

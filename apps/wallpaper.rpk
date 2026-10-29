@@ -1,9 +1,0 @@
-RIOPKG/1
-id=wallpaper
-name=Wallpaper
-type=builtin
-entry=wallpaper
-version=1.0.0
-icon=/icons/wallpaper.bmp
-category=personalization
-description=Browse and apply local uncompressed BMP images stored in /wallpapers.

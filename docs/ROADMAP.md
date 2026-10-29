@@ -2,13 +2,26 @@
 
 RioOS is a long-term learning project. The roadmap is directional rather than a promise of specific release dates.
 
+## P5 — Per-process userspace isolation (v1.12.0)
+
+Implemented in this source baseline:
+
+- PID-keyed EL0 address spaces with private page-table roots and private L3 tables for the executable image and stack ranges.
+- Physical frames allocated for mapped ELF load segments and a private 64 KiB userspace stack; the lower stack region is left unmapped as a guard.
+- ELF segment data is copied through kernel aliases into owned frames rather than writing to a shared fixed virtual image.
+- Address-space activation/deactivation switches TTBR0_EL1 and invalidates stale translation state.
+- PCB support to save and restore the 31 general-purpose registers, ELR, SPSR, and EL0 stack pointer at exception boundaries.
+- User mappings and stack backing frames are released when the process finishes or loading fails.
+
+Still deliberately deferred: scheduling a saved EL0 exception frame onto a different per-process kernel stack, safe process-to-process resume from IRQ/syscall exit, and timer preemption. The current `user_execute()` path remains synchronous; since 1.13.0 the timer IRQ stays live while EL0 runs but only counts ticks. P5 therefore provides real memory isolation and context capture, but it must not be described as full concurrent user-process multitasking yet.
+
 ## Near-term goals
 
 ### Kernel stability
 
 - harden interrupt and timer paths
 - extend cooperative kernel threads toward validated preemption only after IRQ/input safety tests
-- implement per-process page tables/address spaces and saved EL0 register frames before claiming process-level multitasking
+- implement scheduler-driven resume of saved EL0 exception frames on per-process kernel stacks before claiming process-level multitasking
 - improve exception and fault diagnostics
 - increase regression-test coverage
 
@@ -22,7 +35,7 @@ RioOS is a long-term learning project. The roadmap is directional rather than a 
 ### Userspace
 
 - complete pipe integration into the shell and arbitrary userspace process pipelines
-- implement independent EL0 address spaces and saved process CPU contexts before enabling concurrent process execution
+- connect retained EL0 CPU contexts to a validated process scheduler and exception-return switch path
 - add descriptor inheritance through `fork()` only after real process context switching is available
 - expand the small userspace toolset
 - improve the userspace API documentation
@@ -147,13 +160,13 @@ Implemented in this increment:
 - `smp` and `fbinfo` shell diagnostics
 - GitHub Actions CI for clean build, host regression tests, and release verification
 
-Not implemented: secondary CPU release, per-CPU stacks/state, interrupt routing for multiple CPUs, system-wide SMP locking, general USB/HID input, a full desktop window manager, dynamic RPK execution, or timer preemption. The current QEMU pixel UI is a single-screen built-in launcher using ramfb plus a polled VirtIO keyboard/tablet path. Do not enable SMP by editing only the online CPU count; the boot and driver invariants must be completed together.
+Not implemented: secondary CPU release, per-CPU stacks/state, interrupt routing for multiple CPUs, system-wide SMP locking, general USB/HID input, a full desktop window manager, dynamic RPK execution, or timer preemption. Do not enable SMP by editing only the online CPU count; the boot and driver invariants must be completed together.
 
 
-## Pixel UI foundation (v1.11.0)
+## Terminal window and live timer IRQ (v1.13.0)
 
-- Added a QEMU `ramfb` XRGB8888 renderer configured through `fw_cfg` DMA.
-- Added separate boot, lock screen, home screen, app router, and Terminal/Calculator/Clock/Files/Launcher modules under `ui/`.
-- Added and image-packaged five `/apps/*.rpk` built-in-app manifests with release checks.
-- Added `linux/run-ui.sh` and `windows/run-ui.ps1`; the established headless serial runners remain unchanged.
-- QEMU-window keyboard and pointer input use VirtIO keyboard/tablet devices; UART remains a fallback. General USB/HID input, dynamic package execution, and the broader Bash/POSIX shell remain future work. Do not claim runtime stability until the graphical boot and navigation matrix has been tested on QEMU.
+- Removed the pixel UI (`ui/`, `apps/*.rpk`, `assets/`, `run-ui` scripts, UI docs and tests).
+- Added a framebuffer text terminal (`drivers/console.cpp`) with DejaVu Sans Mono, Linux-console colours, ANSI handling, 2000-line scrollback and mouse-wheel / Shift+PageUp scrolling; `run-terminal` shows only the shell in the QEMU window.
+- Enabled the 100 Hz timer IRQ at boot and while EL0 programs run (`SPSR 0x340`); it only counts ticks - preemptive process switching is still deferred.
+- Still needs a runtime acceptance run on `qemu-system-aarch64`.
+

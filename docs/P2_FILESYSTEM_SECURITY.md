@@ -1,5 +1,8 @@
 # P2: Filesystem and permission hardening — RioOS 1.8.0
 
+> **v1.13.0 note:** the timer IRQ is now active (100 Hz tick, also while EL0 programs run) and the GUI was removed. Statements below that say the timer IRQ is disabled/off describe the earlier version this document was written for; see [TIMER_IRQ.md](./TIMER_IRQ.md) and [TERMINAL.md](./TERMINAL.md).
+
+
 ## What changed
 
 - Each filesystem node now carries persisted `uid` and `gid` fields in memory. On disk these fields and a metadata marker use the previously reserved bytes of the existing 128-byte inode, so the superblock version and inode size remain unchanged.

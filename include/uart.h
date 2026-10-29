@@ -4,8 +4,12 @@
 typedef void (*uart_output_hook_t)(char value);
 typedef void (*uart_output_flush_hook_t)();
 
+void uart_init();
 void uart_putc(char c);
 void uart_puts(const char* s);
+/* Serial only: not mirrored to the framebuffer console. */
+void uart_putc_serial_only(char c);
+void uart_puts_serial_only(const char* s);
 /* Non-blocking serial input: returns the next byte (0..255) or -1 when none is pending. */
 int uart_try_getc();
 int uart_has_data();

@@ -1,9 +1,0 @@
-RIOPKG/1
-id=settings
-name=Settings
-type=builtin
-entry=settings
-version=1.0.0
-icon=/icons/settings.bmp
-category=system
-description=Configure RioOS appearance and open wallpaper selection.

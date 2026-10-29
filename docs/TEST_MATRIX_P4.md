@@ -1,5 +1,8 @@
 # RioOS 1.10.0 — P4 test matrix
 
+> **v1.13.0 note:** the timer IRQ is now active (100 Hz tick, also while EL0 programs run) and the GUI was removed. Statements below that say the timer IRQ is disabled/off describe the earlier version this document was written for; see [TIMER_IRQ.md](./TIMER_IRQ.md) and [TERMINAL.md](./TERMINAL.md).
+
+
 | Area | Test | Expected result |
 |---|---|---|
 | SMP default | `tests/smp_host_test.cpp` | One online CPU, SMP disabled, CPU ID masking contract, try-lock/lock/unlock pass |

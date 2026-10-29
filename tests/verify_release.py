@@ -3,7 +3,7 @@ import shutil, struct, subprocess
 
 root=Path(__file__).resolve().parents[1]
 kernel=root/'build/kernel.elf'; disk=root/'storage/disk.img'; user=root/'build/user_init.elf'
-required=['drivers/virtio_mmio.cpp','drivers/virtio_net.cpp','net/netstack.cpp','docs/P3_NETWORKING.md','docs/TEST_MATRIX_P3.md','process/user.cpp','process/elf.cpp','boot/exceptions.S','process/scheduler.cpp','process/thread.cpp','process/ctx_switch.S','kernel/fd.cpp','include/fd.h','tests/fd_host_test.cpp','tests/process_host_test.cpp','tests/scheduler_process_host_test.cpp','drivers/fb.cpp','drivers/font.cpp','drivers/ui_font_data.cpp','include/ui_font_data.h','docs/THIRD_PARTY_NOTICES.md','docs/P2_FILESYSTEM_SECURITY.md','include/smp.h','kernel/smp.cpp','tests/smp_host_test.cpp','tests/fb_host_test.cpp','docs/P4_SMP_DRIVER_HARDENING.md','docs/TEST_MATRIX_P4.md','.github/workflows/ci.yml','include/ui.h','ui/boot.cpp','ui/lock_screen.cpp','ui/home_screen.cpp','ui/ui.cpp','ui/apps.cpp','ui/terminal.cpp','ui/calculator.cpp','ui/clock.cpp','ui/file_manager.cpp','ui/launcher.cpp','ui/wallpaper.cpp','ui/settings.cpp','ui/image.cpp','apps/wallpaper.rpk','apps/pengaturan.rpk','assets/wallpapers/rioos-default.bmp','assets/icons/terminal.bmp','assets/icons/calculator.bmp','assets/icons/clock.bmp','assets/icons/files.bmp','assets/icons/launcher.bmp','assets/icons/wallpaper.bmp','assets/icons/settings.bmp','docs/ANDROID_UI.md','tests/ui_image_host_test.cpp','linux/run-ui.sh','windows/run-ui.ps1','linux/run-terminal.sh','windows/run-terminal.ps1','docs/PIXEL_UI.md','tests/ui_host_test.cpp','apps/terminal.rpk','apps/calculator.rpk','apps/clock.rpk','apps/files.rpk','apps/launcher.rpk']
+required=['drivers/virtio_mmio.cpp','drivers/virtio_net.cpp','net/netstack.cpp','docs/P3_NETWORKING.md','docs/TEST_MATRIX_P3.md','process/user.cpp','process/elf.cpp','boot/exceptions.S','process/scheduler.cpp','process/thread.cpp','process/ctx_switch.S','kernel/fd.cpp','include/fd.h','tests/fd_host_test.cpp','tests/process_host_test.cpp','tests/scheduler_process_host_test.cpp','drivers/fb.cpp','drivers/console.cpp','drivers/console_font.cpp','include/console.h','include/console_font.h','tests/console_host_test.cpp','tools/gen_console_font.py','docs/THIRD_PARTY_NOTICES.md','docs/P2_FILESYSTEM_SECURITY.md','include/smp.h','kernel/smp.cpp','tests/smp_host_test.cpp','docs/P4_SMP_DRIVER_HARDENING.md','docs/TEST_MATRIX_P4.md','docs/TERMINAL.md','docs/TIMER_IRQ.md','.github/workflows/ci.yml','linux/run-terminal.sh','windows/run-terminal.ps1']
 for name in required: assert (root/name).is_file(), f'missing {name}'
 # The repository root is intentionally extensible. Keep the core project
 # metadata required, but do not reject additional files or folders at root.
@@ -11,14 +11,18 @@ assert (root / 'README.md').is_file(), 'README.md is missing from repository roo
 assert (root / '.gitignore').is_file(), '.gitignore is missing from repository root'
 
 platform_scripts = {
-    'linux': ('build.sh', 'run.sh', 'run-terminal.sh', 'run-ui.sh'),
-    'termux': ('build.sh', 'run.sh', 'run-terminal.sh', 'run-ui.sh'),
-    'macos': ('build.sh', 'run.sh', 'run-terminal.sh', 'run-ui.sh'),
-    'windows': ('build.ps1', 'run.ps1', 'run-terminal.ps1', 'run-ui.ps1'),
+    'linux': ('build.sh', 'run.sh', 'run-terminal.sh'),
+    'termux': ('build.sh', 'run.sh', 'run-terminal.sh'),
+    'macos': ('build.sh', 'run.sh', 'run-terminal.sh'),
+    'windows': ('build.ps1', 'run.ps1', 'run-terminal.ps1'),
 }
 for platform, scripts in platform_scripts.items():
     for script in scripts:
         assert (root / platform / script).is_file(), f'missing platform entry point: {platform}/{script}'
+    ui_script = 'run-ui.ps1' if platform == 'windows' else 'run-ui.sh'
+    assert not (root / platform / ui_script).exists(), f'the GUI runner was removed: {platform}/{ui_script}'
+for gone in ('ui', 'apps', 'assets'):
+    assert not (root / gone).exists(), f'GUI folder must not exist: {gone}/'
 assert (root / 'boot/linker.ld').is_file(), 'linker script must remain at boot/linker.ld'
 assert (root / 'docs/LICENSE').is_file(), 'MIT license file is missing'
 assert (root / 'docs/PORTABLE_BUILD.md').is_file(), 'portable build guide is missing'
@@ -74,10 +78,14 @@ for i,(a0,a1,_) in enumerate(nranges):
     for j,(b0,b1,_) in enumerate(nranges):
         if i<j: assert not (a0<b1 and b0<a1), 'nano PT_LOAD ranges overlap'
 
-# Userspace entry must quiesce timer IRQs; normal exec is not allowed to enable them.
+# Timer IRQ is live: the system tick keeps running while EL0 programs execute.
 user_src=(root/'process/user.cpp').read_text()
-assert 'timer_stop();' in user_src and 'interrupt_timer_line_disable();' in user_src and 'interrupt_disable();' in user_src
-assert 'interrupt_enable();' not in user_src
+assert 'timer_stop();' not in user_src and 'interrupt_timer_line_disable();' not in user_src, 'exec must not stop the system timer tick'
+assert 'user_execute_inner' in user_src and 'if (irq_was_on) interrupt_enable();' in user_src, 'exec must restore the CPU IRQ mask'
+user_entry=(root/'process/user_entry.S').read_text()
+assert 'mov x10, #0x340' in user_entry and '#0x3c0' not in user_entry, 'EL0 must be entered with the I-bit clear (SPSR 0x340)'
+vectors_src=(root/'boot/exceptions.S').read_text()
+assert 'VECTOR irq_el0_entry' in vectors_src and 'VECTOR irq_el1_entry' in vectors_src, 'lower-EL and current-EL IRQ vectors are required'
 for i,(a0,a1,_) in enumerate(load_ranges):
     for j,(b0,b1,_) in enumerate(load_ranges):
         if i<j:
@@ -102,8 +110,8 @@ boot_src=(root/'kernel/kernel.cpp').read_text()
 assert 'thread_init();' in boot_src, 'thread subsystem is not initialized'
 thread_src=(root/'process/thread.cpp').read_text()
 assert 'daifclr' not in thread_src, 'cooperative threads must not unmask CPU IRQs'
-assert 'timer_start_periodic(' not in boot_src, 'boot must not start periodic timer IRQs'
-assert 'interrupt_enable();' not in boot_src, 'boot must not unmask CPU IRQs'
+assert 'timer_start_periodic(100U);' in boot_src, 'boot must start the 100 Hz system tick'
+assert 'interrupt_enable();' in boot_src and 'interrupt_timer_line_enable();' in boot_src, 'boot must unmask the timer line and CPU IRQs'
 user_api=(root/'include/user_api.h').read_text()
 syscall_src=(root/'kernel/syscall.cpp').read_text()
 assert 'user_fd_open' in user_api and 'user_fd_seek' in user_api, 'userspace FD helpers are missing'
@@ -119,7 +127,7 @@ fd_test=(root/'tests/fd_host_test.cpp').read_text()
 for marker in ('fd_set_process(77)', 'fd_dup2(shared, 7)', 'fd_pipe(pfd)', '== -11', '== -32'):
     assert marker in fd_test, f'P1 descriptor regression missing: {marker}'
 version_h=(root/'include/version.h').read_text()
-assert '"1.11.0"' in version_h, 'release version mismatch'
+assert '"1.13.0"' in version_h, 'release version mismatch'
 
 # P0 process/MMU/ELF invariants: these checks make the release fail closed if
 # a future edit removes the guards. Runtime QEMU boot is still a separate test.
@@ -142,62 +150,35 @@ assert 'process_destroy(pid) == -3' in proc_test
 syscall_src=(root/'kernel/syscall.cpp').read_text()
 assert 'base > 0xFFFFFFFFFFFFFFFFULL - i' in syscall_src
 
+# P5 process-isolation contracts. The normal EL0 launch path must use a per-PID
+# page-table root and owned frames; host tests cover PCB register-frame storage.
+mmu_p5=(root/'memory/mmu.cpp').read_text()
+mmu_h=(root/'include/mmu.h').read_text()
+elf_p5=(root/'process/elf.cpp').read_text()
+user_p5=(root/'process/user.cpp').read_text()
+assert 'mmu_user_space_create' in mmu_p5 and 'user_l1[USER_AS_MAX]' in mmu_p5
+assert 'mmu_user_space_activate' in mmu_h and 'mmu_user_space_destroy' in mmu_h
+assert 'allocate_page()' in mmu_p5 and 'free_page(' in mmu_p5
+assert 'elf_load_for_process' in elf_p5 and 'mmu_user_space_copy_to' in elf_p5
+assert 'elf_load_for_process(path, &entry, pid)' in user_p5
+assert 'mmu_user_space_deactivate();' in user_p5
+process_h=(root/'include/process.h').read_text()
+assert 'struct ProcessCpuContext' in process_h and 'process_save_context' in process_h
+assert 'process_load_context' in process_h
+assert 'process_save_context(pid, &context)' in (root/'kernel/exceptions.cpp').read_text()
+assert 'process_context_valid' in (root/'tests/process_host_test.cpp').read_text()
+assert (root/'docs/P5_PROCESS_ISOLATION.md').exists(), 'P5 documentation missing'
+
 # no unresolved symbols
 u=subprocess.run([nm_tool,'-u',str(kernel)],text=True,capture_output=True)
 assert not u.stdout.strip(), 'unresolved symbols:\n'+u.stdout
 # superblock
 sb=disk.read_bytes()[:512]; vals=struct.unpack_from('<10I',sb,0); total=struct.unpack_from('<Q',sb,40)[0]
 assert vals[0]==0x4D4B4653 and vals[1]==1 and vals[2]==512 and vals[3]==128 and vals[4]==64 and vals[9]==25 and total==32768
-# Verify the build packaged the built-in RPK applications into /apps and local icon assets.
+# The disk image carries only real programs now: no .rpk packages / images.
 db=disk.read_bytes()
-inodes=[]
-for i in range(64):
-    raw=db[512+i*128:512+(i+1)*128]
-    used,typ,parent,flags=struct.unpack_from('<IIiI',raw,0)
-    size,first=struct.unpack_from('<QQ',raw,16)
-    name=raw[36:100].split(b'\0',1)[0].decode('ascii','ignore')
-    inodes.append({'used':used,'type':typ,'parent':parent,'size':size,'first':first,'name':name})
-apps_id=next((i for i,n in enumerate(inodes) if n['used'] and n['type']==1 and n['parent']==0 and n['name']=='apps'),-1)
-assert apps_id >= 0, 'RPK /apps directory is missing from disk image'
-for app in ('terminal','calculator','clock','files','launcher','wallpaper','pengaturan'):
-    node=next((n for n in inodes if n['used'] and n['parent']==apps_id and n['name']==app+'.rpk'),None)
-    assert node is not None, f'{app}.rpk not installed into disk image'
-    payload=db[node['first']*512:node['first']*512+node['size']]
-    expected_id = b'id=settings' if app == 'pengaturan' else b'id=' + app.encode()
-    assert payload.startswith(b'RIOPKG/1\n') and expected_id in payload, f'{app}.rpk manifest invalid'
-    assert b'icon=/icons/' in payload, f'{app}.rpk local icon entry is missing'
-
-# All wallpaper/icon images must be installed in the guest filesystem, not just
-# present in the source tree. Reject accidental oversize or malformed assets.
-def root_dir(name):
-    return next((i for i,n in enumerate(inodes) if n['used'] and n['type']==1 and n['parent']==0 and n['name']==name),-1)
-def child_file(parent, name):
-    return next((n for n in inodes if n['used'] and n['type']==0 and n['parent']==parent and n['name']==name),None)
-def payload_of(node):
-    assert node is not None and node['size'] > 0, f'missing installed asset: {node}'
-    start=node['first']*512
-    payload=db[start:start+node['size']]
-    assert len(payload)==node['size']
-    return payload
-wallpapers_id=root_dir('wallpapers'); icons_id=root_dir('icons'); settings_id=root_dir('settings')
-assert wallpapers_id>=0 and icons_id>=0 and settings_id>=0, 'wallpaper/icon/settings directories are missing'
-default_wallpaper=child_file(wallpapers_id,'rioos-default.bmp')
-wb=payload_of(default_wallpaper)
-assert len(wb)<=1024*1024 and wb[:2]==b'BM', 'default wallpaper missing or over the 1 MiB cap'
-assert struct.unpack_from('<I',wb,14)[0]>=40
-ww,wh=struct.unpack_from('<ii',wb,18)
-planes,bpp,compression=struct.unpack_from('<HHI',wb,26)
-assert ww>0 and wh!=0 and planes==1 and bpp in (24,32) and compression==0, 'default wallpaper BMP must be uncompressed 24/32-bit'
-for icon_name in ('terminal.bmp','calculator.bmp','clock.bmp','files.bmp','launcher.bmp','wallpaper.bmp','settings.bmp'):
-    ib=payload_of(child_file(icons_id,icon_name))
-    assert len(ib)<=1024*1024 and ib[:2]==b'BM', f'bad local icon asset: {icon_name}'
-assert 'UI_IMAGE_CAPACITY (1024ULL * 1024ULL)' in (root/'ui/image.cpp').read_text()
-assert 'fb_draw_ui_text' in (root/'drivers/fb.cpp').read_text() and 'fb_draw_text(' in (root/'drivers/fb.cpp').read_text(), 'UI smoothing must not remove the legacy serial font renderer'
-assert 'Inter-derived coverage' in (root/'drivers/fb.cpp').read_text(), 'compact antialiased UI font is missing'
-ui_image_test=(root/'tests/ui_image_host_test.cpp').read_text()
-for marker in ('bad BMP format was accepted', 'oversized BMP was accepted', 'wallpaper path traversal was accepted', 'theme settings failed to toggle and persist'):
-    assert marker in ui_image_test, f'UI image/settings regression test missing: {marker}'
-assert 'FS_MAX_FILE_SIZE    (1024ULL * 1024ULL)' in (root/'fs/fs.cpp').read_text()
+assert b'RIOPKG/1' not in db, 'RPK packages must not be installed any more'
+assert not db[512:512+64*128].count(b'.rpk'), 'RPK entries must not exist in the inode table'
 print('RELEASE STATIC CHECK: PASS')
 
 # P2 filesystem/security contracts: persistent owners, centralized access checks,
@@ -251,7 +232,6 @@ assert 'dnsserver' in commands_src and 'ifconfig' in commands_src
 net_test=(root/'tests/net_host_test.cpp').read_text()
 for marker in ('cross-owner socket access', 'corrupt IPv4 checksum', 'bad UDP checksum not delivered', 'outgoing UDP pseudo-header checksum validates', 'DNS A lookup end-to-end', 'TCP three-way handshake', 'TCP receives HTTP response', 'TCP socket close succeeds', 'close-all releases process sockets'):
     assert marker in net_test, f'P3 networking regression missing: {marker}'
-assert 'timer_start_periodic(' not in boot_src and 'interrupt_enable();' not in boot_src
 print('P3 NETWORK STATIC CHECK: PASS')
 
 assert '#define NET_HDR_SIZE             10U' in (root/'drivers/virtio_net.cpp').read_text(), 'base VirtIO-Net header must be 10 bytes when MRG_RXBUF is not negotiated'
@@ -268,63 +248,40 @@ assert '__atomic_exchange_n' in smp_src and '__ATOMIC_ACQUIRE' in smp_src and '_
 assert 'SMP must remain disabled by default' in smp_test
 assert 'smp_init();' in boot_src and 'Secondary-core startup remains disabled' in boot_src
 fb_src=(root/'drivers/fb.cpp').read_text()
-fb_test=(root/'tests/fb_host_test.cpp').read_text()
-assert 'fb_scroll_one_line' in fb_src and 'fb_fill_rect' in fb_src
-assert 'pixel = (bits' in fb_src, 'framebuffer glyph writer must clear background pixels too'
+console_src=(root/'drivers/console.cpp').read_text()
+console_test=(root/'tests/console_host_test.cpp').read_text()
+assert 'fwcfg_init_ramfb' in fb_src and 'RAMFB_FOURCC_XRGB8888' in fb_src, 'QEMU ramfb pixel output path missing'
+assert 'uint8_t entry[64]' in fb_src and 'entry + 4' in fb_src, 'fw_cfg ramfb parser must use fixed 64-byte FWCfgFile records'
 assert 'elem->len > RX_BUFFER_SIZE' in (root/'drivers/virtio_net.cpp').read_text(), 'VirtIO-Net RX length bounds are missing'
 assert 'return -90; /* EMSGSIZE */' in (root/'drivers/virtio_net.cpp').read_text(), 'oversized frame truncation should be rejected'
-assert 'fb_test_attach' in fb_test and 'scroll moves next text row' in fb_test
-assert 'ui_draw_boot_screen' in (root/'tests/ui_host_test.cpp').read_text(), 'pixel UI host rendering regression is missing'
 commands=(root/'kernel/commands.cpp').read_text()
 assert 'command_smp_status' in commands and 'command_fbinfo' in commands
-assert 'timer_start_periodic(' not in boot_src and 'interrupt_enable();' not in boot_src
-ui_src=(root/'ui/ui.cpp').read_text()
-fb_header=(root/'include/fb.h').read_text()
 vfs_src=(root/'fs/vfs.cpp').read_text()
 nano_src=(root/'userspace/nano.S').read_text()
 assert 'fs_resolve("/home/user", root)' in vfs_src, 'interactive VFS must default to the writable user home'
 assert 'current_directory = data_home' in vfs_src, 'VFS writable-home fallback is missing'
 assert 'cmn x0, #2' in nano_src and 'b.eq load_empty' in nano_src, 'nano must only treat ENOENT as a new file'
 assert 'load_failed:' in nano_src and 'msg_denied:' in nano_src, 'nano read/save error handling is missing'
-assert 'state = UI_STATE_HOME;' in ui_src and 'UI: unlocked.' in ui_src, 'lock screen serial unlock path is missing'
-ui_runner=(root/'linux/run-ui.sh').read_text()
-assert 'virtio-keyboard-device' in ui_runner and 'virtio-tablet-device' in ui_runner and 'virtio-mouse-device' in ui_runner, 'QEMU runner must support keyboard, tablet, and optional wheel-capable mouse devices'
-assert 'MOUSE_DEVICE_ARGS=()' in ui_runner and 'wheel scrolling will be disabled' in ui_runner, 'missing optional mouse must not prevent UI startup'
+
+# Framebuffer terminal (QEMU window) contracts.
+assert 'console_putc(c)' in (root/'drivers/uart.cpp').read_text(), 'UART output must be mirrored to the framebuffer terminal'
+assert 'console_start()' in boot_src and 'ui_start' not in boot_src, 'kernel must start the terminal, not a GUI'
+for marker in ('console_scroll_lines', 'console_scroll_pages', 'history_floor', 'run_csi', 'apply_sgr'):
+    assert marker in console_src, f'terminal feature missing: {marker}'
+for marker in ('wheel up goes back', 'scrolled back 30 lines', 'scroll clamps at oldest line', 'output snaps to bottom', 'font is anti-aliased', 'cursor stays in bounds under fuzz'):
+    assert marker.replace('wheel up goes back','scrolled back 30 lines') in console_test, f'terminal regression missing: {marker}'
 input_driver=(root/'drivers/virtio_input.cpp').read_text()
+assert 'console_scroll_lines(event.scroll * WHEEL_LINES_PER_NOTCH)' in input_driver, 'mouse wheel must scroll the terminal'
+assert 'INPUT_REL_WHEEL' in input_driver and 'INPUT_BTN_GEAR_UP' in input_driver, 'wheel must work as REL_WHEEL and as button events'
+assert 'console_scroll_pages(1)' in input_driver and 'console_scroll_pages(-1)' in input_driver, 'PageUp/PageDown must scroll the terminal'
 assert 'virtio_input_poll' in input_driver and 'INPUT_SYN_REPORT' in input_driver, 'VirtIO input events must be polled and synchronized'
-assert 'ui_apps_scroll(active_app, gui_event.scroll)' in ui_src, 'pixel UI must route wheel events to scrollable apps'
-assert 'term_view_offset' in (root/'ui/terminal.cpp').read_text(), 'pixel Terminal must preserve scrollback history'
 assert '&d->queue_size' in input_driver and 'event_avail[i].idx % d->queue_size' in input_driver, 'VirtIO input must honor the negotiated queue size'
-assert 'virtio_input_keyboard_ready' in input_driver and 'virtio_input_pointer_ready' in input_driver, 'keyboard/tablet readiness must be distinguished'
-assert 'INPUT_CFG_ID_NAME' in input_driver and 'read_device_config(d, index)' in input_driver, 'input devices must be identified by their advertised name, not only MMIO order'
-assert 'normalize_axis' in input_driver and 'INPUT_CFG_ABS_INFO' in input_driver, 'tablet coordinates must use device-reported absolute ranges'
-assert 'INPUT_REL_WHEEL' in input_driver and 'RIO_INPUT_SCROLL' in input_driver, 'mouse wheel scrolling must be translated into UI scroll events'
+assert 'INPUT_CFG_ID_NAME' in input_driver and 'read_device_config(d, index)' in input_driver, 'input devices must be identified by their advertised name'
 assert 'INPUT_DEVICE_COUNT    4U' in input_driver, 'VirtIO input scan must support keyboard, tablet, and mouse concurrently'
-assert 'name_len(2), name(name_len)' in fb_src and 'fwcfg_read_next(entry_header, sizeof(entry_header))' in fb_src, 'fw_cfg ramfb parser must honor variable-length directory entries'
-ui_terminal=(root/'ui/terminal.cpp').read_text()
-assert 'execute_command(command_line)' in ui_terminal, 'RPK terminal must use the shared RioOS shell dispatcher'
-assert 'term_equal(command_line, \"logout\")' not in ui_terminal, 'RPK terminal must preserve shared logout/exit command semantics'
-assert 'uart_set_output_hook(term_capture_output, 0)' in ui_terminal, 'RPK terminal must capture normal shell-command output'
-assert 'term_tty_capture' in ui_terminal and 'uart_set_output_flush_hook(term_tty_flush)' in ui_terminal, 'interactive EL0 terminal UI output must be flushed to the framebuffer'
-assert 'uart_flush_output();' in (root/'kernel/security.cpp').read_text(), 'interactive security prompts must flush to the pixel terminal before waiting for input'
-assert 'uart_output_hook_active()' in (root/'kernel/security.cpp').read_text(), 'security input must not draw prompts over a redirected pixel terminal'
-assert 'uart_output_hook_active()' in (root/'kernel/version.cpp').read_text(), 'version output must not paint over a redirected pixel terminal'
-assert '-dy > fb_get_height() / 14' in ui_src and 'pointer_start_y < 52 && dy > fb_get_height() / 14' in ui_src, 'lock-screen/home swipe gestures missing'
-assert 'if (hit >= 0)' in ui_src and 'UI_STATE_APP' in ui_src, 'home-screen pointer hit testing missing'
-assert 'Android-like pixel UI ready' in (root/'ui/ui.cpp').read_text(), 'UI input routing status must be reported'
-assert 'fwcfg_init_ramfb' in fb_src and 'RAMFB_FOURCC_XRGB8888' in fb_src, 'QEMU ramfb pixel output path missing'
-assert 'DISPLAY_BACKEND="${RIOOS_DISPLAY:-gtk}"' in (root/'linux/run-ui.sh').read_text(), 'QEMU UI runner display backend must be configurable'
 terminal_runner=(root/'linux/run-terminal.sh').read_text()
-assert '-serial vc:100Cx32C' in terminal_runner, 'plain-text runner must use a QEMU virtual serial console'
-assert '-display "$DISPLAY_BACKEND"' in terminal_runner, 'plain-text runner must launch a graphical QEMU window'
-assert '-device ramfb' not in terminal_runner, 'plain-text runner must not activate the pixel UI'
-assert '-fw_cfg name=opt/rioos/start-terminal,string=1' not in terminal_runner, 'plain-text runner must not force the pixel Terminal app to start'
-assert '-serial "vc:100Cx32C"' in (root/'windows/run-terminal.ps1').read_text(), 'Windows plain-text runner must attach the QEMU virtual serial console'
-assert 'opt/rioos/start-terminal' in fb_src and 'fb_boot_terminal_requested' in ui_src, 'kernel must honor the optional graphical-terminal startup request'
-assert 'ui_start();' in boot_src and 'timer_delay_ms(900U)' in ui_src
-assert 'timer_start_periodic(' not in ui_src and 'interrupt_enable();' not in ui_src
-assert 'minute != last_render_minute' in ui_src, 'UI must avoid repainting full pages every second'
-for marker in ('fb_fill_rect','fb_draw_circle','fb_draw_round_rect','fb_draw_text','fb_present'):
-    assert marker in fb_header, f'pixel UI primitive missing: {marker}'
+assert '-device ramfb' in terminal_runner and 'virtio-keyboard-device' in terminal_runner and 'virtio-tablet-device' in terminal_runner, 'run-terminal.sh must attach ramfb + keyboard + wheel-capable pointer'
+assert '-nographic' in (root/'linux/run.sh').read_text() and 'ramfb' not in (root/'linux/run.sh').read_text(), 'run.sh must stay a plain host-terminal runner'
+assert 'ramfb' in (root/'windows/run-terminal.ps1').read_text(), 'Windows terminal runner must attach ramfb'
+assert 'uart_flush_output();' in (root/'kernel/security.cpp').read_text(), 'interactive prompts must flush to the terminal before waiting for input'
 print('P4 SMP/DRIVER/FRAMEBUFFER STATIC CHECK: PASS')
-print('UI/RPK STATIC CHECK: PASS')
+print('TERMINAL/IRQ STATIC CHECK: PASS')

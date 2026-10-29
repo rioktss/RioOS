@@ -24,6 +24,8 @@ struct InterruptStats
 
 void interrupt_get_stats(InterruptStats* out);
 int interrupt_cpu_irq_enabled();
+/* Low-power wait for the next event (wfi when the periodic tick is running). */
+void interrupt_idle();
 
 /* Unmask/mask only the timer PPI at the GIC distributor (CPU I-bit is
    controlled separately by interrupt_enable()/interrupt_disable()). */

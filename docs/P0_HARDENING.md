@@ -1,5 +1,8 @@
 # P0 Kernel Hardening — RioOS 1.6.1
 
+> **v1.13.0 note:** the timer IRQ is now active (100 Hz tick, also while EL0 programs run) and the GUI was removed. Statements below that say the timer IRQ is disabled/off describe the earlier version this document was written for; see [TIMER_IRQ.md](./TIMER_IRQ.md) and [TERMINAL.md](./TERMINAL.md).
+
+
 This increment focuses on safety invariants in the existing single-core kernel. It deliberately does **not** enable the Generic Timer IRQ or advertise full process preemption.
 
 ## Changes in this increment

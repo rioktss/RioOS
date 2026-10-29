@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
-# Start the original RioOS UART shell in a plain black QEMU text-console window.
-# This runner deliberately does NOT attach ramfb, fw_cfg start-terminal, or
-# VirtIO GUI input devices, so the pixel UI and its .rpk Terminal app stay off.
+# Run RioOS and show its shell in a QEMU window (framebuffer terminal).
+#
+#   run.sh           -> RioOS in this host terminal (serial, -nographic)
+#   run-terminal.sh  -> RioOS in a QEMU window: only the shell, black
+#                       background, DejaVu Sans Mono font, scrollback with the
+#                       mouse wheel (or Shift+PageUp / Shift+PageDown).
+#
+# The window is a plain text terminal drawn by the kernel on a QEMU ramfb
+# surface. Keyboard and wheel input come from VirtIO keyboard + tablet devices
+# (the absolute tablet needs no mouse grab, so the wheel works as soon as the
+# pointer is over the window). The serial console also stays attached to this
+# host terminal, so boot messages remain visible here.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -23,8 +32,7 @@ command -v "$QEMU" >/dev/null 2>&1 || {
 [[ -f "$KERNEL" ]] || { echo "ERROR: $KERNEL not found. Run the build script for this platform first." >&2; exit 1; }
 [[ -f "$DISK" ]] || { echo "ERROR: $DISK not found. Run the build script for this platform first." >&2; exit 1; }
 
-# Linux/X11/Wayland and Termux:X11 need a graphical session. Native Windows
-# can open the SDL window without DISPLAY; WSLg provides DISPLAY/WAYLAND_DISPLAY.
+# A window needs a desktop session (macOS: Cocoa).
 HOST_KIND="$(uname -s 2>/dev/null || true)"
 IS_NATIVE_WINDOWS=0
 IS_MACOS=0
@@ -34,11 +42,12 @@ case "$HOST_KIND" in
 esac
 if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" && "$IS_NATIVE_WINDOWS" -eq 0 && "$IS_MACOS" -eq 0 ]]; then
     echo "ERROR: no graphical session detected (DISPLAY / WAYLAND_DISPLAY is empty)." >&2
-    echo "  On Android, start Termux:X11 first; on WSL use WSLg." >&2
-    echo "  On a Windows laptop, use run-terminal.ps1 or run this from Git Bash with SDL QEMU." >&2
+    echo "  Run this from a terminal inside your desktop, or use run.sh for a plain terminal." >&2
     exit 1
 fi
 
+# Arch's base qemu packages ship without GUI backends; detect that early
+# instead of letting QEMU open no window at all.
 backend_ok() { "$QEMU" -display help 2>&1 | grep -qw -- "$1"; }
 if ! backend_ok "$DISPLAY_BACKEND"; then
     picked=""
@@ -54,23 +63,30 @@ if ! backend_ok "$DISPLAY_BACKEND"; then
     DISPLAY_BACKEND="$picked"
 fi
 
-echo "RioOS text shell: opening a plain QEMU console window ($DISPLAY_BACKEND)." >&2
-echo "The window shows the original UART command shell on a black background." >&2
-echo "This mode does not start the pixel UI or the Terminal .rpk app." >&2
+DEVICE_HELP="$("$QEMU" -device help 2>&1 || true)"
+for required_device in ramfb virtio-keyboard-device virtio-tablet-device; do
+    if ! grep -Fq "name \"${required_device}\"" <<<"$DEVICE_HELP"; then
+        echo "ERROR: this QEMU build lacks '${required_device}'." >&2
+        echo "  Install a QEMU system-aarch64 build that includes ramfb and VirtIO input devices." >&2
+        exit 1
+    fi
+done
 
-# QEMU's virtual console presents UART text in the graphical window. No ramfb
-# is attached, so ui_start() leaves the built-in serial shell as the only UI.
-# Keep the virtual disk and VirtIO network devices from the normal runner.
+echo "RioOS terminal window: QEMU ($DISPLAY_BACKEND). Type in the window; scroll with the mouse wheel." >&2
+
 exec "$QEMU" \
     -M virt,gic-version=2,virtualization=on \
     -global virtio-mmio.force-legacy=false \
     -cpu "$CPU" \
     -m "$MEM" \
     -display "$DISPLAY_BACKEND" \
-    -serial vc:100Cx32C \
+    -serial stdio \
     -monitor none \
     -kernel "$KERNEL" \
+    -device ramfb \
     -drive "if=none,format=raw,file=$DISK,id=vd0" \
     -device virtio-blk-device,drive=vd0 \
     -netdev user,id=n1,ipv4=on,ipv6=off \
-    -device virtio-net-device,netdev=n1
+    -device virtio-net-device,netdev=n1 \
+    -device virtio-keyboard-device \
+    -device virtio-tablet-device

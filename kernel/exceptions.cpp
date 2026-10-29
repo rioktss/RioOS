@@ -5,6 +5,7 @@
 #include "interrupt.h"
 #include "fault.h"
 #include "user.h"
+#include "process.h"
 
 extern "C" char exception_vectors_el1[];
 extern "C" void user_exit_return();
@@ -54,6 +55,26 @@ extern "C" void exception_sync_el0(void* raw)
 {
     ExceptionFrame* frame = (ExceptionFrame*)raw;
     if (frame == 0) { stop_kernel(); return; }
+
+    /* Capture the complete EL0 register frame at each boundary. P5 retains it
+       in the PCB so a later scheduler can resume this process without relying
+       on the current shell's C stack frame. The live scheduler remains
+       cooperative until process-frame switching has passed QEMU IRQ tests. */
+    int pid = user_current_pid();
+    if (pid >= 0 && process_is_user(pid))
+    {
+        ProcessCpuContext context;
+        for (int r = 0; r < 31; ++r) context.x[r] = frame->x[r];
+        context.elr = frame->elr;
+        context.spsr = frame->spsr;
+#ifndef HOST_TEST
+        asm volatile("mrs %0, sp_el0" : "=r"(context.user_sp));
+#else
+        context.user_sp = 0;
+#endif
+        (void)process_save_context(pid, &context);
+    }
+
     uint64_t ec = (frame->esr >> 26) & 0x3FULL;
     if (ec == 0x15ULL) { syscall_dispatch(frame, 1); return; }
 

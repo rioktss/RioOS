@@ -1,5 +1,8 @@
 # RioOS file-descriptor API — v1.7.0
 
+> **v1.13.0 note:** the timer IRQ is now active (100 Hz tick, also while EL0 programs run) and the GUI was removed. Statements below that say the timer IRQ is disabled/off describe the earlier version this document was written for; see [TIMER_IRQ.md](./TIMER_IRQ.md) and [TERMINAL.md](./TERMINAL.md).
+
+
 RioOS provides a bounded descriptor API for EL0 userspace. It is a small Unix-inspired interface, not a complete POSIX implementation.
 
 ## Operations

@@ -1,9 +1,0 @@
-RIOPKG/1
-id=launcher
-name=Launcher
-type=builtin
-entry=launcher
-version=1.0.0
-icon=/icons/launcher.bmp
-category=system
-description=Pixel app drawer that validates installed RPK manifests and launches built-in apps.

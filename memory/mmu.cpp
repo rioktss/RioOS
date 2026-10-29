@@ -1,11 +1,18 @@
 #include "mmu.h"
 #include "uart.h"
+#include "page_alloc.h"
 
 #define RAM_START 0x40000000ULL
 #define RAM_SIZE (128ULL * 1024ULL * 1024ULL)
 #define L3_ENTRIES 512
 #define RAM_L3_TABLES 64
 #define MAX_USER_PAGES ((MMU_USER_LIMIT - MMU_USER_BASE) / MMU_PAGE_SIZE)
+#define USER_AS_MAX 32
+#define USER_L2_FIRST 56
+#define USER_L2_COUNT 4
+#define STACK_L2_INDEX 63
+#define USER_STACK_PAGES ((MMU_USER_STACK_TOP - MMU_USER_STACK_BASE) / MMU_PAGE_SIZE)
+#define USER_STACK_FIRST_L3 ((MMU_USER_STACK_BASE - (RAM_START + (uint64_t)STACK_L2_INDEX * 0x200000ULL)) / MMU_PAGE_SIZE)
 
 #define DESC_VALID (1ULL << 0)
 #define DESC_TABLE (1ULL << 1)
@@ -52,6 +59,55 @@ extern "C" char __kernel_exec_end[];
 
 static uint8_t user_page_modes[MAX_USER_PAGES];
 static int user_active = 0;
+
+/* P5 address spaces. The L1, RAM L2 and five private L3 tables per process
+   are static so that page-table memory is never itself reclaimed while live.
+   All unmodified RAM/device tables remain shared read-only by convention. */
+struct UserAddressSpace
+{
+    int used;
+    int pid;
+    int ready;
+};
+static UserAddressSpace user_spaces[USER_AS_MAX];
+static uint64_t user_l1[USER_AS_MAX][512] __attribute__((aligned(4096)));
+static uint64_t user_l2_ram[USER_AS_MAX][512] __attribute__((aligned(4096)));
+static uint64_t user_l3_image[USER_AS_MAX][USER_L2_COUNT][512] __attribute__((aligned(4096)));
+static uint64_t user_l3_stack[USER_AS_MAX][512] __attribute__((aligned(4096)));
+static uint64_t user_frames[USER_AS_MAX][MAX_USER_PAGES];
+static uint64_t stack_frames[USER_AS_MAX][USER_STACK_PAGES];
+static uint8_t user_space_modes[USER_AS_MAX][MAX_USER_PAGES];
+static uint8_t user_stack_modes[USER_AS_MAX][USER_STACK_PAGES];
+static int active_user_space = -1;
+
+static void clean_table_range(const void* start_ptr, uint64_t bytes);
+
+static int user_space_find(int pid)
+{
+    if (pid < 0) return -1;
+    for (int i = 0; i < USER_AS_MAX; ++i)
+        if (user_spaces[i].used && user_spaces[i].pid == pid)
+            return i;
+    return -1;
+}
+
+static void copy_table(uint64_t* destination, const uint64_t* source)
+{
+    for (int i = 0; i < 512; ++i) destination[i] = source[i];
+}
+
+static void zero_table(uint64_t* table)
+{
+    for (int i = 0; i < 512; ++i) table[i] = 0;
+}
+
+static void user_space_clean_tables(int slot)
+{
+    clean_table_range(user_l1[slot], sizeof(user_l1[slot]));
+    clean_table_range(user_l2_ram[slot], sizeof(user_l2_ram[slot]));
+    clean_table_range(user_l3_image[slot], sizeof(user_l3_image[slot]));
+    clean_table_range(user_l3_stack[slot], sizeof(user_l3_stack[slot]));
+}
 
 static uint64_t read_sctlr()
 {
@@ -291,6 +347,8 @@ static int user_range_ok(uint64_t start, uint64_t end)
 
 int mmu_user_prepare()
 {
+    /* Return to the baseline kernel address space before touching its tables. */
+    if (active_user_space >= 0) (void)mmu_user_space_deactivate();
     /* Fail closed before changing descriptors, then invalidate stale TLB state. */
     user_active = 0;
     for (uint64_t i = 0; i < MAX_USER_PAGES; ++i)
@@ -361,14 +419,38 @@ int mmu_user_finish()
 
 int mmu_user_pointer_ok(uint64_t address, uint64_t length, int write)
 {
-    if (!user_active || address == 0 || length == 0)
-        return 0;
-    if (address < MMU_USER_BASE || address >= MMU_USER_STACK_TOP)
-        return 0;
-    if (length > MMU_USER_STACK_TOP - address)
-        return 0;
-
+    if (address == 0 || length == 0) return 0;
+    if (address < MMU_USER_BASE || address >= MMU_USER_STACK_TOP) return 0;
+    if (length > MMU_USER_STACK_TOP - address) return 0;
     uint64_t end = address + length;
+
+    if (active_user_space >= 0)
+    {
+        int slot = active_user_space;
+        uint64_t pos = address & ~(MMU_PAGE_SIZE - 1ULL);
+        while (pos < end)
+        {
+            int okay = 0;
+            if (pos >= MMU_USER_BASE && pos < MMU_USER_LIMIT)
+            {
+                uint64_t idx = (pos - MMU_USER_BASE) / MMU_PAGE_SIZE;
+                uint8_t mode = user_space_modes[slot][idx];
+                okay = user_frames[slot][idx] != 0 && (mode & USER_R) != 0 &&
+                       (!write || (mode & USER_W) != 0);
+            }
+            else if (pos >= MMU_USER_STACK_BASE && pos < MMU_USER_STACK_TOP)
+            {
+                uint64_t idx = (pos - MMU_USER_STACK_BASE) / MMU_PAGE_SIZE;
+                okay = idx < USER_STACK_PAGES && stack_frames[slot][idx] != 0 &&
+                       (!write || (user_stack_modes[slot][idx] & USER_W) != 0);
+            }
+            if (!okay) return 0;
+            pos += MMU_PAGE_SIZE;
+        }
+        return 1;
+    }
+
+    if (!user_active) return 0;
     uint64_t pos = address & ~(MMU_PAGE_SIZE - 1ULL);
     while (pos < end)
     {
@@ -377,20 +459,279 @@ int mmu_user_pointer_ok(uint64_t address, uint64_t length, int write)
         {
             uint64_t idx = (pos - MMU_USER_BASE) / MMU_PAGE_SIZE;
             uint8_t mode = user_page_modes[idx];
-            okay = (mode & USER_R)!= 0 && (!write || (mode & USER_W)!= 0);
+            okay = (mode & USER_R) != 0 && (!write || (mode & USER_W) != 0);
         }
         else if (pos >= MMU_USER_STACK_BASE && pos < MMU_USER_STACK_TOP)
         {
-            okay = 1; /* private EL0 stack is always RW */
+            okay = 1; /* compatibility path: legacy single-image stack */
         }
-        if (!okay)
-            return 0;
+        if (!okay) return 0;
         pos += MMU_PAGE_SIZE;
     }
     return 1;
 }
 
 uint64_t mmu_user_stack_top() { return MMU_USER_STACK_TOP; }
+
+
+int mmu_user_space_exists(int pid)
+{
+    return user_space_find(pid) >= 0;
+}
+
+int mmu_user_space_active_pid()
+{
+    return active_user_space >= 0 ? user_spaces[active_user_space].pid : -1;
+}
+
+int mmu_user_space_create(int pid)
+{
+    if (!mmu_enabled() || pid < 0 || !page_alloc_ready()) return -1;
+    if (user_space_find(pid) >= 0) return -2;
+
+    int slot = -1;
+    for (int i = 0; i < USER_AS_MAX; ++i)
+        if (!user_spaces[i].used) { slot = i; break; }
+    if (slot < 0) return -3;
+
+    user_spaces[slot].used = 1;
+    user_spaces[slot].pid = pid;
+    user_spaces[slot].ready = 0;
+    for (uint64_t i = 0; i < MAX_USER_PAGES; ++i)
+    {
+        user_frames[slot][i] = 0;
+        user_space_modes[slot][i] = 0;
+    }
+    for (uint64_t i = 0; i < USER_STACK_PAGES; ++i)
+    {
+        stack_frames[slot][i] = 0;
+        user_stack_modes[slot][i] = 0;
+    }
+
+    copy_table(user_l1[slot], l1_table);
+    copy_table(user_l2_ram[slot], l2_ram);
+    user_l1[slot][0] = table_descriptor((uint64_t)l2_low);
+    user_l1[slot][1] = table_descriptor((uint64_t)user_l2_ram[slot]);
+
+    for (int t = 0; t < USER_L2_COUNT; ++t)
+    {
+        copy_table(user_l3_image[slot][t], ram_l3[USER_L2_FIRST + t]);
+        zero_table(user_l3_image[slot][t]);
+        user_l2_ram[slot][USER_L2_FIRST + t] =
+            table_descriptor((uint64_t)user_l3_image[slot][t]);
+    }
+
+    copy_table(user_l3_stack[slot], ram_l3[STACK_L2_INDEX]);
+    for (int i = 256; i < 512; ++i) user_l3_stack[slot][i] = 0;
+    user_l2_ram[slot][STACK_L2_INDEX] = table_descriptor((uint64_t)user_l3_stack[slot]);
+
+    /* Only the top 64 KiB is mapped as EL0 stack. Each page has an independent
+       physical backing page; the lower part of the previous 1 MiB range is a
+       guard region, so underflow becomes a permission/translation fault. */
+    for (uint64_t i = 0; i < USER_STACK_PAGES; ++i)
+    {
+        void* frame = allocate_page();
+        if (frame == 0)
+        {
+            (void)mmu_user_space_destroy(pid);
+            return -4;
+        }
+        stack_frames[slot][i] = (uint64_t)frame;
+        user_stack_modes[slot][i] = (uint8_t)(USER_R | USER_W);
+        uint64_t l3_index = USER_STACK_FIRST_L3 + i;
+        user_l3_stack[slot][l3_index] =
+            page_descriptor_l3((uint64_t)frame, user_flags(USER_R | USER_W), DESC_SH_INNER);
+    }
+
+    user_space_clean_tables(slot);
+    return 0;
+}
+
+int mmu_user_space_map(int pid, uint64_t start, uint64_t end, uint32_t flags)
+{
+    int slot = user_space_find(pid);
+    if (slot < 0 || user_spaces[slot].ready || !mmu_enabled() || end <= start ||
+        start < MMU_USER_BASE || end > MMU_USER_LIMIT ||
+        (start & (MMU_PAGE_SIZE - 1ULL)) != 0 || flags == 0 ||
+        (flags & ~(USER_R | USER_W | USER_X)) != 0 ||
+        ((flags & USER_W) != 0 && (flags & USER_X) != 0))
+        return -1;
+
+    uint64_t rounded_end = (end + MMU_PAGE_SIZE - 1ULL) & ~(MMU_PAGE_SIZE - 1ULL);
+    if (rounded_end < end || rounded_end > MMU_USER_LIMIT) return -1;
+    uint64_t first = (start - MMU_USER_BASE) / MMU_PAGE_SIZE;
+    uint64_t last = (rounded_end - MMU_USER_BASE) / MMU_PAGE_SIZE;
+    if (last <= first || last > MAX_USER_PAGES) return -1;
+
+    for (uint64_t i = first; i < last; ++i)
+        if (user_frames[slot][i] != 0 || user_space_modes[slot][i] != 0)
+            return -2;
+
+    uint64_t i = first;
+    for (; i < last; ++i)
+    {
+        void* frame = allocate_page();
+        if (frame == 0) break;
+        user_frames[slot][i] = (uint64_t)frame;
+        user_space_modes[slot][i] = (uint8_t)flags;
+        uint64_t va = MMU_USER_BASE + i * MMU_PAGE_SIZE;
+        uint64_t table_index = (va - RAM_START) / 0x200000ULL;
+        uint64_t l3_index = (va >> 12) & 0x1FFULL;
+        if (table_index < USER_L2_FIRST || table_index >= USER_L2_FIRST + USER_L2_COUNT)
+        {
+            (void)mmu_user_space_destroy(pid);
+            return -3;
+        }
+        user_l3_image[slot][table_index - USER_L2_FIRST][l3_index] =
+            page_descriptor_l3((uint64_t)frame, user_flags(flags), DESC_SH_INNER);
+    }
+    if (i != last)
+    {
+        for (uint64_t j = first; j < i; ++j)
+        {
+            (void)free_page((void*)user_frames[slot][j]);
+            user_frames[slot][j] = 0;
+            user_space_modes[slot][j] = 0;
+            uint64_t va = MMU_USER_BASE + j * MMU_PAGE_SIZE;
+            uint64_t table_index = (va - RAM_START) / 0x200000ULL;
+            uint64_t l3_index = (va >> 12) & 0x1FFULL;
+            user_l3_image[slot][table_index - USER_L2_FIRST][l3_index] = 0;
+        }
+        return -4;
+    }
+    return 0;
+}
+
+void* mmu_user_space_pointer(int pid, uint64_t address)
+{
+    int slot = user_space_find(pid);
+    if (slot < 0) return 0;
+    if (address >= MMU_USER_BASE && address < MMU_USER_LIMIT)
+    {
+        uint64_t index = (address - MMU_USER_BASE) / MMU_PAGE_SIZE;
+        if (user_frames[slot][index] == 0) return 0;
+        return (void*)(user_frames[slot][index] + (address & (MMU_PAGE_SIZE - 1ULL)));
+    }
+    if (address >= MMU_USER_STACK_BASE && address < MMU_USER_STACK_TOP)
+    {
+        uint64_t index = (address - MMU_USER_STACK_BASE) / MMU_PAGE_SIZE;
+        if (index >= USER_STACK_PAGES || stack_frames[slot][index] == 0) return 0;
+        return (void*)(stack_frames[slot][index] + (address & (MMU_PAGE_SIZE - 1ULL)));
+    }
+    return 0;
+}
+
+int mmu_user_space_copy_to(int pid, uint64_t destination, const void* source, uint64_t length)
+{
+    if (source == 0 || length == 0 || destination < MMU_USER_BASE ||
+        destination >= MMU_USER_LIMIT || length > MMU_USER_LIMIT - destination)
+        return -1;
+    const uint8_t* src = (const uint8_t*)source;
+    uint64_t copied = 0;
+    while (copied < length)
+    {
+        uint64_t address = destination + copied;
+        uint64_t chunk = MMU_PAGE_SIZE - (address & (MMU_PAGE_SIZE - 1ULL));
+        if (chunk > length - copied) chunk = length - copied;
+        uint8_t* dst = (uint8_t*)mmu_user_space_pointer(pid, address);
+        if (dst == 0) return -2;
+        for (uint64_t j = 0; j < chunk; ++j) dst[j] = src[copied + j];
+        copied += chunk;
+    }
+    return 0;
+}
+
+int mmu_user_space_finish(int pid)
+{
+    int slot = user_space_find(pid);
+    if (slot < 0 || !mmu_enabled()) return -1;
+    int mapped = 0;
+    for (uint64_t i = 0; i < MAX_USER_PAGES; ++i)
+        if (user_frames[slot][i] != 0) mapped = 1;
+    if (!mapped) return -2;
+    user_spaces[slot].ready = 1;
+    user_space_clean_tables(slot);
+    asm volatile("dsb sy" ::: "memory");
+    return 0;
+}
+
+int mmu_user_space_activate(int pid)
+{
+    int slot = user_space_find(pid);
+    if (slot < 0 || !user_spaces[slot].ready || !mmu_enabled()) return -1;
+    user_space_clean_tables(slot);
+    asm volatile("dsb sy" ::: "memory");
+    uint64_t root = (uint64_t)user_l1[slot];
+    asm volatile("msr ttbr0_el1, %0\n isb" :: "r"(root) : "memory");
+    tlb_flush_all();
+    active_user_space = slot;
+    user_active = 0;
+    return 0;
+}
+
+int mmu_user_space_deactivate()
+{
+    if (active_user_space < 0) return 0;
+    uint64_t root = (uint64_t)l1_table;
+    asm volatile("msr ttbr0_el1, %0\n isb" :: "r"(root) : "memory");
+    tlb_flush_all();
+    active_user_space = -1;
+    user_active = 0;
+    return 0;
+}
+
+int mmu_user_space_destroy(int pid)
+{
+    int slot = user_space_find(pid);
+    if (slot < 0) return -1;
+    if (active_user_space == slot) (void)mmu_user_space_deactivate();
+
+    for (uint64_t i = 0; i < MAX_USER_PAGES; ++i)
+    {
+        if (user_frames[slot][i] != 0)
+            (void)free_page((void*)user_frames[slot][i]);
+        user_frames[slot][i] = 0;
+        user_space_modes[slot][i] = 0;
+    }
+    for (uint64_t i = 0; i < USER_STACK_PAGES; ++i)
+    {
+        if (stack_frames[slot][i] != 0)
+            (void)free_page((void*)stack_frames[slot][i]);
+        stack_frames[slot][i] = 0;
+        user_stack_modes[slot][i] = 0;
+    }
+    user_spaces[slot].used = 0;
+    user_spaces[slot].pid = -1;
+    user_spaces[slot].ready = 0;
+    return 0;
+}
+
+int mmu_user_space_sync_code(int pid, uint64_t start, uint64_t end)
+{
+    int slot = user_space_find(pid);
+    if (slot < 0 || !user_spaces[slot].ready || start < MMU_USER_BASE ||
+        end <= start || end > MMU_USER_LIMIT)
+        return -1;
+    if (mmu_user_space_activate(pid) != 0) return -2;
+    uint64_t begin = start & ~63ULL;
+    uint64_t finish = (end + 63ULL) & ~63ULL;
+    for (uint64_t p = begin; p < finish; p += 64ULL)
+    {
+        uint64_t page = (p - MMU_USER_BASE) / MMU_PAGE_SIZE;
+        if (page < MAX_USER_PAGES && (user_space_modes[slot][page] & USER_X) != 0)
+            asm volatile("dc cvau, %0" :: "r"(p) : "memory");
+    }
+    asm volatile("dsb ish" ::: "memory");
+    for (uint64_t p = begin; p < finish; p += 64ULL)
+    {
+        uint64_t page = (p - MMU_USER_BASE) / MMU_PAGE_SIZE;
+        if (page < MAX_USER_PAGES && (user_space_modes[slot][page] & USER_X) != 0)
+            asm volatile("ic ivau, %0" :: "r"(p) : "memory");
+    }
+    asm volatile("dsb ish\n isb" ::: "memory");
+    (void)mmu_user_space_deactivate();
+    return 0;
+}
 
 void mmu_status()
 {
@@ -402,5 +743,5 @@ void mmu_status()
     for (int i = 15; i >= 0; --i) uart_putc(h[(v >> (i * 4)) & 0xF]);
     uart_puts("\r\n");
     uart_puts("User VA : 0x47000000 - 0x47800000\r\n");
-    uart_puts("Stack : 0x47F00000 - 0x48000000\r\n");
+    uart_puts("Stack : 0x47FF0000 - 0x48000000 (64 KiB; guard below)\r\n");
 }

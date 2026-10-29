@@ -10,10 +10,10 @@ This package makes the RioOS build/run workflow portable across:
 
 ## Files
 
-- `linux/` — `build.sh`, `run.sh`, `run-terminal.sh`, `run-ui.sh` for Linux and WSL
+- `linux/` — `build.sh`, `run.sh`, `run-terminal.sh` for Linux and WSL
 - `termux/` — the same four Bash entry points for Android Termux
 - `macos/` — the same four Bash entry points with macOS Cocoa display defaults
-- `windows/` — `build.ps1`, `run.ps1`, `run-terminal.ps1`, `run-ui.ps1`
+- `windows/` — `build.ps1`, `run.ps1`, `run-terminal.ps1`
 - `docs/PORTABLE_BUILD.md` — this documentation
 
 ## Important

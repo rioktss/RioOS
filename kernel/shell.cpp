@@ -2,7 +2,8 @@
 #include "keyboard.h"
 #include "commands.h"
 #include "uart.h"
-#include "fb.h"
+#include "console.h"
+#include "interrupt.h"
 #include "vfs.h"
 #include "fs.h"
 #include "security.h"
@@ -22,21 +23,23 @@ static void shell_prompt_text()
 {
     char cwd[96];
     vfs_get_path(cwd, (int)sizeof(cwd));
-    uart_putc('[');
-    uart_puts(security_username());
-    uart_puts("@RioOS ");
-    uart_puts(cwd);
-    uart_putc(']');
-    uart_putc(security_prompt_char());
-    uart_putc(' ');
+    char tail[4];
+    tail[0] = ']'; tail[1] = security_prompt_char(); tail[2] = ' '; tail[3] = '\0';
 
-    fb_print("[", 0x00FF00);
-    fb_print(security_username(), 0x00FF00);
-    fb_print("@RioOS ", 0x00FF00);
-    fb_print(cwd, 0x00FF00);
-    fb_print("]", 0x00FF00);
-    fb_putc(security_prompt_char(), 0x00FF00);
-    fb_putc(' ', 0x00FF00);
+    /* The serial console gets plain text; the QEMU window gets the same text
+       in Arch-style colours (green user@host, blue directory). */
+    uart_putc_serial_only('[');
+    uart_puts_serial_only(security_username());
+    uart_puts_serial_only("@RioOS ");
+    uart_puts_serial_only(cwd);
+    uart_puts_serial_only(tail);
+
+    console_write_attr("[", 2, 1);
+    console_write_attr(security_username(), 2, 1);
+    console_write_attr("@RioOS ", 2, 1);
+    console_write_attr(cwd, 4, 1);
+    console_write_attr("]", 2, 1);
+    console_write_attr(tail + 1, security_prompt_char() == '#' ? 1 : 2, 1);
 }
 
 static void redraw_line(const char* input, int length)
@@ -186,12 +189,21 @@ void shell()
             char c = 0;
             if (uart_has_data()) c = uart_getc();
             else if (keyboard_has_data()) c = keyboard_getc();
-            else { asm volatile("yield"); continue; }
+            else { console_flush(); interrupt_idle(); continue; }
 
-            if (c == '\x1B')
+            /* QEMU-window arrow keys arrive as single bytes (VirtIO / PS/2);
+               serial terminals send ESC [ A / ESC [ B. Normalise both. */
+            int arrow = 0;
+            if ((unsigned char)c == 0x80U) arrow = 'A';
+            else if ((unsigned char)c == 0x81U) arrow = 'B';
+            if (c == '\x1B' || arrow != 0)
             {
                 char seq[3];
-                if (read_escape_sequence(seq) >= 2 && seq[0] == '[')
+                seq[0] = seq[1] = seq[2] = '\0';
+                int have = 0;
+                if (arrow != 0) { seq[0] = '['; seq[1] = (char)arrow; have = 2; }
+                else have = read_escape_sequence(seq);
+                if (have >= 2 && seq[0] == '[')
                 {
                     if (seq[1] == 'A') /* Up */
                     {
@@ -231,7 +243,6 @@ void shell()
             {
                 input[length] = '\0';
                 uart_puts("\r\n");
-                fb_print("\r\n", 0xFFFFFF);
                 if (length > 0) history_add(input);
                 break;
             }
@@ -243,7 +254,6 @@ void shell()
                     --length;
                     input[length] = '\0';
                     uart_puts("\b \b");
-                    fb_putc('\b', 0xFFFFFF);
                 }
                 continue;
             }
@@ -253,12 +263,10 @@ void shell()
                 input[length++] = c;
                 input[length] = '\0';
                 uart_putc(c);
-                fb_putc(c, 0xFFFFFF);
             }
         }
 
         execute_command(input);
         uart_puts("\r\n");
-        fb_print("\r\n", 0xFFFFFF);
     }
 }
