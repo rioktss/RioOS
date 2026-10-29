@@ -1,5 +1,6 @@
 # RioOS
 
+
 <p align="center">
   <strong>RioOS — ARM64/AArch64 Bare-Metal Operating System</strong><br>
   Built around the custom MyKernel kernel and designed to boot on QEMU <code>virt</code>.
@@ -19,6 +20,14 @@
 [![Target](https://img.shields.io/badge/target-QEMU%20virt-success)](https://www.qemu.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue)](./docs/LICENSE)
 [![Status](https://img.shields.io/badge/status-work%20in%20progress-orange)](#project-status)
+
+
+# RioOS Preview
+
+![RioOS Preview](docs/img/view.jpg)
+
+*RioOS running on QEMU system aarch64*
+
 
 ## About RioOS
 
