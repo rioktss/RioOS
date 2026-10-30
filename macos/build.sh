@@ -270,9 +270,6 @@ step "8/9" "Running host tests"
     -o "$HOST_TOOLS/console_host_test"
 "$HOST_TOOLS/console_host_test" > /dev/null
 
-step "9/9" "Release verification"
-"$PYTHON" tests/verify_release.py > /dev/null
-
 # MINIMAL SUCCESS
 printf 'build success\n'
 

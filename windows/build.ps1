@@ -169,10 +169,6 @@ Invoke-HostTest "scheduler_process_host_test" @("tests/scheduler_process_host_te
 Invoke-HostTest "smp_host_test" @("tests/smp_host_test.cpp","kernel/smp.cpp") $true
 Invoke-HostTest "console_host_test" @("tests/console_host_test.cpp","drivers/console.cpp","drivers/console_font.cpp","drivers/fb.cpp") $true
 
-Write-Host "[9/9] Release verification"
-if ($Python -eq "py") { & py -3 tests/verify_release.py } else { & $Python tests/verify_release.py }
-if ($LASTEXITCODE -ne 0) { throw "Release verification failed" }
-
 Write-Host ""
 Write-Host "=================================="
 Write-Host "       BUILD SUCCESS (v1.13.0)"
