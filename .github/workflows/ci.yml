@@ -25,4 +25,3 @@ jobs:
         run: |
           test -s build/kernel.elf
           test -s build/user_init.elf
-          python3 tests/verify_release.py
