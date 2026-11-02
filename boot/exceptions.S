@@ -82,6 +82,7 @@ sync_el0_entry:
     SAVE_EXCEPTION_FRAME
     mov x0, sp
     bl exception_sync_el0
+    bl task_deliver_signals
     b exception_restore_el1
 
 irq_el1_entry:
@@ -94,6 +95,8 @@ irq_el0_entry:
     SAVE_EXCEPTION_FRAME
     mov x0, sp
     bl interrupt_dispatch
+    bl thread_user_preempt
+    bl task_deliver_signals
     b exception_restore_el1
 
 exception_restore_el1:

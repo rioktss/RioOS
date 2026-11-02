@@ -1,3 +1,4 @@
+#include "thread.h"
 #include "interrupt.h"
 #include "uart.h"
 #include "timer.h"
@@ -241,6 +242,8 @@ void interrupt_idle()
        us; otherwise (tick stopped via `irq off`, or IRQs masked) just hint. */
     /* Never sleep: input is polled, so a missing wake-up can't freeze typing. */
     asm volatile("yield" ::: "memory");
+    /* Let background user tasks run while the shell waits for input. */
+    if (thread_user_tasks() > 0) thread_yield();
 }
 
 int interrupt_cpu_irq_enabled()

@@ -49,17 +49,17 @@ extern "C" void kernel_main()
         }
         while (pos > 0) uart_putc(cpu_id_text[--pos]);
     }
-    uart_puts("; online CPUs = 1; SMP disabled by design.\r\n");
+    uart_puts("; secondary cores are released after the MMU is up.\r\n");
 
     uart_puts("[1] Initializing memory...\r\n");
     memory_init();
     uart_puts("[2] Memory initialized.\r\n");
 
-    /* Physical page pool (4 MiB + alignment slack) carved from the heap. */
+    /* Physical page pool (32 MiB + alignment slack) carved from the heap. */
     {
-        void* pool = kmalloc(4ULL * 1024ULL * 1024ULL + PAGE_SIZE_BYTES);
+        void* pool = kmalloc(32ULL * 1024ULL * 1024ULL + PAGE_SIZE_BYTES);
 
-        if (pool == 0 || page_alloc_init(pool, 4ULL * 1024ULL * 1024ULL + PAGE_SIZE_BYTES) != 0)
+        if (pool == 0 || page_alloc_init(pool, 32ULL * 1024ULL * 1024ULL + PAGE_SIZE_BYTES) != 0)
             uart_puts("Page allocator unavailable.\r\n");
         else
             uart_puts("Page allocator ready.\r\n");
@@ -77,6 +77,8 @@ extern "C" void kernel_main()
 
     uart_puts("[5] Initializing MMU...\r\n");
     mmu_init();
+    smp_boot_secondaries();
+    if (smp_online_cpu_count() > 1U) uart_puts("SMP: secondary CPUs released via PSCI (idle/job loop; scheduler stays on CPU0).\r\n");
 
     uart_puts("[6] Initializing storage / VirtIO block...\r\n");
     storage_init();

@@ -12,6 +12,7 @@ void uart_putc_serial_only(char c);
 void uart_puts_serial_only(const char* s);
 /* Non-blocking serial input: returns the next byte (0..255) or -1 when none is pending. */
 int uart_try_getc();
+void uart_poll_job_keys(int (*filter)(int));
 int uart_has_data();
 char uart_getc();
 /* Temporarily route output to a foreground console (for example the pixel terminal). */

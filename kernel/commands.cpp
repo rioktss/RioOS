@@ -1,4 +1,10 @@
 #include "commands.h"
+#include "jobs.h"
+#include "pci.h"
+#include "nvme.h"
+#include "ahci.h"
+#include "storage.h"
+#include "script.h"
 
 #include "uart.h"
 #include "fb.h"
@@ -351,13 +357,202 @@ static void command_tasks()
     process_list();
 }
 
-static void command_mount()
+static int split_words(char* argument, char** words, int capacity);
+static int str_contains(const char* hay, const char* needle)
 {
+    int n = str_len(needle);
+    for (int i = 0; hay[i]; ++i)
+    {
+        int k = 0;
+        while (k < n && hay[i + k] == needle[k]) ++k;
+        if (k == n) return 1;
+    }
+    return 0;
+}
+
+static void command_mount(const char* argument)
+{
+    if (argument && argument[0])
+    {
+        if (!security_is_root()) { uart_puts("mount: permission denied (root required)\r\n"); return; }
+        char buf[96]; str_copy(buf, argument, sizeof(buf));
+        char* w[6]; int n = split_words(buf, w, 6);
+        int ro = -1;
+        for (int i = 0; i < n; ++i)
+        {
+            if (str_equal(w[i], "-r")) ro = 1;
+            else if (str_equal(w[i], "-w")) ro = 0;
+            else if (str_equal(w[i], "-o") && i + 1 < n)
+            {
+                ++i;
+                if (str_contains(w[i], "ro")) ro = 1;
+                if (str_contains(w[i], "rw")) ro = 0;
+            }
+        }
+        if (ro < 0) { uart_puts("usage: mount [-o remount,ro|remount,rw] [/]\r\n"); return; }
+        if (ro == 0 || ro == 1)
+        {
+            (void)fs_sync();
+            fs_set_readonly(ro);
+            uart_puts(ro ? "/ remounted read-only.\r\n" : "/ remounted read-write.\r\n");
+        }
+        return;
+    }
+    FsJournalInfo ji;
+    fs_journal_status(&ji);
     uart_puts("Mounts\r\n------\r\n");
-    uart_puts("block device   : "); uart_puts(storage_ready() ? "virtio-blk (ready)" : "none");
+    uart_puts("block device   : "); {
+        int bk = storage_backend();
+        uart_puts(!storage_ready() ? "none" : bk == 2 ? "NVMe (ready)" : bk == 3 ? "AHCI/SATA (ready)" : "virtio-blk (ready)");
+    }
     uart_puts("\r\nroot (/)       : myfs, ");
     uart_puts(fs_persistent() ? "persistent (disk-backed)" : "RAM only (not persistent)");
+    uart_puts(fs_is_readonly() ? ", ro" : ", rw");
+    uart_puts("\r\njournal        : ");
+    if (ji.enabled)
+    {
+        uart_puts("on (sectors "); print_u64(ji.start_sector); uart_puts("+"); print_u64(ji.sectors);
+        uart_puts("), commits "); print_u64(ji.commits); uart_puts(", replayed "); print_u64(ji.replayed);
+    }
+    else uart_puts("off");
     uart_puts("\r\n");
+}
+
+static void command_umount(const char* argument)
+{
+    if (!security_is_root()) { uart_puts("umount: permission denied (root required)\r\n"); return; }
+    if (!argument || !argument[0]) { uart_puts("usage: umount <mountpoint>\r\n"); return; }
+    if (str_equal(argument, "/")) { uart_puts("umount: /: target is busy (root filesystem; use 'mount -o remount,ro /')\r\n"); return; }
+    uart_puts("umount: "); uart_puts(argument); uart_puts(": not mounted\r\n");
+}
+
+static void command_lspci() { pci_list(); }
+
+static void command_nvme(const char* argument)
+{
+    if (!nvme_ready()) { uart_puts("nvme: no NVMe controller (try QEMU: -device nvme,drive=nv,serial=rio)\r\n"); return; }
+    if (argument && str_equal(argument, "selftest"))
+    {
+        int rc = nvme_selftest(storage_backend() != 2);
+        uart_puts(rc == 0 ? "nvme selftest: PASS\r\n" : "nvme selftest: FAIL\r\n");
+        return;
+    }
+    nvme_status();
+}
+
+static void command_sata(const char* argument)
+{
+    if (!ahci_ready()) { uart_puts("sata: no AHCI disk (try QEMU: -device ich9-ahci,id=ahci -device ide-hd,drive=sd,bus=ahci.0)\r\n"); return; }
+    if (argument && str_equal(argument, "selftest"))
+    {
+        int rc = ahci_selftest(storage_backend() != 3);
+        uart_puts(rc == 0 ? "sata selftest: PASS\r\n" : "sata selftest: FAIL\r\n");
+        return;
+    }
+    ahci_status();
+}
+
+static void command_dhcp()
+{
+    if (!net_ready()) { uart_puts("dhcp: network unavailable\r\n"); return; }
+    uart_puts("dhcp: requesting lease...\r\n");
+    int rc = net_dhcp(8000U);
+    if (rc != 0) { uart_puts("dhcp: no lease (timeout/NAK)\r\n"); return; }
+    uint32_t srv, lease; int bound;
+    net_dhcp_info(&srv, &lease, &bound);
+    uart_puts("dhcp: bound, server "); net_print_ipv4(srv); uart_puts(", lease "); print_u64(lease); uart_puts(" s\r\n");
+    net_status();
+}
+
+static void command_ping6(const char* argument)
+{
+    uint8_t t[16];
+    if (!argument || !argument[0] || net_ip6_parse(argument, t) != 0) { uart_puts("usage: ping6 <ipv6-address>\r\n"); return; }
+    int rc = net_ping6(t, 3000U);
+    if (rc >= 0) { uart_puts("Reply from "); net_ip6_print(t); uart_puts(": time="); print_u64((uint64_t)rc); uart_puts(" ms\r\n"); }
+    else uart_puts("ping6: no reply\r\n");
+}
+
+/* httpd <port> [requests]: tiny HTTP/1.0 server over the TCP listen/accept API. */
+static void command_httpd(const char* argument)
+{
+    char buf[48]; str_copy(buf, argument ? argument : "", sizeof(buf));
+    char* w[3]; int n = split_words(buf, w, 3);
+    if (!net_ready() || n < 1) { uart_puts("usage: httpd <port> [requests]\r\n"); return; }
+    int port = parse_uint(w[0], -1); int limit = n > 1 ? parse_uint(w[1], -1) : 1;
+    if (port <= 0 || port > 65535 || limit <= 0 || limit > 100) { uart_puts("httpd: bad arguments\r\n"); return; }
+    int ls = net_tcp_socket(0);
+    if (ls < 0 || net_tcp_listen(0, ls, (uint16_t)port) != 0) { uart_puts("httpd: cannot listen\r\n"); if (ls > 0) net_tcp_close(0, ls); return; }
+    uart_puts("httpd: listening on port "); print_u64((uint64_t)port); uart_puts(" ("); print_u64((uint64_t)limit); uart_puts(" request(s); Ctrl-C aborts)\r\n");
+    int served = 0, idle = 0;
+    while (served < limit && idle < 60)
+    {
+        uint32_t pip; uint16_t pport;
+        int c = net_tcp_accept(0, ls, &pip, &pport, 1000U);
+        if (c < 0) { ++idle; int ch = uart_try_getc(); if (ch == 3) break; continue; }
+        idle = 0;
+        char req[512]; int got = net_tcp_recv(0, c, req, sizeof(req) - 1, 2000U);
+        if (got < 0) got = 0;
+        req[got] = 0;
+        char path[96] = "/"; int pp = 0;
+        if (req[0] == 'G' && req[1] == 'E' && req[2] == 'T' && req[3] == ' ')
+        { int i = 4; while (req[i] && req[i] != ' ' && req[i] != '\r' && pp < 95) path[pp++] = req[i++]; path[pp] = 0; }
+        static uint8_t body[2048]; uint64_t sz = 0; const char* status = "200 OK";
+        if (str_equal(path, "/") || pp == 0)
+        { const char* m = "Hello from RioOS httpd\n"; sz = (uint64_t)str_len(m); for (uint64_t i = 0; i < sz; ++i) body[i] = (uint8_t)m[i]; }
+        else if (fs_read_file(path, vfs_cwd(), body, sizeof(body), &sz) != 0)
+        { const char* m = "not found\n"; status = "404 Not Found"; sz = (uint64_t)str_len(m); for (uint64_t i = 0; i < sz; ++i) body[i] = (uint8_t)m[i]; }
+        char hdr[128]; int hp = 0;
+        const char* a = "HTTP/1.0 "; for (int i = 0; a[i]; ++i) hdr[hp++] = a[i];
+        for (int i = 0; status[i]; ++i) hdr[hp++] = status[i];
+        const char* b = "\r\nContent-Length: "; for (int i = 0; b[i]; ++i) hdr[hp++] = b[i];
+        char num[12]; int nn = 0; uint64_t v = sz; do { num[nn++] = (char)('0' + v % 10); v /= 10; } while (v);
+        while (nn) hdr[hp++] = num[--nn];
+        const char* d = "\r\nConnection: close\r\n\r\n"; for (int i = 0; d[i]; ++i) hdr[hp++] = d[i];
+        (void)net_tcp_send(0, c, hdr, (uint32_t)hp, 3000U);
+        for (uint64_t off = 0; off < sz; ) { uint32_t chunk = sz - off > 1024 ? 1024U : (uint32_t)(sz - off); if (net_tcp_send(0, c, body + off, chunk, 3000U) <= 0) break; off += chunk; }
+        (void)net_tcp_close(0, c);
+        ++served;
+        uart_puts("httpd: served "); uart_puts(path); uart_puts("\r\n");
+    }
+    (void)net_tcp_close(0, ls);
+    uart_puts("httpd: stopped\r\n");
+}
+
+static void command_sync()
+{
+    uart_puts(fs_sync() == 0 ? "synced.\r\n" : "sync: I/O error\r\n");
+}
+
+static void command_ln(const char* argument)
+{
+    char buf[200]; str_copy(buf, argument ? argument : "", sizeof(buf));
+    char* w[4]; int n = split_words(buf, w, 4);
+    if (n != 3 || !str_equal(w[0], "-s")) { uart_puts("usage: ln -s <target> <linkname>\r\n"); return; }
+    int rc = fs_symlink(w[1], w[2], vfs_cwd());
+    if (rc >= 0) uart_puts("Symlink created.\r\n");
+    else if (rc == -30) uart_puts("ln: read-only filesystem\r\n");
+    else if (rc == -17) uart_puts("ln: destination exists\r\n");
+    else if (rc == -13) uart_puts("ln: permission denied\r\n");
+    else uart_puts("ln: failed\r\n");
+}
+
+static void command_readlink(const char* argument)
+{
+    char t[260];
+    if (!argument || !argument[0]) { uart_puts("usage: readlink <link>\r\n"); return; }
+    int rc = fs_readlink(argument, vfs_cwd(), t, sizeof(t));
+    if (rc > 0) { uart_puts(t); uart_puts("\r\n"); }
+    else uart_puts("readlink: not a symlink or not found\r\n");
+}
+
+static void command_jtest(const char* argument)
+{
+    if (!security_is_root()) { uart_puts("jtest: permission denied (root required)\r\n"); return; }
+    const char* path = (argument && argument[0]) ? argument : "/jtest.txt";
+    int rc = fs_journal_crash_test(path, vfs_cwd());
+    if (rc == 0) uart_puts("Journal committed, in-place apply skipped (simulated power loss). Reset the machine; mount must replay it.\r\n");
+    else uart_puts("jtest: failed\r\n");
 }
 
 static void command_stats()
@@ -437,11 +632,22 @@ static const ManualEntry manual_entries[] =
     {"df", "show filesystem free/used space", "df [-h]", "-h human readable"},
     {"nano", "edit a text file", "nano <file>", "Runs the bundled text editor"},
     {"tree", "show filesystem tree", "tree", "No options"},
-    {"mount", "show mounted storage/filesystem status", "mount", "No options"},
+    {"mount", "show mounts / remount root", "mount [-o remount,ro|remount,rw]", "root only for remount; shows journal state"},
+    {"dhcp", "obtain an IPv4 lease via DHCP", "dhcp", "applies address, mask, gateway and DNS"},
+    {"ping6", "ICMPv6 echo to a link-local address", "ping6 <ipv6>", "uses NDP neighbor discovery"},
+    {"httpd", "tiny HTTP server (TCP listen/accept)", "httpd <port> [requests]", "serves files from the filesystem; / is a greeting"},
+    {"lspci", "list PCIe devices", "lspci", "bus 0 via ECAM; shows class and assigned BARs"},
+    {"nvme", "NVMe disk status", "nvme [selftest]", "selftest is read-only on the root disk, read/write on others"},
+    {"sata", "AHCI/SATA disk status", "sata [selftest]", "selftest is read-only on the root disk, read/write on others"},
+    {"umount", "unmount a filesystem", "umount <mountpoint>", "root only; / is busy"},
+    {"sync", "flush filesystem to disk", "sync", "No options"},
+    {"ln", "create a symbolic link", "ln -s <target> <link>", "relative targets resolve from the link's directory"},
+    {"readlink", "print a symlink target", "readlink <link>", "No options"},
+    {"jtest", "journal crash-recovery test", "jtest [path]", "root only; commits to journal then skips apply; reset to see replay"},
     {"ps", "show processes", "ps", "No options"},
     {"history", "show command history", "history [10|-c]", "-c clear history; N show last N entries; Arrow Up/Down recall"},
     {"threads", "list cooperative kernel threads", "threads", "Shows state, priority, run counts, and context switches"},
-    {"smp", "show CPU/SMP bring-up readiness", "smp", "Reports current MPIDR Aff0, online CPU count, and whether SMP is enabled; secondary startup is disabled"},
+    {"smp", "show CPU topology / run jobs on secondary CPUs", "smp [test]", "lists online CPUs; test offloads a computation to every secondary CPU and verifies it"},
     {"fbinfo", "show framebuffer backend status", "fbinfo", "Reports the framebuffer terminal state (QEMU window runner)"},
     {"thread-demo", "exercise voluntary context switching", "thread-demo", "Uses yield only; no preemption (tick keeps running)"},
     {"unset", "remove an environment variable", "unset NAME", "NAME must follow shell identifier rules"},
@@ -1250,16 +1456,38 @@ static void command_threads()
     thread_list();
 }
 
-static void command_smp_status()
+static void command_smp_status(const char* argument)
 {
-    uart_puts("SMP / CPU topology\r\n------------------\r\nCPU Affinity-0 ID : ");
+    if (argument && str_equal(argument, "test"))
+    {
+        uint32_t n = smp_online_cpu_count();
+        if (n < 2U) { uart_puts("smp test: no secondary CPU online (start QEMU with -smp 4)\r\n"); return; }
+        int ok = 1;
+        for (uint32_t cpu = 1; cpu < n; ++cpu)
+        {
+            uint64_t lo = (uint64_t)cpu * 1000ULL, hi = lo + 1000ULL, got = 0, want = 0;
+            for (uint64_t i = lo; i < hi; ++i) want += i * i;
+            int rc = smp_run_on(cpu, lo, hi, &got);
+            uart_puts("CPU "); print_u64(cpu); uart_puts(": sum[");
+            print_u64(lo); uart_puts(","); print_u64(hi); uart_puts(") = "); print_u64(got);
+            uart_puts(rc == 0 && got == want ? "  OK\r\n" : "  FAIL\r\n");
+            if (rc != 0 || got != want) ok = 0;
+        }
+        uart_puts(ok ? "smp test: PASS\r\n" : "smp test: FAIL\r\n");
+        return;
+    }
+    uart_puts("SMP / CPU topology\r\n------------------\r\nBoot CPU affinity-0: ");
     print_u64((uint64_t)smp_cpu_id());
     uart_puts("\r\nOnline CPUs       : ");
     print_u64((uint64_t)smp_online_cpu_count());
     uart_puts("\r\nSMP scheduling    : ");
-    uart_puts(smp_is_enabled() ? "enabled\r\n" : "disabled (safe default)\r\n");
-    uart_puts("Spinlocks          : atomic acquire/release primitives available\r\n");
-    uart_puts("Secondary startup  : not implemented; no secondary core is released\r\n");
+    uart_puts(smp_is_enabled() ? "enabled\r\n" : "scheduler on CPU0 only; secondary CPUs run offloaded jobs ('smp test')\r\n");
+    uart_puts("Spinlocks         : atomic acquire/release primitives available\r\n");
+    for (uint32_t cpu = 1; cpu < smp_online_cpu_count(); ++cpu)
+    {
+        uart_puts("CPU "); print_u64(cpu); uart_puts("            : online, MPIDR 0x"); print_u64(smp_cpu_mpidr(cpu));
+        uart_puts(", wakeups "); print_u64(smp_cpu_heartbeat(cpu)); uart_puts("\r\n");
+    }
 }
 
 static void command_fbinfo()
@@ -2168,35 +2396,77 @@ static void command_user_login(const char* argument)
 
 static void command_su(const char* argument)
 {
-    if (!argument || !argument[0] || str_equal(argument, "root"))
+    const char* target = (argument && argument[0]) ? argument : "root";
+    char password[48];
+    uart_puts(target); uart_puts(" password: ");
+    if (security_read_password(password, sizeof(password)) < 0 ||
+        security_login_as(target, password) != 0)
     {
-        char password[48];
-        uart_puts("root password: ");
-        if (security_read_password(password, sizeof(password)) < 0 ||
-            security_login_root(password) != 0)
-        {
-            uart_puts("su: authentication failed\r\n");
-            return;
-        }
-        uart_puts("Switched to root.\r\n");
+        uart_puts("su: authentication failed\r\n");
         return;
     }
+    if (security_is_root()) uart_puts("Switched to root.\r\n");
+    else { uart_puts("Switched to "); uart_puts(security_username()); uart_puts(".\r\n"); }
+}
 
-    if (str_equal(argument, "user"))
+static void command_useradd(const char* argument)
+{
+    if (!security_is_root()) { uart_puts("useradd: permission denied (root required)\r\n"); return; }
+    if (!argument || !argument[0]) { uart_puts("useradd: usage: useradd <name>\r\n"); return; }
+    char pw1[48], pw2[48];
+    uart_puts("New password: ");
+    if (security_read_password(pw1, sizeof(pw1)) <= 0) { uart_puts("useradd: empty password rejected\r\n"); return; }
+    uart_puts("Retype password: ");
+    if (security_read_password(pw2, sizeof(pw2)) < 0 || !str_equal(pw1, pw2)) { uart_puts("useradd: passwords do not match\r\n"); return; }
+    int rc = security_user_add(argument, pw1);
+    if (rc == 0) uart_puts("User created (home: /home/<name>).\r\n");
+    else if (rc == -2) uart_puts("useradd: name exists or invalid\r\n");
+    else if (rc == -3) uart_puts("useradd: name may only contain a-z 0-9 _\r\n");
+    else uart_puts("useradd: failed\r\n");
+}
+
+static void command_userdel(const char* argument)
+{
+    if (!security_is_root()) { uart_puts("userdel: permission denied (root required)\r\n"); return; }
+    if (!argument || !argument[0]) { uart_puts("userdel: usage: userdel <name>\r\n"); return; }
+    int rc = security_user_del(argument);
+    if (rc == 0) uart_puts("User removed.\r\n");
+    else if (rc == -3) uart_puts("userdel: cannot remove root or the current account\r\n");
+    else uart_puts("userdel: no such user\r\n");
+}
+
+static void command_passwd(const char* argument)
+{
+    const char* who = (argument && argument[0]) ? argument : security_username();
+    char old_pw[48] = {0}, pw1[48], pw2[48];
+    if (!security_is_root())
     {
-        command_user_login(0);
-        return;
+        uart_puts("Current password: ");
+        if (security_read_password(old_pw, sizeof(old_pw)) < 0) return;
     }
+    uart_puts("New password: ");
+    if (security_read_password(pw1, sizeof(pw1)) <= 0) { uart_puts("passwd: empty password rejected\r\n"); return; }
+    uart_puts("Retype password: ");
+    if (security_read_password(pw2, sizeof(pw2)) < 0 || !str_equal(pw1, pw2)) { uart_puts("passwd: passwords do not match\r\n"); return; }
+    int rc = security_set_password(who, old_pw, pw1);
+    if (rc == 0) uart_puts("Password updated.\r\n");
+    else if (rc == -1) uart_puts("passwd: permission denied\r\n");
+    else if (rc == -3) uart_puts("passwd: current password is wrong\r\n");
+    else uart_puts("passwd: no such user\r\n");
+}
 
-    uart_puts("su: usage: su [root|user]\r\n");
+static void command_id()
+{
+    uart_puts("uid="); print_u64(security_uid()); uart_puts("("); uart_puts(security_username());
+    uart_puts(") gid="); print_u64(security_gid()); uart_puts("\r\n");
 }
 
 static void command_logout()
 {
-    if (security_is_root())
+    if (security_is_root() || !str_equal(security_username(), "user"))
     {
         security_logout_to_user();
-        uart_puts("Logged out of root. Back to user.\r\n");
+        uart_puts("Logged out. Back to user.\r\n");
     }
     else
     {
@@ -2209,7 +2479,7 @@ static void command_whoami()
     uart_puts("Username: ");
     uart_puts(security_username());
     uart_puts("\r\nUID      : ");
-    print_u64(security_is_root() ? 0ULL : 1000ULL);
+    print_u64(security_uid());
     uart_puts("\r\nDomain   : kernel shell\r\n");
     int pid = user_current_pid();
     uart_puts("EL0 app  : ");
@@ -2508,35 +2778,22 @@ void execute_command(
     if (*line == '\0')
         return;
 
-    /* Expand $VAR before parsing, then handle shell operators. */
+    /* Compound statements (if/for/while) and sh/source run before expansion. */
+    if (script_handle_compound(line))
+        return;
+
+    /* Expand $VAR $? $# $0-$9 before parsing, then handle shell operators. */
     char expanded[1024];
-    int ep = 0;
-    for (int i = 0; line[i] && ep < (int)sizeof(expanded)-1; )
-    {
-        if (line[i] == '$')
-        {
-            ++i;
-            char name[32]; int np = 0;
-            if (line[i] == '{')
-            {
-                ++i; while(line[i] && line[i] != '}' && np < 31) name[np++]=line[i++]; if(line[i]=='}')++i;
-            }
-            else
-            {
-                while(line[i] && ((line[i]>='A'&&line[i]<='Z')||(line[i]>='a'&&line[i]<='z')||(line[i]>='0'&&line[i]<='9')||line[i]=='_') && np<31) name[np++]=line[i++];
-            }
-            name[np]=0;
-            const char* val = env_get(name);
-            if (val) for (int k=0; val[k] && ep < (int)sizeof(expanded)-1; ++k) expanded[ep++]=val[k];
-            else if (!name[0] && ep < (int)sizeof(expanded)-1) expanded[ep++]='$';
-            continue;
-        }
-        expanded[ep++] = line[i++];
-    }
-    expanded[ep] = 0;
+    script_expand(line, expanded, sizeof(expanded));
     line = expanded;
     normalize_shell_whitespace(line);
     if (*line == '\0') return;
+
+    if (script_handle_simple(line))
+        return;
+
+    if (jobs_handle_line(line))
+        return;
 
     if (handle_shell_operators(line))
         return;
@@ -2735,6 +2992,11 @@ void execute_command(
     if (str_equal(command, "apps")) { command_apps(); return; }
     if (str_equal(command, "uname")) { command_uname(); return; }
     if (str_equal(command, "whoami")) { command_whoami(); return; }
+    if (str_equal(command, "useradd")) { command_useradd(argument); return; }
+    if (str_equal(command, "userdel")) { command_userdel(argument); return; }
+    if (str_equal(command, "passwd")) { command_passwd(argument); return; }
+    if (str_equal(command, "id")) { command_id(); return; }
+    if (str_equal(command, "users")) { security_list_accounts(); return; }
     if (str_equal(command, "net")) { command_net(); return; }
     if (str_equal(command, "ifconfig")) { command_net(); return; }
     if (str_equal(command, "ping")) { command_ping(argument); return; }
@@ -2745,11 +3007,22 @@ void execute_command(
     if (str_equal(command, "pages")) { command_pages(); return; }
     if (str_equal(command, "tasks")) { command_tasks(); return; }
     if (str_equal(command, "threads")) { command_threads(); return; }
-    if (str_equal(command, "smp")) { command_smp_status(); return; }
+    if (str_equal(command, "smp")) { command_smp_status(argument); return; }
     if (str_equal(command, "fbinfo")) { command_fbinfo(); return; }
     if (str_equal(command, "fds")) { fd_list(); return; }
     if (str_equal(command, "thread-demo")) { command_thread_demo(); return; }
-    if (str_equal(command, "mount")) { command_mount(); return; }
+    if (str_equal(command, "dhcp")) { command_dhcp(); return; }
+    if (str_equal(command, "ping6")) { command_ping6(argument); return; }
+    if (str_equal(command, "httpd")) { command_httpd(argument); return; }
+    if (str_equal(command, "lspci")) { command_lspci(); return; }
+    if (str_equal(command, "nvme")) { command_nvme(argument); return; }
+    if (str_equal(command, "sata")) { command_sata(argument); return; }
+    if (str_equal(command, "umount")) { command_umount(argument); return; }
+    if (str_equal(command, "sync")) { command_sync(); return; }
+    if (str_equal(command, "ln")) { command_ln(argument); return; }
+    if (str_equal(command, "readlink")) { command_readlink(argument); return; }
+    if (str_equal(command, "jtest")) { command_jtest(argument); return; }
+    if (str_equal(command, "mount")) { command_mount(argument); return; }
     if (str_equal(command, "stats")) { command_stats(); return; }
     if (str_equal(command, "log")) { command_log(argument); return; }
     if (str_equal(command, "irq")) { command_irq(argument); return; }
@@ -3031,6 +3304,16 @@ void execute_command(
         );
 
         return;
+    }
+
+    {
+        /* Not a built-in: run it as a program (/bin/<name>[.elf], absolute or ./path). */
+        char program[96];
+        if (jobs_resolve_program(command, program, sizeof(program)))
+        {
+            user_execute(program, argument ? argument : "");
+            return;
+        }
     }
 
     uart_puts(

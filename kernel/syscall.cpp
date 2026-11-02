@@ -12,6 +12,10 @@
 #include "fd.h"
 #include "security.h"
 #include "netstack.h"
+#include "process.h"
+#include "thread.h"
+#include "task.h"
+#include "elf.h"
 
 extern "C" void user_exit_return();
 
@@ -183,6 +187,9 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
                 break;
             }
             user_set_exit_code((int)frame->x[0]);
+#ifndef HOST_TEST
+            task_exit_current((int)frame->x[0], 0);   /* never returns */
+#endif
             frame->x[0] = 0;
             frame->spsr = 0x3C5ULL;
             frame->elr = (uint64_t)user_exit_return;
@@ -239,6 +246,10 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
                 result = (uint64_t)-22;
                 break;
             }
+#ifndef HOST_TEST
+            if (from_user) thread_wait_ms(frame->x[0]);   /* other tasks run meanwhile */
+            else
+#endif
             timer_delay_ms(frame->x[0]);
             result = 0;
             break;
@@ -276,7 +287,9 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
                 if (serial_char < 0) break;
                 input_char = (char)serial_char;
 #else
+                if (from_user && user_current_pid() >= 0 && process_is_background(user_current_pid())) break;
                 if (!keyboard_try_getc(&input_char)) break;
+                if (from_user && task_console_key(user_current_pid(), input_char)) continue;
 #endif
                 buf[got++] = input_char;
             }
@@ -423,6 +436,16 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
                 break;
             }
             result = (uint64_t)fd_read(descriptor, buffer, length);
+#ifndef HOST_TEST
+            while (from_user && (int64_t)result == -11 && fd_is_pipe(descriptor))
+            {
+                int me = user_current_pid();
+                if (me >= 0 && (process_sig_pending(me) & ~((1U << SIG_CHLD) | (1U << SIG_CONT))) != 0) { result = (uint64_t)-4; break; }
+                thread_wait_ms(1);
+                (void)select_fd_owner(from_user);
+                result = (uint64_t)fd_read(descriptor, buffer, length);
+            }
+#endif
             break;
         }
 
@@ -443,6 +466,31 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
                 break;
             }
             result = (uint64_t)fd_write(descriptor, buffer, length);
+#ifndef HOST_TEST
+            if (from_user && (int64_t)result == -32)
+            {
+                int me = user_current_pid();
+                if (me >= 0) (void)process_sig_raise(me, SIG_PIPE);
+            }
+            if (from_user && fd_is_pipe(descriptor) && ((int64_t)result == -11 ||
+                ((int64_t)result > 0 && (uint64_t)result < length)))
+            {
+                /* Blocking pipe write: keep going until everything is queued. */
+                uint64_t done = (int64_t)result > 0 ? result : 0;
+                while (done < length)
+                {
+                    int me = user_current_pid();
+                    if (me >= 0 && (process_sig_pending(me) & ~((1U << SIG_CHLD) | (1U << SIG_CONT))) != 0) break;
+                    thread_wait_ms(1);
+                    (void)select_fd_owner(from_user);
+                    int64_t w = fd_write(descriptor, (const char*)buffer + done, length - done);
+                    if (w == -11) continue;
+                    if (w < 0) { if (done == 0) done = (uint64_t)w; break; }
+                    done += (uint64_t)w;
+                }
+                result = done;
+            }
+#endif
             break;
         }
 
@@ -705,6 +753,29 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
             break;
         }
 
+        case SYS_NET_TCP_LISTEN:
+        {
+            int owner_pid = from_user ? user_current_pid() : scheduler_current_pid();
+            if (owner_pid < 0) owner_pid = 0;
+            if (frame->x[0] > 0x7FFFFFFFULL || frame->x[1] == 0 || frame->x[1] > 65535ULL) result = (uint64_t)-22;
+            else result = (uint64_t)(int64_t)net_tcp_listen(owner_pid, (int)frame->x[0], (uint16_t)frame->x[1]);
+            break;
+        }
+
+        case SYS_NET_TCP_ACCEPT:
+        {
+            int owner_pid = from_user ? user_current_pid() : scheduler_current_pid();
+            if (owner_pid < 0) owner_pid = 0;
+            uint64_t* out = (uint64_t*)frame->x[1];
+            if (frame->x[0] > 0x7FFFFFFFULL || frame->x[2] > NET_TCP_MAX_TIMEOUT_MS) { result = (uint64_t)-22; break; }
+            if (out && from_user && !syscall_user_pointer_ok_write(out, sizeof(uint64_t))) { result = (uint64_t)-14; break; }
+            uint32_t ip = 0; uint16_t port = 0;
+            int rc = net_tcp_accept(owner_pid, (int)frame->x[0], &ip, &port, (uint32_t)frame->x[2]);
+            if (rc > 0 && out) *out = (uint64_t)ip | ((uint64_t)port << 32);
+            result = (uint64_t)(int64_t)rc;
+            break;
+        }
+
         case SYS_NET_TCP_CLOSE:
         {
             int owner_pid = from_user ? user_current_pid() : scheduler_current_pid();
@@ -713,6 +784,198 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
             else result = (uint64_t)(int64_t)net_tcp_close(owner_pid, (int)frame->x[0]);
             break;
         }
+
+#ifndef HOST_TEST
+        case SYS_FORK:
+        {
+            if (!from_user) { result = (uint64_t)-38; break; }
+            result = (uint64_t)(int64_t)task_fork(frame);
+            break;
+        }
+
+        case SYS_EXEC:
+        {
+            if (!from_user) { result = (uint64_t)-38; break; }
+            char path[SYSCALL_PATH_MAX];
+            char args[PROCESS_ARGS_SIZE];
+            if (copy_path((const char*)frame->x[0], path, from_user) != 0) { result = (uint64_t)-14; break; }
+            args[0] = '\0';
+            if (frame->x[1] != 0)
+            {
+                int ok = 0;
+                for (int i = 0; i < PROCESS_ARGS_SIZE; ++i)
+                {
+                    if (!syscall_user_pointer_ok((const char*)frame->x[1] + i, 1)) break;
+                    args[i] = ((const char*)frame->x[1])[i];
+                    if (args[i] == '\0') { ok = 1; break; }
+                }
+                if (!ok) { result = (uint64_t)-14; break; }
+            }
+            int rc = task_exec(frame, path, args);
+            if (rc == 0) return;               /* frame now describes the fresh image */
+            result = (uint64_t)(int64_t)rc;
+            break;
+        }
+
+        case SYS_WAITPID:
+        {
+            if (!from_user) { result = (uint64_t)-38; break; }
+            int* status_ptr = (int*)frame->x[1];
+            if (status_ptr && !syscall_user_pointer_ok_write(status_ptr, sizeof(int))) { result = (uint64_t)-14; break; }
+            int st = 0;
+            int rc = task_wait(user_current_pid(), (int)(int64_t)frame->x[0], &st, (int)frame->x[2]);
+            if (rc > 0 && status_ptr) *status_ptr = st;
+            result = (uint64_t)(int64_t)rc;
+            break;
+        }
+
+        case SYS_GETPPID:
+        {
+            int me = from_user ? user_current_pid() : scheduler_current_pid();
+            result = (uint64_t)(int64_t)process_parent(me);
+            break;
+        }
+
+        case SYS_KILL:
+        {
+            int me = from_user ? user_current_pid() : -1;
+            int target = (int)(int64_t)frame->x[0];
+            /* Privilege separation: an unprivileged process may only signal its own
+               processes (same uid) — root may signal anyone. */
+            if (from_user && me >= 0 && process_uid(me) != 0 &&
+                process_uid(target) != process_uid(me))
+            {
+                result = (uint64_t)-1;
+                break;
+            }
+            result = (uint64_t)(int64_t)task_kill(target, (int)(int64_t)frame->x[1]);
+            break;
+        }
+
+        case SYS_YIELD:
+            thread_yield();
+            result = 0;
+            break;
+
+        case SYS_BRK:
+        {
+            if (!from_user) { result = (uint64_t)-38; break; }
+            uint64_t out = 0;
+            int rc = mmu_user_brk(user_current_pid(), frame->x[0], &out);
+            result = rc == 0 ? out : (uint64_t)(int64_t)-12;
+            break;
+        }
+
+        case SYS_MMAP:
+        {
+            if (!from_user) { result = (uint64_t)-38; break; }
+            int me = user_current_pid();
+            uint64_t length = frame->x[0];
+            uint32_t prot = (uint32_t)frame->x[1];
+            int64_t fdn = (int64_t)frame->x[2];
+            uint64_t off = frame->x[3];
+            if (length == 0 || length > (4ULL << 20)) { result = (uint64_t)-22; break; }
+            uint64_t base = 0;
+            uint32_t map_prot = (fdn >= 0) ? (prot | MMU_USER_WRITE) & ~MMU_USER_EXEC : prot;
+            int rc = mmu_user_mmap(me, length, map_prot, &base);
+            if (rc != 0) { result = (uint64_t)-12; break; }
+            if (fdn >= 0)
+            {
+                /* Private file mapping: copy the requested window into fresh pages. */
+                if (select_fd_owner(from_user) != 0) { (void)mmu_user_munmap(me, base, length); result = (uint64_t)-24; break; }
+                int64_t cur = fd_seek((int)fdn, 0, 1);
+                if (cur < 0 || fd_seek((int)fdn, (int64_t)off, 0) < 0)
+                { (void)mmu_user_munmap(me, base, length); result = (uint64_t)-9; break; }
+                uint64_t done = 0;
+                while (done < length)
+                {
+                    uint64_t chunk = length - done > 1024 ? 1024 : length - done;
+                    if (!syscall_user_pointer_ok_write((void*)(base + done), chunk)) break;
+                    int64_t n = fd_read((int)fdn, (void*)(base + done), chunk);
+                    if (n <= 0) break;
+                    done += (uint64_t)n;
+                }
+                (void)fd_seek((int)fdn, cur, 0);
+                if ((prot & MMU_USER_WRITE) == 0) { /* read-only request: harmless, pages stay private */ }
+            }
+            result = base;
+            break;
+        }
+
+        case SYS_MUNMAP:
+            result = from_user ? (uint64_t)(int64_t)mmu_user_munmap(user_current_pid(), frame->x[0], frame->x[1]) : (uint64_t)-38;
+            break;
+
+        case SYS_MPROTECT:
+            result = from_user ? (uint64_t)(int64_t)mmu_user_mprotect(user_current_pid(), frame->x[0], frame->x[1], (uint32_t)frame->x[2]) : (uint64_t)-38;
+            break;
+
+        case SYS_GETUID:
+        {
+            int cp = user_current_pid();
+            result = from_user ? ((uint64_t)process_uid(cp) | ((uint64_t)process_gid(cp) << 32)) : 0;
+            break;
+        }
+
+        case SYS_SETUID:
+        {
+            int cp = user_current_pid();
+            if (!from_user) { result = (uint64_t)-38; break; }
+            if (process_uid(cp) != 0) { result = (uint64_t)-1; break; }   /* EPERM: only root */
+            (void)process_set_creds(cp, (uint32_t)frame->x[0], (uint32_t)frame->x[1]);
+            fs_set_credentials((uint32_t)frame->x[0], (uint32_t)frame->x[1]);
+            result = 0;
+            break;
+        }
+
+        case SYS_SPAWN:
+        case SYS_SPAWN_FD:
+        {
+            if (!from_user) { result = (uint64_t)-38; break; }
+            char path[SYSCALL_PATH_MAX];
+            char args[PROCESS_ARGS_SIZE];
+            if (copy_path((const char*)frame->x[0], path, from_user) != 0) { result = (uint64_t)-14; break; }
+            args[0] = '\0';
+            if (frame->x[1] != 0)
+            {
+                int ok = 0;
+                for (int i = 0; i < PROCESS_ARGS_SIZE; ++i)
+                {
+                    if (!syscall_user_pointer_ok((const char*)frame->x[1] + i, 1)) break;
+                    args[i] = ((const char*)frame->x[1])[i];
+                    if (args[i] == '\0') { ok = 1; break; }
+                }
+                if (!ok) { result = (uint64_t)-14; break; }
+            }
+            int me = user_current_pid();
+            int in_fd = -1, out_fd = -1, bg = 0;
+            if (number == SYS_SPAWN_FD) { in_fd = (int)(int64_t)frame->x[2]; out_fd = (int)(int64_t)frame->x[3]; }
+            else bg = (int)(frame->x[2] & 1);
+            int rc = task_spawn(path, args, me, bg, in_fd, out_fd);
+            (void)mmu_user_space_activate(me);
+            (void)select_fd_owner(from_user);
+            result = (uint64_t)(int64_t)rc;
+            break;
+        }
+
+        case SYS_PROCINFO:
+        {
+            ProcInfo* out = (ProcInfo*)frame->x[1];
+            int target = (int)(int64_t)frame->x[0];
+            if (target < 0) target = user_current_pid();
+            if (!out || (from_user && !syscall_user_pointer_ok_write(out, sizeof(ProcInfo)))) { result = (uint64_t)-14; break; }
+            if (process_get_state(target) < 0) { result = (uint64_t)-3; break; }
+            out->pid = target; out->ppid = process_parent(target); out->state = process_get_state(target);
+            out->thread = process_thread(target); out->uid = process_uid(target); out->gid = process_gid(target);
+            out->start_ms = process_start_ms(target);
+            out->resident_pages = out->shared_pages = out->cow_faults = out->demand_faults = 0;
+            (void)mmu_user_space_stats(target, &out->resident_pages, &out->shared_pages, &out->cow_faults, &out->demand_faults);
+            const char* nm = process_name(target);
+            int i = 0; while (nm[i] && i < 31) { out->name[i] = nm[i]; ++i; } out->name[i] = 0;
+            result = 0;
+            break;
+        }
+#endif
 
         default:
             result = (uint64_t)-38;

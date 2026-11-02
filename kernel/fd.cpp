@@ -14,9 +14,9 @@
 #define FD_SEEK_CUR 1
 #define FD_SEEK_END 2
 
-#define FD_PROCESS_TABLES 32
+#define FD_PROCESS_TABLES 48
 #define FD_OPEN_FILES 128
-#define FD_PIPE_MAX 8
+#define FD_PIPE_MAX 32
 #define FD_PIPE_CAPACITY 4096
 
 struct FdEntry
@@ -644,4 +644,63 @@ void fd_list()
         uart_puts(" "); print_u64(entry->offset); uart_puts("  ");
         uart_puts(entry->path[0] ? entry->path : "-"); uart_puts("\r\n");
     }
+}
+
+
+/* ---- process creation support ------------------------------------------ */
+
+/* fork(): the child's table references the very same open-file objects as the
+   parent's (shared offsets, shared pipe ends), like POSIX descriptors. */
+int fd_clone_table(int src_pid, int dst_pid)
+{
+    int src = find_table(src_pid);
+    if (src < 0) return -1;
+    int dst = find_table(dst_pid);
+    if (dst < 0) dst = create_table(dst_pid);
+    if (dst < 0) return -24;
+    FdTable* a = &tables[src];
+    FdTable* b = &tables[dst];
+    for (int d = 0; d < FD_MAX_DESCRIPTORS; ++d) close_entry(b, d);
+    for (int d = 0; d < FD_MAX_DESCRIPTORS; ++d)
+    {
+        clear_descriptor(b, d);
+        if (!descriptor_valid_in(a, d)) continue;
+        int object = a->entries[d].object;
+        b->entries[d].used = 1;
+        b->entries[d].object = object;
+        if (!open_files[object].permanent) ++open_files[object].refs;
+    }
+    return 0;
+}
+
+/* Make descriptor `dst_fd` of `dst_pid` refer to descriptor `src_fd` of `src_pid`
+   (used by the shell to wire `a | b` between two freshly spawned programs). */
+int fd_redirect(int dst_pid, int dst_fd, int src_pid, int src_fd)
+{
+    int s = find_table(src_pid);
+    int d = find_table(dst_pid);
+    if (s < 0 || d < 0 || dst_fd < 0 || dst_fd >= FD_MAX_DESCRIPTORS) return -9;
+    if (!descriptor_valid_in(&tables[s], src_fd)) return -9;
+    close_entry(&tables[d], dst_fd);
+    int object = tables[s].entries[src_fd].object;
+    tables[d].entries[dst_fd].used = 1;
+    tables[d].entries[dst_fd].object = object;
+    if (!open_files[object].permanent) ++open_files[object].refs;
+    return 0;
+}
+
+int fd_close_in(int pid, int descriptor)
+{
+    int t = find_table(pid);
+    if (t < 0 || descriptor < 0 || descriptor >= FD_MAX_DESCRIPTORS) return -9;
+    close_entry(&tables[t], descriptor);
+    return 0;
+}
+
+int fd_is_pipe(int descriptor)
+{
+    FdTable* table = current_table();
+    if (!descriptor_valid_in(table, descriptor)) return 0;
+    int k = open_files[table->entries[descriptor].object].kind;
+    return k == FD_KIND_PIPE_READ || k == FD_KIND_PIPE_WRITE;
 }

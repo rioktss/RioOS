@@ -40,6 +40,8 @@ int net_tcp_send(int, int, const void*, uint32_t length, uint32_t) { return (int
 int net_tcp_recv(int, int, void*, uint32_t, uint32_t) { return -110; }
 int net_tcp_close(int, int) { return 0; }
 void net_tcp_close_all_for(int) {}
+int net_tcp_listen(int, int, uint16_t) { return -38; }
+int net_tcp_accept(int, int, uint32_t*, uint16_t*, uint32_t) { return -38; }
 
 /* Fake single-file filesystem: only "/storage/home/hello" exists after a write. */
 static uint8_t fake_file[4096]; static uint64_t fake_size = 0; static int fake_exists = 0;

@@ -85,7 +85,7 @@ if [[ "$CLEAN" -eq 1 ]]; then
     rm -f "$HOST_TOOLS"/fd_host_test
     rm -f "$HOST_TOOLS"/process_host_test
     rm -f "$HOST_TOOLS"/scheduler_process_host_test
-    rm -f "$HOST_TOOLS"/smp_host_test "$HOST_TOOLS"/console_host_test
+    rm -f "$HOST_TOOLS"/smp_host_test "$HOST_TOOLS"/console_host_test "$HOST_TOOLS"/sha_host_test
 fi
 
 src_of() {
@@ -113,7 +113,7 @@ ASMFLAGS=(
 
 MODULES=(
     uart memory string fs vfs process sched_policy scheduler timer interrupt keyboard
-    commands version shell history env rtc exceptions syscall user mmu virtio_mmio virtio_input virtio_blk storage thread fd
+    commands version shell history env rtc exceptions syscall user mmu virtio_mmio virtio_input virtio_blk storage thread fd task jobs sha256 script pci nvme ahci
     fb console console_font
     elf virtio_net netstack page_alloc fault diag security smp
     kernel
@@ -151,6 +151,40 @@ if [[ -f userspace/calc.cpp ]]; then
     vlog " -> build/calc.elf ready"
 fi
 
+# --- RioOS libc + user programs (userspace/bin/*.cpp) -----------------------
+UCXXFLAGS=(
+    -Iinclude
+    --target=aarch64-none-elf -mcpu=cortex-a72 -mgeneral-regs-only
+    -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-builtin
+    -fno-pic -fno-pie -fno-vectorize -fno-slp-vectorize
+    -fno-unwind-tables -fno-asynchronous-unwind-tables
+    -nostdinc++ -nostdlib -std=c++17 -O1 -Wall -Wextra -Werror
+)
+mkdir -p build/bin
+"$CLANG" "${ASMFLAGS[@]}" -c userspace/libc/crt0.S -o build/bin/crt0.o
+"$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/ulibc.cpp -o build/bin/ulibc.o
+"$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/dl.cpp -o build/bin/dl.o
+EXTRA_ELFS=()
+for src in userspace/bin/*.cpp; do
+    [[ -f "$src" ]] || continue
+    name="$(basename "$src" .cpp)"
+    "$CXX" "${UCXXFLAGS[@]}" -c "$src" -o "build/bin/$name.o"
+    "$LD" -T userspace/user_init.ld -nostdlib -z max-page-size=0x1000 \
+        build/bin/crt0.o build/bin/"$name".o build/bin/ulibc.o build/bin/dl.o -o "build/bin/$name.elf"
+    EXTRA_ELFS+=("build/bin/$name.elf")
+    vlog " -> build/bin/$name.elf ready"
+done
+# shared objects (dynamic linker test payloads)
+SO_FILES=()
+for src in userspace/so/*.cpp; do
+    [[ -f "$src" ]] || continue
+    name="$(basename "$src" .cpp)"
+    "$CXX" "${UCXXFLAGS[@]}" -fPIC -c "$src" -o "build/bin/$name.so.o"
+    "$LD" -shared -nostdlib -z max-page-size=0x1000 -Bsymbolic "build/bin/$name.so.o" -o "build/bin/lib$name.so"
+    SO_FILES+=("build/bin/lib$name.so")
+    vlog " -> build/bin/lib$name.so ready"
+done
+
 step "2/9" "Building host tools"
 "$CXX" -std=c++17 -O2 -Wall -Wextra -pedantic \
     fs/mkfs_myfs.cpp -o "$HOST_TOOLS/mkfs_myfs"
@@ -163,6 +197,7 @@ fi
 APP_ELFS=(build/user_init.elf)
 [[ -f build/nano.elf ]] && APP_ELFS+=(build/nano.elf)
 [[ -f build/calc.elf ]] && APP_ELFS+=(build/calc.elf)
+APP_ELFS+=("${EXTRA_ELFS[@]}" "${SO_FILES[@]}")
 "$HOST_TOOLS/mkfs_myfs" storage/disk.img "${APP_ELFS[@]}" >/dev/null
 vlog " -> storage/disk.img ready"
 
@@ -194,7 +229,7 @@ step "6/9" "Linking"
     build/commands.o build/version.o build/shell.o build/history.o build/env.o build/rtc.o build/exceptions.o build/syscall.o build/user.o build/mmu.o \
     build/virtio_mmio.o build/virtio_input.o build/virtio_blk.o build/storage.o build/elf.o build/virtio_net.o \
     build/netstack.o build/page_alloc.o build/fault.o build/diag.o build/security.o \
-    build/fb.o build/console.o build/console_font.o build/thread.o build/fd.o build/smp.o \
+    build/fb.o build/console.o build/console_font.o build/thread.o build/fd.o build/smp.o build/task.o build/jobs.o build/sha256.o build/script.o build/pci.o build/nvme.o build/ahci.o \
     -o build/kernel.elf
 
 step "7/9" "Verifying ELF"
@@ -264,6 +299,10 @@ step "8/9" "Running host tests"
     tests/smp_host_test.cpp kernel/smp.cpp \
     -o "$HOST_TOOLS/smp_host_test"
 "$HOST_TOOLS/smp_host_test" > /dev/null
+"$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -iquote include -DHOST_TEST \
+    tests/sha_host_test.cpp kernel/sha256.cpp \
+    -o "$HOST_TOOLS/sha_host_test"
+"$HOST_TOOLS/sha_host_test" > /dev/null
 
 "$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -iquote include -DHOST_TEST \
     tests/console_host_test.cpp drivers/console.cpp drivers/console_font.cpp drivers/fb.cpp \

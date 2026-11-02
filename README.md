@@ -108,10 +108,10 @@ To customize QEMU or tool paths, use the existing environment overrides such as 
 
 - **AArch64 boot and exceptions:** custom boot path, exception vectors, fault reporting, and GIC support for the QEMU `virt` machine.
 - **Memory:** MMU setup, page allocation, and memory diagnostics.
-- **Processes and threads:** PID-owned EL0 page tables and physical frames, a guarded 64 KiB user stack, ELF loading into per-process memory, retained EL0 exception/register frames, system calls, and cooperative kernel-thread context switching. A 100 Hz timer IRQ is live in the shell and while EL0 programs run; user processes still run synchronously, and preemptive saved-frame process scheduling is not yet enabled.
+- **Processes and threads:** PID-owned EL0 page tables and physical frames, a guarded 64 KiB user stack, ELF loading into per-process memory, retained EL0 exception/register frames, system calls, and cooperative kernel-thread context switching. A 100 Hz timer IRQ preempts concurrently running EL0 processes (one kernel thread + private address space each); fork/exec/wait/exit, signals, background jobs and ELF pipelines are supported. See [`docs/EXTENDED_FEATURES.md`](./docs/EXTENDED_FEATURES.md).
 - **File descriptors and IPC:** bounded per-process descriptor tables, standard streams, `open/read/write/close/seek`, `dup/dup2`, and bounded non-blocking kernel pipes.
 - **Filesystem and storage:** custom filesystem/VFS and a persistent disk image attached through VirtIO block.
-- **Networking:** VirtIO-Net with Ethernet, ARP/IPv4/ICMP, owner-scoped UDP/DNS, and a bounded outbound TCP client. The `httpget <host> [path]` command tests real plain-HTTP access through QEMU user networking; HTTPS/TLS, DHCP, and IPv6 are not included.
+- **Networking:** VirtIO-Net with Ethernet, ARP/IPv4/ICMP, owner-scoped UDP/DNS, and a bounded outbound TCP client. The `httpget <host> [path]` command tests real plain-HTTP access through QEMU user networking; it now also has a DHCP client, a TCP server (`httpd`, listen/accept syscalls) and IPv6 link-local NDP/ICMPv6 (`ping6`). HTTPS/TLS is not included.
 - **Shell:** environment expansion, `export`/`unset`, basic filesystem commands, and in-memory `cat`/`echo` pipelines to `grep`/`wc`.
 - **Terminal window:** QEMU `ramfb` text terminal (DejaVu Sans Mono, Linux-console palette, 2000-line scrollback, mouse-wheel / Shift+PageUp scrolling). It shows only the shell - there is no GUI.
 - **Input:** the window runner attaches VirtIO keyboard and tablet devices (the tablet delivers the wheel without a mouse grab). UART remains available.
@@ -147,7 +147,7 @@ RioOS/
 
 ## Known scope and limitations
 
-RioOS is an experimental learning project, not a replacement for Linux/BSD or a ready-to-use general-purpose OS. QEMU display backends and input devices vary by host package. SMP startup remains disabled; the timer IRQ is live (100 Hz tick) but there is no preemptive process switching; per-process address-space isolation is implemented, but saved EL0 frames are not yet switched between concurrently running user processes; and a QEMU visual/input session should be tested locally when changing the renderer or runners. Read the feature-specific guides for exact implementation status and tests.
+RioOS is an experimental learning project, not a replacement for Linux/BSD or a ready-to-use general-purpose OS. QEMU display backends and input devices vary by host package. Secondary CPUs are released via PSCI but only run offloaded jobs (the scheduler stays on CPU0); HTTPS/TLS and USB/HID are not implemented; and a QEMU visual/input session should be tested locally when changing the renderer or runners. Read the feature-specific guides for exact implementation status and tests.
 
 ## Documentation
 
@@ -160,6 +160,7 @@ RioOS is an experimental learning project, not a replacement for Linux/BSD or a 
 - [`docs/LEARN.md`](./docs/LEARN.md) — guided learning path.
 - [`docs/ROADMAP.md`](./docs/ROADMAP.md) — planned work.
 - [`docs/P5_PROCESS_ISOLATION.md`](./docs/P5_PROCESS_ISOLATION.md) — P5 address spaces, page ownership, context frames, and limitations.
+- [`docs/EXTENDED_FEATURES.md`](./docs/EXTENDED_FEATURES.md) — preemptive multitasking, processes, memory, libc/dl, journal/symlinks, accounts, scripting, PCI/NVMe/AHCI, DHCP/TCP server/IPv6, SMP.
 - [`docs/FAQ.md`](./docs/FAQ.md) — common questions.
 - [`tests/TEST_MATRIX.md`](./tests/TEST_MATRIX.md) — general test matrix.
 - [`docs/TEST_MATRIX_P5.md`](./docs/TEST_MATRIX_P5.md) — P5-specific verification matrix.

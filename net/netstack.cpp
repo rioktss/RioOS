@@ -6,6 +6,7 @@
 
 #define ETH_TYPE_ARP 0x0806U
 #define ETH_TYPE_IPV4 0x0800U
+#define ETH_TYPE_IPV6 0x86DDU
 #define ARP_HTYPE_ETH 1U
 #define ARP_PTYPE_IPV4 0x0800U
 #define ARP_OP_REQUEST 1U
@@ -15,9 +16,15 @@
 #define IP_PROTO_TCP 6U
 #define ICMP_ECHO_REPLY 0U
 #define ICMP_ECHO_REQUEST 8U
-#define NET_IP ((10U<<24)|(0U<<16)|(2U<<8)|15U)
-#define NET_GATEWAY ((10U<<24)|(0U<<16)|(2U<<8)|2U)
-#define NET_MASK 0xFFFFFF00U
+#define NET_IP_DEFAULT ((10U<<24)|(0U<<16)|(2U<<8)|15U)
+#define NET_GATEWAY_DEFAULT ((10U<<24)|(0U<<16)|(2U<<8)|2U)
+#define NET_MASK_DEFAULT 0xFFFFFF00U
+static uint32_t cur_ip = NET_IP_DEFAULT;
+static uint32_t cur_gw = NET_GATEWAY_DEFAULT;
+static uint32_t cur_mask = NET_MASK_DEFAULT;
+#define NET_IP cur_ip
+#define NET_GATEWAY cur_gw
+#define NET_MASK cur_mask
 #define NET_BROADCAST 0xFFFFFFFFU
 #define MAX_FRAME 1600U
 #define ARP_CACHE_SIZE 8
@@ -30,7 +37,8 @@
 #define DNS_PORT 53U
 #define UDP_HEADER_SIZE 8U
 #define UDP_FRAME_MAX (sizeof(EthernetHeader) + sizeof(Ipv4Header) + UDP_HEADER_SIZE + NET_UDP_MAX_PAYLOAD)
-#define TCP_SOCKET_COUNT 4U
+#define TCP_SOCKET_COUNT 8U
+#define TCP_ACCEPT_QUEUE 4U
 #define TCP_RX_BUFFER_SIZE NET_TCP_MAX_IO
 #define TCP_SEGMENT_MAX 536U
 #define TCP_HEADER_SIZE 20U
@@ -47,6 +55,8 @@
 #define TCP_STATE_CLOSE_WAIT 3U
 #define TCP_STATE_FIN_WAIT 4U
 #define TCP_STATE_RESET 5U
+#define TCP_STATE_LISTEN 6U
+#define TCP_STATE_SYN_RCVD 7U
 
 struct __attribute__((packed)) EthernetHeader
 {
@@ -145,6 +155,9 @@ struct TcpSocketState
     uint32_t rcv_nxt;
     uint16_t rx_head;
     uint16_t rx_count;
+    uint8_t parent;                     /* listener handle for a not-yet-accepted child (0 = none) */
+    uint8_t accept_count;
+    uint8_t accept_q[TCP_ACCEPT_QUEUE];
     uint8_t rx_buffer[TCP_RX_BUFFER_SIZE];
 };
 
@@ -169,6 +182,7 @@ static uint16_t dns_query_id = 0x5249U;
 static uint32_t dns_server_ip = DNS_DEFAULT_SERVER;
 
 static int arp_resolve(uint32_t ip, uint8_t mac[6], uint32_t timeout_ms);
+static void v6_input(uint32_t len);
 static void tcp_input(uint32_t source_ip, uint32_t dest_ip,
                       const uint8_t* bytes, uint32_t length);
 static int tcp_send_segment(TcpSocketState* socket, uint8_t flags,
@@ -653,6 +667,12 @@ int net_poll_once()
         uint32_t source_ip = read_be32(&ip->src);
         uint32_t dest_ip = read_be32(&ip->dst);
         if (dest_ip != NET_IP) return 1;
+        if (source_ip != 0 && source_ip != NET_IP && (source_ip & NET_MASK) == (NET_IP & NET_MASK) &&
+            mac_is_valid_unicast(e->src))
+        {
+            uint8_t known[6];
+            if (arp_lookup(source_ip, known) != 0) arp_store(source_ip, e->src);   /* learn on-link peers (passive opens) */
+        }
         if (ip->proto == IP_PROTO_UDP)
         {
             if (total < (uint16_t)(ihl + UDP_HEADER_SIZE)) return -5;
@@ -710,6 +730,12 @@ int net_poll_once()
             virtio_net_send(tx_frame, NET_ETH_HDR + total);
         }
 
+        return 1;
+    }
+
+    if (type == ETH_TYPE_IPV6)
+    {
+        v6_input((uint32_t)len);
         return 1;
     }
 
@@ -811,13 +837,76 @@ static void tcp_input(uint32_t source_ip, uint32_t dest_ip,
             break;
         }
     }
-    if (!socket) return;
+    if (!socket)
+    {
+        /* Passive open: SYN to a listening port creates a child in SYN_RCVD. */
+        if ((flags & (TCP_FLAG_SYN | TCP_FLAG_ACK | TCP_FLAG_RST)) != TCP_FLAG_SYN) return;
+        TcpSocketState* listener = 0; uint32_t listener_index = 0;
+        for (uint32_t i = 0; i < TCP_SOCKET_COUNT; ++i)
+            if (tcp_sockets[i].used && tcp_sockets[i].state == TCP_STATE_LISTEN && tcp_sockets[i].local_port == dest_port)
+            { listener = &tcp_sockets[i]; listener_index = i; break; }
+        if (!listener) return;
+        uint32_t pending = listener->accept_count;
+        for (uint32_t i = 0; i < TCP_SOCKET_COUNT; ++i)
+            if (tcp_sockets[i].used && tcp_sockets[i].parent == listener_index + 1U) ++pending;
+        if (pending >= TCP_ACCEPT_QUEUE) return;
+        uint32_t next_hop = ((source_ip & NET_MASK) == (NET_IP & NET_MASK)) ? source_ip : NET_GATEWAY;
+        uint8_t hop_mac[6];
+        if (arp_lookup(next_hop, hop_mac) != 0) { (void)send_arp(next_hop); return; }   /* client retransmits SYN */
+        for (uint32_t i = 0; i < TCP_SOCKET_COUNT; ++i)
+        {
+            TcpSocketState* child = &tcp_sockets[i];
+            if (child->used) continue;
+            child->used = 1;
+            child->owner_pid = listener->owner_pid;
+            child->state = TCP_STATE_SYN_RCVD;
+            child->peer_closed = 0;
+            child->local_port = dest_port;
+            child->remote_port = source_port;
+            child->remote_ip = source_ip;
+            uint32_t iss = (uint32_t)timer_millis() ^ source_ip ^ ((uint32_t)source_port << 16) ^ 0x52494F53U;
+            if (iss == 0) iss = 1;
+            child->snd_una = iss;
+            child->snd_nxt = iss + 1U;
+            child->rcv_nxt = sequence + 1U;
+            child->rx_head = child->rx_count = 0;
+            child->parent = (uint8_t)(listener_index + 1U);
+            child->accept_count = 0;
+            (void)tcp_send_segment(child, TCP_FLAG_SYN | TCP_FLAG_ACK, iss, child->rcv_nxt, 0, 0);
+            return;
+        }
+        return;
+    }
 
     if (flags & TCP_FLAG_RST)
     {
+        if (socket->parent) { socket->used = 0; socket->state = TCP_STATE_CLOSED; socket->parent = 0; return; }
         socket->state = TCP_STATE_RESET;
         socket->peer_closed = 1;
         return;
+    }
+
+    if (socket->state == TCP_STATE_SYN_RCVD)
+    {
+        if (flags & TCP_FLAG_SYN)       /* retransmitted SYN: repeat SYN-ACK */
+        {
+            (void)tcp_send_segment(socket, TCP_FLAG_SYN | TCP_FLAG_ACK, socket->snd_una, socket->rcv_nxt, 0, 0);
+            return;
+        }
+        if ((flags & TCP_FLAG_ACK) && acknowledgement == socket->snd_nxt)
+        {
+            socket->snd_una = acknowledgement;
+            socket->state = TCP_STATE_ESTABLISHED;
+            TcpSocketState* listener = socket->parent ? &tcp_sockets[socket->parent - 1U] : 0;
+            if (listener && listener->used && listener->state == TCP_STATE_LISTEN && listener->accept_count < TCP_ACCEPT_QUEUE)
+            {
+                listener->accept_q[listener->accept_count++] = (uint8_t)((socket - tcp_sockets) + 1);
+                socket->parent = 0;
+            }
+            else { socket->used = 0; socket->state = TCP_STATE_CLOSED; socket->parent = 0; return; }
+            /* fall through: the ACK may carry data */
+        }
+        else return;
     }
 
     if (socket->state == TCP_STATE_SYN_SENT)
@@ -894,6 +983,7 @@ int net_tcp_socket(int owner_pid)
         socket->remote_ip = 0;
         socket->snd_una = socket->snd_nxt = socket->rcv_nxt = 0;
         socket->rx_head = socket->rx_count = 0;
+        socket->parent = 0; socket->accept_count = 0;
         return (int)i + 1;
     }
     return -24;
@@ -969,6 +1059,48 @@ int net_tcp_connect(int owner_pid, int socket_handle, uint32_t target_ip,
     socket->remote_ip = 0;
     socket->remote_port = 0;
     return -110;
+}
+
+int net_tcp_listen(int owner_pid, int socket_handle, uint16_t local_port)
+{
+    TcpSocketState* socket = tcp_get_socket(owner_pid, socket_handle);
+    if (!socket) return -9;
+    if (!ready_state) return -19;
+    if (socket->state != TCP_STATE_CLOSED || local_port == 0) return -22;
+    for (uint32_t i = 0; i < TCP_SOCKET_COUNT; ++i)
+        if (tcp_sockets[i].used && &tcp_sockets[i] != socket && tcp_sockets[i].state == TCP_STATE_LISTEN &&
+            tcp_sockets[i].local_port == local_port)
+            return -98;                                  /* EADDRINUSE */
+    socket->local_port = local_port;
+    socket->state = TCP_STATE_LISTEN;
+    socket->accept_count = 0;
+    return 0;
+}
+
+/* Returns a new connected socket handle (owned by the listener's owner), or a negative errno. */
+int net_tcp_accept(int owner_pid, int socket_handle, uint32_t* peer_ip, uint16_t* peer_port, uint32_t timeout_ms)
+{
+    TcpSocketState* socket = tcp_get_socket(owner_pid, socket_handle);
+    if (!socket) return -9;
+    if (!ready_state) return -19;
+    if (socket->state != TCP_STATE_LISTEN) return -22;
+    if (timeout_ms > NET_TCP_MAX_TIMEOUT_MS) return -22;
+    uint64_t start = timer_millis();
+    for (;;)
+    {
+        if (socket->accept_count > 0)
+        {
+            uint8_t handle = socket->accept_q[0];
+            for (uint32_t i = 1; i < socket->accept_count; ++i) socket->accept_q[i - 1] = socket->accept_q[i];
+            --socket->accept_count;
+            TcpSocketState* child = &tcp_sockets[handle - 1U];
+            if (peer_ip) *peer_ip = child->remote_ip;
+            if (peer_port) *peer_port = child->remote_port;
+            return handle;
+        }
+        if (timer_millis() - start >= timeout_ms) return -11;       /* EAGAIN */
+        (void)net_poll_once();
+    }
 }
 
 int net_tcp_send(int owner_pid, int socket_handle, const void* data,
@@ -1081,6 +1213,22 @@ int net_tcp_close(int owner_pid, int socket_handle)
                 (void)net_poll_once();
         }
     }
+    if (socket->state == TCP_STATE_LISTEN)
+    {
+        uint32_t me = (uint32_t)(socket - tcp_sockets) + 1U;
+        for (uint32_t i = 0; i < TCP_SOCKET_COUNT; ++i)
+        {
+            TcpSocketState* c = &tcp_sockets[i];
+            if (!c->used || c == socket) continue;
+            int queued = 0;
+            for (uint32_t k = 0; k < socket->accept_count; ++k) if (socket->accept_q[k] == i + 1U) queued = 1;
+            if (c->parent == me || queued)
+            {
+                if (c->state == TCP_STATE_ESTABLISHED) (void)tcp_send_segment(c, TCP_FLAG_RST | TCP_FLAG_ACK, c->snd_nxt, c->rcv_nxt, 0, 0);
+                c->used = 0; c->state = TCP_STATE_CLOSED; c->parent = 0; c->owner_pid = -1;
+            }
+        }
+    }
     socket->used = 0;
     socket->owner_pid = -1;
     socket->state = TCP_STATE_CLOSED;
@@ -1089,6 +1237,7 @@ int net_tcp_close(int owner_pid, int socket_handle)
     socket->remote_port = 0;
     socket->remote_ip = 0;
     socket->rx_head = socket->rx_count = 0;
+    socket->parent = 0; socket->accept_count = 0;
     return rc;
 }
 
@@ -1554,6 +1703,393 @@ int net_ping(uint32_t target_ip, uint32_t timeout_ms)
     return -110;
 }
 
+/* ===================== DHCP client ===================================== */
+#define DHCP_SERVER_PORT 67U
+#define DHCP_CLIENT_PORT 68U
+static uint8_t dhcp_buf[MAX_FRAME] __attribute__((aligned(16)));
+static uint32_t dhcp_lease_s = 0;
+static uint32_t dhcp_server_ip = 0;
+static int dhcp_bound = 0;
+
+static uint32_t dhcp_build(uint8_t type, uint32_t xid, uint32_t req_ip, uint32_t server_ip)
+{
+    uint8_t* f = tx_frame;
+    for (uint32_t i = 0; i < 400; ++i) f[i] = 0;
+    EthernetHeader* e = (EthernetHeader*)f;
+    fill6(e->dst, 0xFF); copy6(e->src, local_mac); write_be16(&e->type, ETH_TYPE_IPV4);
+    Ipv4Header* ip = (Ipv4Header*)(f + NET_ETH_HDR);
+    uint8_t* udp = (uint8_t*)ip + sizeof(Ipv4Header);
+    uint8_t* b = udp + UDP_HEADER_SIZE;
+    b[0] = 1; b[1] = 1; b[2] = 6; b[3] = 0;
+    write_be32(b + 4, xid);
+    write_be16(b + 10, 0x8000U);                      /* broadcast flag: server replies to ff:ff:ff:ff:ff:ff */
+    copy6(b + 28, local_mac);
+    uint8_t* o = b + 236;
+    o[0] = 0x63; o[1] = 0x82; o[2] = 0x53; o[3] = 0x63; o += 4;
+    *o++ = 53; *o++ = 1; *o++ = type;
+    *o++ = 61; *o++ = 7; *o++ = 1; for (int i = 0; i < 6; ++i) *o++ = local_mac[i];
+    if (req_ip) { *o++ = 50; *o++ = 4; write_be32(o, req_ip); o += 4; }
+    if (server_ip) { *o++ = 54; *o++ = 4; write_be32(o, server_ip); o += 4; }
+    *o++ = 55; *o++ = 4; *o++ = 1; *o++ = 3; *o++ = 6; *o++ = 51;
+    *o++ = 255;
+    uint32_t bootp_len = (uint32_t)(o - b);
+    if (bootp_len < 300) bootp_len = 300;
+    uint32_t udp_len = UDP_HEADER_SIZE + bootp_len;
+    uint32_t ip_len = sizeof(Ipv4Header) + udp_len;
+    write_be16(udp, DHCP_CLIENT_PORT); write_be16(udp + 2, DHCP_SERVER_PORT);
+    write_be16(udp + 4, (uint16_t)udp_len); write_be16(udp + 6, 0);
+    ip->ver_ihl = 0x45; ip->tos = 0;
+    write_be16(&ip->total_len, (uint16_t)ip_len);
+    write_be16(&ip->id, (uint16_t)next_ip_id++);
+    write_be16(&ip->frag, 0);
+    ip->ttl = 64; ip->proto = IP_PROTO_UDP;
+    write_be16(&ip->checksum, 0);
+    write_be32(&ip->src, 0); write_be32(&ip->dst, NET_BROADCAST);
+    write_be16(&ip->checksum, checksum16((const uint8_t*)ip, sizeof(Ipv4Header)));
+    return NET_ETH_HDR + ip_len;
+}
+
+/* Waits for a BOOTP reply with this xid; returns DHCP message type (2 offer, 5 ack, 6 nak) or 0. */
+static int dhcp_wait(uint32_t xid, uint32_t timeout_ms, uint32_t* yiaddr, uint32_t* server, uint32_t* mask,
+                     uint32_t* router, uint32_t* dns, uint32_t* lease)
+{
+    uint64_t start = timer_millis();
+    while (timer_millis() - start < timeout_ms)
+    {
+        int len = virtio_net_receive(dhcp_buf, sizeof(dhcp_buf));
+        if (len <= 0) continue;
+        if ((uint32_t)len < NET_ETH_HDR + sizeof(Ipv4Header) + UDP_HEADER_SIZE + 240) continue;
+        EthernetHeader* e = (EthernetHeader*)dhcp_buf;
+        if (read_be16(&e->type) != ETH_TYPE_IPV4) continue;
+        Ipv4Header* ip = (Ipv4Header*)(dhcp_buf + NET_ETH_HDR);
+        if (ip->proto != IP_PROTO_UDP) continue;
+        uint32_t ihl = (uint32_t)(ip->ver_ihl & 0x0F) * 4U;
+        if (ihl < 20 || NET_ETH_HDR + ihl + UDP_HEADER_SIZE + 240 > (uint32_t)len) continue;
+        uint8_t* udp = dhcp_buf + NET_ETH_HDR + ihl;
+        if (read_be16(udp + 2) != DHCP_CLIENT_PORT) continue;
+        uint8_t* b = udp + UDP_HEADER_SIZE;
+        uint32_t avail = (uint32_t)len - (uint32_t)(b - dhcp_buf);
+        if (b[0] != 2 || read_be32(b + 4) != xid) continue;
+        if (b[236] != 0x63 || b[237] != 0x82 || b[238] != 0x53 || b[239] != 0x63) continue;
+        int type = 0;
+        *yiaddr = read_be32(b + 16);
+        for (uint32_t i = 240; i < avail; )
+        {
+            uint8_t code = b[i];
+            if (code == 255) break;
+            if (code == 0) { ++i; continue; }
+            if (i + 1 >= avail) break;
+            uint8_t l = b[i + 1];
+            if (i + 2 + l > avail) break;
+            const uint8_t* v = b + i + 2;
+            if (code == 53 && l == 1) type = v[0];
+            else if (code == 54 && l == 4) *server = read_be32(v);
+            else if (code == 1 && l == 4) *mask = read_be32(v);
+            else if (code == 3 && l >= 4) *router = read_be32(v);
+            else if (code == 6 && l >= 4) *dns = read_be32(v);
+            else if (code == 51 && l == 4) *lease = read_be32(v);
+            i += 2U + l;
+        }
+        if (type) return type;
+    }
+    return 0;
+}
+
+int net_dhcp(uint32_t timeout_ms)
+{
+    if (!ready_state) return -19;
+    uint32_t xid = (uint32_t)timer_millis() ^ 0x52494F00U;
+    uint32_t yi = 0, srv = 0, mask = 0, router = 0, dns = 0, lease = 0;
+    int got = 0;
+    for (int attempt = 0; attempt < 4 && !got; ++attempt)
+    {
+        uint32_t n = dhcp_build(1, xid, 0, 0);
+        if (virtio_net_send(tx_frame, n) != 0) return -5;
+        got = dhcp_wait(xid, timeout_ms / 4U, &yi, &srv, &mask, &router, &dns, &lease) == 2;
+    }
+    if (!got) return -110;
+    uint32_t offered = yi, server = srv;
+    uint32_t n = dhcp_build(3, xid, offered, server);
+    if (virtio_net_send(tx_frame, n) != 0) return -5;
+    yi = 0; mask = router = dns = lease = 0;
+    int t = dhcp_wait(xid, timeout_ms / 2U + 500U, &yi, &srv, &mask, &router, &dns, &lease);
+    if (t != 5 || yi != offered) return t == 6 ? -13 : -110;
+    cur_ip = yi;
+    cur_mask = mask ? mask : NET_MASK_DEFAULT;
+    cur_gw = router ? router : cur_gw;
+    if (dns) dns_server_ip = dns;
+    dhcp_lease_s = lease; dhcp_server_ip = server; dhcp_bound = 1;
+    for (int i = 0; i < ARP_CACHE_SIZE; i++) arp_cache[i].valid = 0;
+    return 0;
+}
+
+void net_dhcp_info(uint32_t* server, uint32_t* lease, int* bound)
+{
+    if (server) *server = dhcp_server_ip;
+    if (lease) *lease = dhcp_lease_s;
+    if (bound) *bound = dhcp_bound;
+}
+
+/* ===================== IPv6 (link-local) + ICMPv6 / NDP ================= */
+#define IPV6_HDR 40U
+#define ICMP6_ECHO_REQ 128U
+#define ICMP6_ECHO_REP 129U
+#define ICMP6_NS 135U
+#define ICMP6_NA 136U
+static uint8_t v6_buf[MAX_FRAME] __attribute__((aligned(16)));
+static struct { int valid; uint8_t ip[16]; uint8_t mac[6]; } v6_neigh[4];
+static volatile int v6_echo_seen = 0;
+static volatile uint16_t v6_echo_id = 0, v6_echo_seq = 0;
+static uint32_t v6_rx_echo_req = 0, v6_rx_ns = 0, v6_tx_na = 0;
+
+static void v6_local(uint8_t out[16])
+{
+    for (int i = 0; i < 16; ++i) out[i] = 0;
+    out[0] = 0xFE; out[1] = 0x80;
+    out[8] = local_mac[0] ^ 0x02; out[9] = local_mac[1]; out[10] = local_mac[2];
+    out[11] = 0xFF; out[12] = 0xFE;
+    out[13] = local_mac[3]; out[14] = local_mac[4]; out[15] = local_mac[5];
+}
+
+static int v6_eq(const uint8_t* a, const uint8_t* b) { for (int i = 0; i < 16; ++i) if (a[i] != b[i]) return 0; return 1; }
+
+static uint16_t v6_checksum(const uint8_t* src, const uint8_t* dst, uint8_t next, const uint8_t* msg, uint32_t len)
+{
+    uint32_t sum = 0;
+    for (int i = 0; i < 16; i += 2) { sum += ((uint32_t)src[i] << 8) | src[i + 1]; sum += ((uint32_t)dst[i] << 8) | dst[i + 1]; }
+    sum += len >> 16; sum += len & 0xFFFFU; sum += next;
+    for (uint32_t i = 0; i + 1 < len; i += 2) sum += ((uint32_t)msg[i] << 8) | msg[i + 1];
+    if (len & 1U) sum += (uint32_t)msg[len - 1] << 8;
+    while (sum >> 16) sum = (sum & 0xFFFFU) + (sum >> 16);
+    uint16_t r = (uint16_t)~sum;
+    return r == 0 ? 0xFFFFU : r;
+}
+
+static void v6_neigh_store(const uint8_t* ip, const uint8_t* mac)
+{
+    int slot = -1;
+    for (int i = 0; i < 4; ++i) { if (v6_neigh[i].valid && v6_eq(v6_neigh[i].ip, ip)) { slot = i; break; } }
+    if (slot < 0) for (int i = 0; i < 4; ++i) if (!v6_neigh[i].valid) { slot = i; break; }
+    if (slot < 0) slot = 0;
+    v6_neigh[slot].valid = 1;
+    for (int i = 0; i < 16; ++i) v6_neigh[slot].ip[i] = ip[i];
+    copy6(v6_neigh[slot].mac, mac);
+}
+
+static int v6_neigh_lookup(const uint8_t* ip, uint8_t* mac)
+{
+    for (int i = 0; i < 4; ++i)
+        if (v6_neigh[i].valid && v6_eq(v6_neigh[i].ip, ip)) { copy6(mac, v6_neigh[i].mac); return 0; }
+    return -1;
+}
+
+static int v6_send(const uint8_t* dst_mac, const uint8_t* src, const uint8_t* dst, uint8_t hop, const uint8_t* msg, uint32_t len)
+{
+    if (NET_ETH_HDR + IPV6_HDR + len > sizeof(tx_frame)) return -90;
+    EthernetHeader* e = (EthernetHeader*)tx_frame;
+    copy6(e->dst, dst_mac); copy6(e->src, local_mac); write_be16(&e->type, ETH_TYPE_IPV6);
+    uint8_t* h = tx_frame + NET_ETH_HDR;
+    h[0] = 0x60; h[1] = h[2] = h[3] = 0;
+    write_be16(h + 4, (uint16_t)len);
+    h[6] = 58; h[7] = hop;
+    for (int i = 0; i < 16; ++i) { h[8 + i] = src[i]; h[24 + i] = dst[i]; }
+    for (uint32_t i = 0; i < len; ++i) h[IPV6_HDR + i] = msg[i];
+    return virtio_net_send(tx_frame, NET_ETH_HDR + IPV6_HDR + len) == 0 ? 0 : -5;
+}
+
+static int v6_send_na(const uint8_t* dst_mac, const uint8_t* dst_ip, const uint8_t* target, int solicited)
+{
+    uint8_t me[16]; v6_local(me);
+    uint8_t m[32];
+    for (int i = 0; i < 32; ++i) m[i] = 0;
+    m[0] = ICMP6_NA;
+    m[4] = (uint8_t)(0x20 | (solicited ? 0x40 : 0));          /* O (+S) */
+    for (int i = 0; i < 16; ++i) m[8 + i] = target[i];
+    m[24] = 2; m[25] = 1; copy6(m + 26, local_mac);
+    write_be16(m + 2, v6_checksum(me, dst_ip, 58, m, 32));
+    ++v6_tx_na;
+    return v6_send(dst_mac, me, dst_ip, 255, m, 32);
+}
+
+static void v6_input(uint32_t len)
+{
+    /* Copy out of rx_frame: replies are built in tx_frame and ARP/ND may poll again. */
+    if (len < NET_ETH_HDR + IPV6_HDR + 8U || len > sizeof(v6_buf)) return;
+    for (uint32_t i = 0; i < len; ++i) v6_buf[i] = rx_frame[i];
+    const EthernetHeader* e = (const EthernetHeader*)v6_buf;
+    const uint8_t* h = v6_buf + NET_ETH_HDR;
+    if ((h[0] >> 4) != 6 || h[6] != 58) return;
+    uint32_t plen = read_be16(h + 4);
+    if (plen < 8 || plen + IPV6_HDR + NET_ETH_HDR > len) return;
+    const uint8_t* src = h + 8; const uint8_t* dst = h + 24;
+    const uint8_t* msg = h + IPV6_HDR;
+    uint8_t me[16]; v6_local(me);
+    int to_me = v6_eq(dst, me);
+    int solicited_node = dst[0] == 0xFF && dst[1] == 0x02 && dst[11] == 0x01 && dst[12] == 0xFF &&
+                         dst[13] == me[13] && dst[14] == me[14] && dst[15] == me[15];
+    int all_nodes = dst[0] == 0xFF && dst[1] == 0x02 && dst[15] == 0x01;
+    if (!to_me && !solicited_node && !all_nodes) return;
+    if (v6_checksum(src, dst, 58, msg, plen) != 0xFFFFU && checksum16(msg, 0) == 1) return;
+    /* verify checksum: sum including the transmitted checksum field must fold to zero */
+    {
+        uint32_t sum = 0;
+        for (int i = 0; i < 16; i += 2) { sum += ((uint32_t)src[i] << 8) | src[i + 1]; sum += ((uint32_t)dst[i] << 8) | dst[i + 1]; }
+        sum += plen >> 16; sum += plen & 0xFFFFU; sum += 58;
+        for (uint32_t i = 0; i + 1 < plen; i += 2) sum += ((uint32_t)msg[i] << 8) | msg[i + 1];
+        if (plen & 1U) sum += (uint32_t)msg[plen - 1] << 8;
+        while (sum >> 16) sum = (sum & 0xFFFFU) + (sum >> 16);
+        if (sum != 0xFFFFU) return;
+    }
+    uint8_t type = msg[0];
+    if (type == ICMP6_NS && plen >= 24 && h[7] == 255)
+    {
+        const uint8_t* target = msg + 8;
+        ++v6_rx_ns;
+        if (!v6_eq(target, me)) return;
+        int unspecified = 1;
+        for (int i = 0; i < 16; ++i) if (src[i]) unspecified = 0;
+        if (unspecified) return;                                  /* DAD probe for our address: not supported */
+        uint8_t peer_mac[6]; copy6(peer_mac, e->src);
+        if (plen >= 32 && msg[24] == 1 && msg[25] == 1) copy6(peer_mac, msg + 26);
+        v6_neigh_store(src, peer_mac);
+        (void)v6_send_na(peer_mac, src, me, 1);
+    }
+    else if (type == ICMP6_NA && plen >= 24 && h[7] == 255)
+    {
+        const uint8_t* target = msg + 8;
+        uint8_t mac[6]; copy6(mac, e->src);
+        if (plen >= 32 && msg[24] == 2 && msg[25] == 1) copy6(mac, msg + 26);
+        v6_neigh_store(target, mac);
+    }
+    else if (type == ICMP6_ECHO_REQ && to_me)
+    {
+        ++v6_rx_echo_req;
+        if (plen > 1200) return;
+        uint8_t rep[1200];
+        for (uint32_t i = 0; i < plen; ++i) rep[i] = msg[i];
+        rep[0] = ICMP6_ECHO_REP; rep[2] = rep[3] = 0;
+        write_be16(rep + 2, v6_checksum(me, src, 58, rep, plen));
+        uint8_t mac[6];
+        if (v6_neigh_lookup(src, mac) != 0) { copy6(mac, e->src); v6_neigh_store(src, mac); }
+        (void)v6_send(mac, me, src, 64, rep, plen);
+    }
+    else if (type == ICMP6_ECHO_REP && to_me && plen >= 8)
+    {
+        v6_echo_id = read_be16(msg + 4); v6_echo_seq = read_be16(msg + 6);
+        v6_echo_seen = 1;
+    }
+}
+
+int net_ip6_parse(const char* text, uint8_t out[16])
+{
+    if (!text) return -22;
+    uint16_t groups[8]; int n = 0, gap = -1;
+    const char* p = text;
+    if (p[0] == ':' && p[1] == ':') { gap = 0; p += 2; if (!*p) { for (int i = 0; i < 16; ++i) out[i] = 0; return 0; } }
+    else if (p[0] == ':') return -22;
+    while (*p)
+    {
+        uint32_t v = 0; int d = 0;
+        while (*p && *p != ':')
+        {
+            int c = *p;
+            int x = (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10 : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+            if (x < 0 || ++d > 4) return -22;
+            v = (v << 4) | (uint32_t)x; ++p;
+        }
+        if (d == 0) return -22;
+        if (n >= 8) return -22;
+        groups[n++] = (uint16_t)v;
+        if (*p == ':')
+        {
+            ++p;
+            if (*p == ':') { if (gap >= 0) return -22; gap = n; ++p; if (!*p) break; }
+            else if (!*p) return -22;
+        }
+    }
+    int total = n;
+    uint16_t full[8];
+    if (gap < 0) { if (total != 8) return -22; for (int i = 0; i < 8; ++i) full[i] = groups[i]; }
+    else
+    {
+        if (total > 7) return -22;
+        int fill = 8 - total;
+        int k = 0;
+        for (int i = 0; i < gap; ++i) full[k++] = groups[i];
+        for (int i = 0; i < fill; ++i) full[k++] = 0;
+        for (int i = gap; i < total; ++i) full[k++] = groups[i];
+    }
+    for (int i = 0; i < 8; ++i) { out[i * 2] = (uint8_t)(full[i] >> 8); out[i * 2 + 1] = (uint8_t)full[i]; }
+    return 0;
+}
+
+void net_ip6_print(const uint8_t a[16])
+{
+    static const char hx[] = "0123456789abcdef";
+    int best = -1, best_len = 0;
+    for (int i = 0; i < 8; )
+    {
+        if (a[i * 2] == 0 && a[i * 2 + 1] == 0) { int j = i; while (j < 8 && a[j * 2] == 0 && a[j * 2 + 1] == 0) ++j; if (j - i > best_len && j - i >= 2) { best = i; best_len = j - i; } i = j; }
+        else ++i;
+    }
+    for (int i = 0; i < 8; ++i)
+    {
+        if (i == best) { uart_puts("::"); i += best_len - 1; continue; }
+        if (i > 0 && !(best >= 0 && i == best + best_len)) uart_putc(':');
+        uint16_t g = (uint16_t)((a[i * 2] << 8) | a[i * 2 + 1]);
+        int started = 0;
+        for (int s = 12; s >= 0; s -= 4) { int d = (g >> s) & 0xF; if (d || started || s == 0) { uart_putc(hx[d]); started = 1; } }
+    }
+}
+
+void net_ip6_local(uint8_t out[16]) { v6_local(out); }
+
+int net_ping6(const uint8_t target[16], uint32_t timeout_ms)
+{
+    if (!ready_state) return -19;
+    uint8_t me[16]; v6_local(me);
+    uint8_t mac[6];
+    uint64_t start = timer_millis();
+    if (v6_neigh_lookup(target, mac) != 0)
+    {
+        uint8_t ns[32], sn[16] = {0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xFF, 0, 0, 0};
+        sn[13] = target[13]; sn[14] = target[14]; sn[15] = target[15];
+        for (int i = 0; i < 32; ++i) ns[i] = 0;
+        ns[0] = ICMP6_NS;
+        for (int i = 0; i < 16; ++i) ns[8 + i] = target[i];
+        ns[24] = 1; ns[25] = 1; copy6(ns + 26, local_mac);
+        write_be16(ns + 2, v6_checksum(me, sn, 58, ns, 32));
+        uint8_t mmac[6] = {0x33, 0x33, 0xFF, sn[13], sn[14], sn[15]};
+        uint64_t last = 0; int tries = 0;
+        while (v6_neigh_lookup(target, mac) != 0)
+        {
+            uint64_t now = timer_millis();
+            if (now - start >= timeout_ms) return -113;           /* EHOSTUNREACH */
+            if (tries == 0 || now - last >= 500) { if (tries++ >= 4) return -113; (void)v6_send(mmac, me, sn, 255, ns, 32); last = now; }
+            (void)net_poll_once();
+        }
+    }
+    uint8_t req[8 + 32];
+    for (int i = 0; i < 40; ++i) req[i] = 0;
+    req[0] = ICMP6_ECHO_REQ; write_be16(req + 4, 0x5249U); write_be16(req + 6, 1);
+    for (int i = 0; i < 32; ++i) req[8 + i] = (uint8_t)i;
+    write_be16(req + 2, v6_checksum(me, target, 58, req, 40));
+    v6_echo_seen = 0;
+    if (v6_send(mac, me, target, 64, req, 40) != 0) return -5;
+    uint64_t t0 = timer_millis();
+    while (timer_millis() - start < timeout_ms)
+    {
+        (void)net_poll_once();
+        if (v6_echo_seen && v6_echo_id == 0x5249U) return (int)(timer_millis() - t0);
+    }
+    return -110;
+}
+
+void net_ip6_stats(uint32_t* ns, uint32_t* na_tx, uint32_t* echo)
+{
+    if (ns) *ns = v6_rx_ns; if (na_tx) *na_tx = v6_tx_na; if (echo) *echo = v6_rx_echo_req;
+}
+
 void net_init()
 {
     ready_state = 0;
@@ -1583,7 +2119,10 @@ void net_init()
         tcp_sockets[i].rcv_nxt = 0;
         tcp_sockets[i].rx_head = 0;
         tcp_sockets[i].rx_count = 0;
+        tcp_sockets[i].parent = 0;
+        tcp_sockets[i].accept_count = 0;
     }
+    cur_ip = NET_IP_DEFAULT; cur_gw = NET_GATEWAY_DEFAULT; cur_mask = NET_MASK_DEFAULT;
     for (int i = 0; i < ARP_CACHE_SIZE; i++)
     {
         arp_cache[i].valid = 0;
@@ -1615,8 +2154,11 @@ void net_status()
     uart_puts(ready_state? "yes\r\n" : "no\r\n");
     uart_puts("IPv4 : ");
     net_print_ipv4(NET_IP);
-    uart_puts("/24\r\n");
-    uart_puts("Gateway: ");
+    uart_puts(" mask ");
+    net_print_ipv4(NET_MASK);
+    uart_puts("\r\nIPv6   : ");
+    { uint8_t a6[16]; v6_local(a6); net_ip6_print(a6); }
+    uart_puts("/64 (link-local)\r\nGateway: ");
     net_print_ipv4(NET_GATEWAY);
     uart_puts("\r\nDNS    : ");
     net_print_ipv4(dns_server_ip);

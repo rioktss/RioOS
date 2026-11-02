@@ -81,6 +81,144 @@ static uint32_t current_uid = 0;
 static uint32_t current_gid = 0;
 static uint8_t truncate_buffer[FS_MAX_FILE_SIZE];
 static void clear_bytes(void* ptr, uint64_t size);
+
+/* ---- Write-ahead metadata journal (ordered mode) --------------------------
+   File data goes straight to its (new) extent first; every metadata sector
+   (inode table, allocation bitmap, superblock) touched by one operation is
+   staged in RAM, then committed atomically: journal data -> journal header
+   (commit record) -> in-place apply -> header cleared. Mount replays a
+   committed-but-unapplied transaction. Journal = last 33 sectors of the disk. */
+#define JNL_SECTORS 33ULL
+#define JNL_MAX     32
+#define JNL_MAGIC   0x4A4E4C52U
+struct __attribute__((packed)) JnlHeader
+{
+    uint32_t magic;
+    uint32_t seq;
+    uint32_t count;
+    uint32_t checksum;
+    uint64_t target[JNL_MAX];
+};
+static int jnl_enabled = 0;
+static int tx_depth = 0;
+static int tx_count = 0;
+static int fs_ro = 0;
+static int jnl_crash_armed = 0;
+static uint32_t jnl_seq = 0;
+static uint32_t jnl_commits = 0;
+static uint32_t jnl_replayed = 0;
+static uint64_t tx_sector[JNL_MAX];
+static uint8_t tx_data[JNL_MAX][512] __attribute__((aligned(16)));
+static uint8_t jnl_io[512] __attribute__((aligned(16)));
+static uint64_t jnl_start() { return disk_sectors - JNL_SECTORS; }
+
+static int meta_write(uint64_t sector, const void* buf)
+{
+    if (jnl_enabled && tx_depth > 0)
+    {
+        int slot = -1;
+        for (int i = 0; i < tx_count; ++i) if (tx_sector[i] == sector) { slot = i; break; }
+        if (slot < 0)
+        {
+            if (tx_count >= JNL_MAX) return -1;
+            slot = tx_count++;
+            tx_sector[slot] = sector;
+        }
+        for (int i = 0; i < 512; ++i) tx_data[slot][i] = ((const uint8_t*)buf)[i];
+        return 0;
+    }
+    return storage_write_sector(sector, buf);
+}
+
+static int meta_read(uint64_t sector, void* buf)
+{
+    if (jnl_enabled && tx_depth > 0)
+        for (int i = 0; i < tx_count; ++i)
+            if (tx_sector[i] == sector)
+            {
+                for (int k = 0; k < 512; ++k) ((uint8_t*)buf)[k] = tx_data[i][k];
+                return 0;
+            }
+    return storage_read_sector(sector, buf);
+}
+
+static int meta_flush() { return tx_depth > 0 ? 0 : storage_flush(); }
+
+static uint32_t jnl_sum(const JnlHeader* h, const uint8_t (*data)[512])
+{
+    uint32_t x = 2166136261U;
+    for (uint32_t i = 0; i < h->count; ++i)
+    {
+        for (int b = 0; b < 8; ++b) { x ^= (uint8_t)(h->target[i] >> (b * 8)); x *= 16777619U; }
+        for (int b = 0; b < 512; ++b) { x ^= data[i][b]; x *= 16777619U; }
+    }
+    x ^= h->seq; x *= 16777619U;
+    x ^= h->count; x *= 16777619U;
+    return x;
+}
+
+static int jnl_clear_header()
+{
+    clear_bytes(jnl_io, 512);
+    if (storage_write_sector(jnl_start(), jnl_io) != 0) return -1;
+    return storage_flush();
+}
+
+static void tx_end()
+{
+    if (--tx_depth > 0) return;
+    if (tx_depth < 0) tx_depth = 0;
+    if (!jnl_enabled || tx_count == 0) { tx_count = 0; return; }
+    int n = tx_count;
+    tx_count = 0;
+    uint64_t js = jnl_start();
+    for (int i = 0; i < n; ++i)
+        if (storage_write_sector(js + 1 + (uint64_t)i, tx_data[i]) != 0) return;
+    if (storage_flush() != 0) return;
+    JnlHeader h;
+    clear_bytes(&h, sizeof(h));
+    h.magic = JNL_MAGIC; h.seq = ++jnl_seq; h.count = (uint32_t)n;
+    for (int i = 0; i < n; ++i) h.target[i] = tx_sector[i];
+    h.checksum = jnl_sum(&h, tx_data);
+    clear_bytes(jnl_io, 512);
+    for (uint64_t i = 0; i < sizeof(h); ++i) jnl_io[i] = ((const uint8_t*)&h)[i];
+    if (storage_write_sector(js, jnl_io) != 0) return;
+    if (storage_flush() != 0) return;          /* commit point */
+    ++jnl_commits;
+    if (jnl_crash_armed) { jnl_crash_armed = 0; return; }   /* simulated power loss before apply */
+    for (int i = 0; i < n; ++i)
+        if (storage_write_sector(tx_sector[i], tx_data[i]) != 0) return;
+    if (storage_flush() != 0) return;
+    (void)jnl_clear_header();
+}
+
+struct FsTx { FsTx() { ++tx_depth; } ~FsTx() { tx_end(); } };
+#define FS_RW_CHECK() do { if (fs_ro) return -30; } while (0)
+
+static int jnl_recover()
+{
+    if (!jnl_enabled) return 0;
+    uint64_t js = jnl_start();
+    if (storage_read_sector(js, jnl_io) != 0) return -1;
+    JnlHeader h;
+    for (uint64_t i = 0; i < sizeof(h); ++i) ((uint8_t*)&h)[i] = jnl_io[i];
+    if (h.magic != JNL_MAGIC) return 0;
+    if (h.count == 0 || h.count > JNL_MAX) return jnl_clear_header();
+    static uint8_t rdata[JNL_MAX][512] __attribute__((aligned(16)));
+    for (uint32_t i = 0; i < h.count; ++i)
+        if (storage_read_sector(js + 1 + i, rdata[i]) != 0) return -1;
+    if (jnl_sum(&h, rdata) != h.checksum)       /* torn commit: discard */
+        return jnl_clear_header();
+    for (uint32_t i = 0; i < h.count; ++i)
+    {
+        if (h.target[i] >= js) continue;          /* never write into the journal itself */
+        if (storage_write_sector(h.target[i], rdata[i]) != 0) return -1;
+    }
+    if (storage_flush() != 0) return -1;
+    jnl_seq = h.seq;
+    jnl_replayed += h.count;
+    return jnl_clear_header();
+}
 static uint32_t default_mode_for_type(int type)
 {
     return type == FS_DIR ? 0755U : 0644U;
@@ -156,10 +294,10 @@ static int write_bitmap()
     for (uint64_t s = 0; s < FS_BITMAP_SECTORS; ++s)
     {
         const uint8_t* src = bitmap + s * FS_SECTOR_SIZE;
-        if (storage_write_sector(FS_BITMAP_START + s, src) != 0)
+        if (meta_write(FS_BITMAP_START + s, src) != 0)
             return -1;
     }
-    return storage_flush();
+    return meta_flush();
 }
 
 static void node_to_disk(const FsNode* n, DiskInode* d)
@@ -221,15 +359,15 @@ static int save_inode(int id)
     uint64_t index = (uint64_t)id;
     uint64_t sector = FS_INODE_START + (index * FS_INODE_SIZE) / FS_SECTOR_SIZE;
     uint64_t offset = (index * FS_INODE_SIZE) % FS_SECTOR_SIZE;
-    if (storage_read_sector(sector, io_buffer) != 0)
+    if (meta_read(sector, io_buffer) != 0)
         return -1;
     DiskInode d;
     node_to_disk(&nodes[id], &d);
     for (uint64_t i = 0; i < sizeof(d); ++i)
         io_buffer[offset + i] = ((const uint8_t*)&d)[i];
-    if (storage_write_sector(sector, io_buffer) != 0)
+    if (meta_write(sector, io_buffer) != 0)
         return -1;
-    return storage_flush();
+    return meta_flush();
 }
 
 static int save_super()
@@ -250,9 +388,9 @@ static int save_super()
     clear_bytes(io_buffer, FS_SECTOR_SIZE);
     for (uint64_t i = 0; i < sizeof(sb); ++i)
         io_buffer[i] = ((const uint8_t*)&sb)[i];
-    if (storage_write_sector(0, io_buffer) != 0)
+    if (meta_write(0, io_buffer) != 0)
         return -1;
-    return storage_flush();
+    return meta_flush();
 }
 
 static int load_super()
@@ -272,6 +410,7 @@ static int load_super()
     if (sb.total_sectors < FS_DATA_START || sb.total_sectors > FS_MAX_DISK_SECTORS)
         return -3;
     disk_sectors = sb.total_sectors;
+    jnl_enabled = disk_sectors >= FS_DATA_START + 256ULL;
     return 0;
 }
 
@@ -310,7 +449,7 @@ static int rebuild_bitmap_from_inodes()
 
     for (int i = 0; i < FS_MAX_NODES; ++i)
     {
-        if (!nodes[i].used || nodes[i].type != FS_FILE || nodes[i].sector_count == 0)
+        if (!nodes[i].used || (nodes[i].type != FS_FILE && nodes[i].type != FS_SYMLINK) || nodes[i].sector_count == 0)
             continue;
 
         /* Validate the start before subtracting it from disk_sectors. The
@@ -360,8 +499,9 @@ static int validate_mounted_fs()
             nodes[i].gid > 0x7FFFFFFFU)
             return 0;
 
-        if (nodes[i].type == FS_FILE)
+        if (nodes[i].type == FS_FILE || nodes[i].type == FS_SYMLINK)
         {
+            if (nodes[i].type == FS_SYMLINK && (nodes[i].size == 0 || nodes[i].size > 255)) return 0;
             /* Bound size before adding sector_size - 1; otherwise a corrupt
                UINT64_MAX size can wrap and appear to need zero sectors. */
             if (nodes[i].size > FS_MAX_FILE_SIZE)
@@ -411,13 +551,13 @@ static int validate_mounted_fs()
     /* Detect duplicated/overlapping allocated extents between files. */
     for (int a = 0; a < FS_MAX_NODES; ++a)
     {
-        if (!nodes[a].used || nodes[a].type != FS_FILE || nodes[a].sector_count == 0)
+        if (!nodes[a].used || nodes[a].type == FS_DIR || nodes[a].sector_count == 0)
             continue;
         uint64_t a0 = nodes[a].first_sector;
         uint64_t a1 = a0 + nodes[a].sector_count;
         for (int b = a + 1; b < FS_MAX_NODES; ++b)
         {
-            if (!nodes[b].used || nodes[b].type != FS_FILE || nodes[b].sector_count == 0)
+            if (!nodes[b].used || nodes[b].type == FS_DIR || nodes[b].sector_count == 0)
                 continue;
             uint64_t b0 = nodes[b].first_sector;
             uint64_t b1 = b0 + nodes[b].sector_count;
@@ -444,11 +584,15 @@ static void reserve_metadata()
 {
     for (uint64_t s = 0; s < FS_DATA_START && s < FS_MAX_DISK_SECTORS; ++s)
         bitmap_set(s, 1);
+    if (jnl_enabled)
+        for (uint64_t s = disk_sectors - JNL_SECTORS; s < disk_sectors && s < FS_MAX_DISK_SECTORS; ++s)
+            bitmap_set(s, 1);
 }
 
 static int format_fs()
 {
     disk_sectors = FS_DEFAULT_DISK_SECTORS;
+    jnl_enabled = 1;
     uart_puts("FS: formatting persistent filesystem...\r\n");
     clear_bytes(bitmap, sizeof(bitmap));
     for (int i = 0; i < FS_MAX_NODES; ++i)
@@ -712,6 +856,12 @@ void fs_init()
     }
 
     int rc = load_super();
+    if (rc == 0)
+    {
+        if (jnl_recover() != 0) uart_puts("FS: journal recovery I/O error.\r\n");
+        else if (jnl_replayed) { uart_puts("FS: journal replayed, filesystem recovered.\r\n"); }
+        rc = load_super();
+    }
     if (rc == -2)
     {
         int blank = 1;
@@ -753,6 +903,13 @@ void fs_init()
             return;
         }
         root_id = 0;
+
+        /* Old images may keep data where the journal now lives: then run without it. */
+        if (jnl_enabled)
+            for (int i = 0; i < FS_MAX_NODES; ++i)
+                if (nodes[i].used && nodes[i].sector_count &&
+                    nodes[i].first_sector + nodes[i].sector_count > jnl_start())
+                    jnl_enabled = 0;
 
         /* Rebuild the allocation bitmap from authoritative inode extents.
            This also repairs a stale/corrupt on-disk bitmap during mount. */
@@ -816,9 +973,21 @@ void fs_init()
 
 int fs_get_root() { return root_id; }
 
-int fs_resolve(const char* path, int cwd)
+static int read_link_target(int id, char* out, int cap)
+{
+    if (id < 0 || id >= FS_MAX_NODES || !nodes[id].used || nodes[id].type != FS_SYMLINK) return -1;
+    if (storage_ready() == 0 || nodes[id].size == 0 || nodes[id].size >= (uint64_t)cap || nodes[id].size > 255) return -1;
+    static uint8_t lbuf[512] __attribute__((aligned(16)));
+    if (storage_read_sector(nodes[id].first_sector, lbuf) != 0) return -1;
+    for (uint64_t i = 0; i < nodes[id].size; ++i) out[i] = (char)lbuf[i];
+    out[nodes[id].size] = '\0';
+    return (int)nodes[id].size;
+}
+
+static int resolve_ex(const char* path, int cwd, int follow_last, int depth)
 {
     if (path == 0) return -1;
+    if (depth > 8) return -40;                 /* ELOOP */
     if (path[0] == '\0') return cwd;
     int current = path[0] == '/' ? root_id : cwd;
     int i = 0;
@@ -842,16 +1011,94 @@ int fs_resolve(const char* path, int cwd)
                 current = nodes[current].parent;
             continue;
         }
+        int parent_dir = current;
         current = find_child(current, part);
         if (current < 0) return -1;
+        if (nodes[current].type == FS_SYMLINK)
+        {
+            int rest = 0;
+            for (int k = i; path[k]; ++k) if (path[k] != '/') { rest = 1; break; }
+            if (rest || follow_last)
+            {
+                char target[260];
+                if (read_link_target(current, target, sizeof(target)) < 0) return -1;
+                current = resolve_ex(target, parent_dir, 1, depth + 1);
+                if (current < 0) return current;
+            }
+        }
     }
     return current;
 }
 
-int fs_mkdir(const char* path, int cwd) { return create_path(path, cwd, FS_DIR); }
+int fs_resolve(const char* path, int cwd) { return resolve_ex(path, cwd, 1, 0); }
+int fs_resolve_nofollow(const char* path, int cwd) { return resolve_ex(path, cwd, 0, 0); }
+
+int fs_symlink(const char* target, const char* linkpath, int cwd)
+{
+    FS_RW_CHECK();
+    if (!target || !target[0] || str_len(target) > 255 || !linkpath) return -22;
+    FsTx fs_tx_scope;
+    if (fs_resolve_nofollow(linkpath, cwd) >= 0) return -17;
+    int id = create_path(linkpath, cwd, FS_SYMLINK);
+    if (id < 0) return id;
+    uint64_t first = 0;
+    if (alloc_contiguous(1, &first) != 0) { clear_bytes(&nodes[id], sizeof(nodes[id])); (void)save_inode(id); return -3; }
+    clear_bytes(io_buffer, FS_SECTOR_SIZE);
+    int len = str_len(target);
+    for (int i = 0; i < len; ++i) io_buffer[i] = (uint8_t)target[i];
+    if (storage_write_sector(first, io_buffer) != 0)
+    {
+        free_sectors(first, 1);
+        clear_bytes(&nodes[id], sizeof(nodes[id])); (void)save_inode(id); (void)write_bitmap();
+        return -4;
+    }
+    nodes[id].size = (uint64_t)len; nodes[id].first_sector = first; nodes[id].sector_count = 1;
+    nodes[id].mode = 0777U;
+    if (save_inode(id) != 0 || write_bitmap() != 0) return -5;
+    return id;
+}
+
+int fs_readlink(const char* path, int cwd, char* out, int cap)
+{
+    int id = fs_resolve_nofollow(path, cwd);
+    if (id < 0) return id;
+    if (nodes[id].type != FS_SYMLINK) return -22;
+    return read_link_target(id, out, cap);
+}
+
+int fs_link_target_of(int id, char* out, int cap) { return read_link_target(id, out, cap); }
+
+void fs_set_readonly(int ro) { fs_ro = ro ? 1 : 0; }
+int fs_is_readonly() { return fs_ro; }
+int fs_sync() { return storage_ready() ? storage_flush() : 0; }
+
+void fs_journal_status(FsJournalInfo* out)
+{
+    if (!out) return;
+    out->enabled = (uint32_t)jnl_enabled;
+    out->start_sector = jnl_enabled ? jnl_start() : 0;
+    out->sectors = jnl_enabled ? JNL_SECTORS : 0;
+    out->commits = jnl_commits;
+    out->replayed = jnl_replayed;
+}
+
+/* Test hook: the next transaction commits to the journal, then "loses power"
+   before applying in place. The next mount must recover it. */
+int fs_journal_crash_test(const char* path, int cwd)
+{
+    if (!jnl_enabled) return -1;
+    jnl_crash_armed = 1;
+    int rc = fs_write(path, cwd, "journal crash test: recovered after replay\n");
+    jnl_crash_armed = 0;
+    return rc;
+}
+
+int fs_mkdir(const char* path, int cwd) { FS_RW_CHECK(); FsTx fs_tx_scope; return create_path(path, cwd, FS_DIR); }
 
 int fs_touch(const char* path, int cwd)
 {
+    FS_RW_CHECK();
+    FsTx fs_tx_scope;
     int existing = fs_resolve(path, cwd);
     if (existing >= 0)
     {
@@ -865,6 +1112,8 @@ int fs_touch(const char* path, int cwd)
 
 int fs_mkdir_p(const char* path, int cwd)
 {
+    FS_RW_CHECK();
+    FsTx fs_tx_scope;
     if (path == 0 || path[0] == '\0') return -1;
     char temp[192];
     if (str_len(path) >= (int)sizeof(temp)) return -1;
@@ -909,6 +1158,8 @@ int fs_mkdir_p(const char* path, int cwd)
 
 int fs_write_data(const char* path, int cwd, const uint8_t* data, uint64_t size)
 {
+    FS_RW_CHECK();
+    FsTx fs_tx_scope;
     if (path == 0 || (data == 0 && size != 0) || size > FS_MAX_FILE_SIZE)
         return -1;
 
@@ -1093,7 +1344,9 @@ int fs_cat_numbered(const char* path, int cwd)
 
 int fs_rm(const char* path, int cwd)
 {
-    int id = fs_resolve(path, cwd);
+    FS_RW_CHECK();
+    FsTx fs_tx_scope;
+    int id = fs_resolve_nofollow(path, cwd);
     if (id < 0) return -1;
     if (id == root_id) return -3;
     if (fs_parent_writable(id) != 0) return -13;
@@ -1149,7 +1402,9 @@ static int rm_node_recursive(int id)
 
 int fs_rm_recursive(const char* path, int cwd)
 {
-    int id = fs_resolve(path, cwd);
+    FS_RW_CHECK();
+    FsTx fs_tx_scope;
+    int id = fs_resolve_nofollow(path, cwd);
     if (id < 0) return -1;
     if (id == root_id) return -3;
     return rm_node_recursive(id);
@@ -1157,7 +1412,9 @@ int fs_rm_recursive(const char* path, int cwd)
 
 int fs_rename(const char* from, const char* to, int cwd)
 {
-    int id = fs_resolve(from, cwd);
+    FS_RW_CHECK();
+    FsTx fs_tx_scope;
+    int id = fs_resolve_nofollow(from, cwd);
     if (id < 0) return -1;
     if (id == root_id) return -3;
     if (to == 0 || to[0] == '\0') return -5;
@@ -1310,6 +1567,8 @@ uint32_t fs_get_gid(int id)
 
 int fs_set_mode(int id, uint32_t mode)
 {
+    FS_RW_CHECK();
+    FsTx fs_tx_scope;
     if (id < 0 || id >= FS_MAX_NODES || !nodes[id].used) return -1;
     if (current_uid != 0 && current_uid != nodes[id].uid) return -13;
     if (mode & ~0777U) return -22;
@@ -1322,6 +1581,8 @@ int fs_set_mode(int id, uint32_t mode)
 
 int fs_set_owner(int id, uint32_t uid, uint32_t gid)
 {
+    FS_RW_CHECK();
+    FsTx fs_tx_scope;
     if (id < 0 || id >= FS_MAX_NODES || !nodes[id].used) return -1;
     if (current_uid != 0) return -13;
     if (uid > 0x7FFFFFFFU || gid > 0x7FFFFFFFU) return -22;
@@ -1387,7 +1648,7 @@ uint64_t fs_used_sectors()
 {
     uint64_t used = 0;
     for (int i = 0; i < FS_MAX_NODES; ++i)
-        if (nodes[i].used && nodes[i].type == FS_FILE)
+        if (nodes[i].used && nodes[i].type != FS_DIR)
             used += nodes[i].sector_count;
     return used;
 }

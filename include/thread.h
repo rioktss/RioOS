@@ -6,8 +6,8 @@
 /* Kernel threads with context switching (opt-in; boot behaviour unchanged).
    Thread 0 is the boot/shell context. */
 
-#define THREAD_MAX 4
-#define THREAD_STACK_SIZE 16384
+#define THREAD_MAX 40
+#define THREAD_STACK_SIZE 32768
 #define THREAD_SLICE_TICKS 5
 
 typedef void (*ThreadEntry)(void*);
@@ -18,6 +18,17 @@ void thread_init();
    priority is clamped to 0..3. */
 int thread_create(const char* name, ThreadEntry entry, void* arg, uint32_t priority);
 
+/* Like thread_create but binds the thread to a user process: on every switch
+   to it the process address space and descriptor table are activated. */
+int thread_create_for_pid(const char* name, ThreadEntry entry, void* arg, uint32_t priority, int pid);
+int thread_pid(int thread);        /* bound pid or -1 */
+int thread_current_pid();          /* pid bound to the running thread, -1 for the shell/kernel thread */
+int thread_kill(int thread);       /* terminate another thread (never the running one) */
+int thread_state_of(int thread);   /* SchedState value */
+extern "C" void thread_user_preempt();        /* IRQ-from-EL0 hook: switch if the slice expired */
+void thread_set_user_tasks(int count);
+int thread_user_tasks();
+void thread_wait_ms(uint64_t ms);  /* sleep (user threads) or yield-wait (shell) */
 void thread_yield();
 void thread_sleep_ms(uint64_t ms);
 int thread_current();

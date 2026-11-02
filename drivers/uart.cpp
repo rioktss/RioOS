@@ -117,17 +117,43 @@ char uart_getc()
     return (char)(*UART_DR & 0xFF);
 }
 
+/* Bytes pulled off the UART by the job-control poller but not consumed by it. */
+static uint8_t rx_ring[256];
+static unsigned rx_head = 0, rx_tail = 0;
+
 int uart_try_getc()
 {
+    if (rx_head != rx_tail)
+    {
+        int c = rx_ring[rx_tail];
+        rx_tail = (rx_tail + 1U) & 255U;
+        return c;
+    }
     if ((*UART_FR) & (1U << 4))
         return -1;
 
     return (int)(*UART_DR & 0xFFU);
 }
 
+/* Drain the hardware FIFO: bytes for which filter() returns non-zero (Ctrl-C /
+   Ctrl-Z while a foreground job runs) are consumed, everything else is queued
+   in order for the next uart_try_getc(). */
+void uart_poll_job_keys(int (*filter)(int))
+{
+    while (((*UART_FR) & (1U << 4)) == 0)
+    {
+        int c = (int)(*UART_DR & 0xFFU);
+        if (filter && filter(c)) continue;
+        unsigned next = (rx_head + 1U) & 255U;
+        if (next == rx_tail) break;              /* ring full: stop draining */
+        rx_ring[rx_head] = (uint8_t)c;
+        rx_head = next;
+    }
+}
+
 // TAMBAHAN BARU - FIX SHELL HANG
 int uart_has_data()
 {
     // FR bit 4 = RXFE (RX FIFO Empty). Kalau 0 = ada data
-    return ((*UART_FR) & (1U << 4)) == 0;
+    return rx_head != rx_tail || ((*UART_FR) & (1U << 4)) == 0;
 }

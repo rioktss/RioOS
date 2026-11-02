@@ -66,3 +66,39 @@ user_exit_return:
     ldp x27, x28, [sp, #80]
     ldp x29, x30, [sp], #96
     ret
+
+/* user_resume(ctx, kernel_stack_top): load a full ProcessCpuContext
+ * (x0-x30 @0, elr @248, spsr @256, sp_el0 @264) and eret into EL0.
+ * SP_EL1 is reset to the thread's kernel stack top, so every exception taken
+ * from EL0 starts on an empty kernel stack. Never returns. */
+.global user_resume
+user_resume:
+    msr daifset, #0x2
+    ldr x2, [x0, #248]
+    msr elr_el1, x2
+    ldr x2, [x0, #256]
+    msr spsr_el1, x2
+    ldr x2, [x0, #264]
+    msr sp_el0, x2
+    mov x9, x1                     /* new kernel stack top */
+    mov x8, x0
+    ldp x2, x3, [x8, #16]
+    ldp x4, x5, [x8, #32]
+    ldp x6, x7, [x8, #48]
+    ldp x10, x11, [x8, #80]
+    ldp x12, x13, [x8, #96]
+    ldp x14, x15, [x8, #112]
+    ldp x16, x17, [x8, #128]
+    ldp x18, x19, [x8, #144]
+    ldp x20, x21, [x8, #160]
+    ldp x22, x23, [x8, #176]
+    ldp x24, x25, [x8, #192]
+    ldp x26, x27, [x8, #208]
+    ldp x28, x29, [x8, #224]
+    ldr x30, [x8, #240]
+    ldp x0, x1, [x8, #0]
+    mov sp, x9
+    ldr x9, [x8, #72]
+    ldr x8, [x8, #64]
+    isb
+    eret

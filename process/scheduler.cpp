@@ -2,7 +2,7 @@
 #include "uart.h"
 #include "process.h"
 
-#define SCHED_MAX 32
+#define SCHED_MAX 48
 
 static int queue[SCHED_MAX];
 static int count = 0;

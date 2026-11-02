@@ -1,4 +1,5 @@
 #include "timer.h"
+#include "thread.h"
 #include "uart.h"
 #include "scheduler.h"
 
@@ -178,6 +179,8 @@ void timer_interrupt_handler()
 
         if (sched_tick_enabled)
             (void)scheduler_tick();
+
+        thread_timer_tick();
 
         return;
     }

@@ -42,4 +42,15 @@ int mmu_user_space_sync_code(int pid, uint64_t start, uint64_t end);
 int mmu_user_space_exists(int pid);
 int mmu_user_space_active_pid();
 
+
+/* Demand paging / copy-on-write / dynamic memory (per active address space). */
+int mmu_user_fault(uint64_t far, int is_write);
+int mmu_user_space_clone(int src_pid, int dst_pid);
+int mmu_user_space_replace(int pid, int built_pid);
+int mmu_user_brk(int pid, uint64_t new_brk, uint64_t* out);
+int mmu_user_mmap(int pid, uint64_t length, uint32_t prot, uint64_t* out);
+int mmu_user_munmap(int pid, uint64_t addr, uint64_t length);
+int mmu_user_mprotect(int pid, uint64_t addr, uint64_t length, uint32_t prot);
+int mmu_user_space_stats(int pid, uint64_t* resident, uint64_t* shared, uint64_t* cow_faults, uint64_t* demand_faults);
+
 #endif

@@ -83,6 +83,65 @@ boot_hang:
     wfe
     b boot_hang
 
+/* ---- Secondary CPU entry (released through PSCI CPU_ON; x0 = cpu index) ---- */
+.section .text.boot
+.global secondary_start
+.type secondary_start, %function
+.extern smp_boot_ctx
+.extern smp_stack_area
+.extern smp_secondary_main
+secondary_start:
+    mov x19, x0
+    ldr x2, =smp_stack_area
+    add x3, x19, #1
+    lsl x3, x3, #13                 /* 8 KiB per CPU */
+    add x2, x2, x3
+    mrs x0, CurrentEL
+    lsr x0, x0, #2
+    and x0, x0, #3
+    cmp x0, #2
+    b.ne 1f
+    mov x1, #3
+    msr cnthctl_el2, x1
+    mrs x1, hcr_el2
+    mov x4, #0x80000000
+    orr x1, x1, x4
+    msr hcr_el2, x1
+    msr sp_el1, x2
+    ldr x1, =secondary_el1
+    msr elr_el2, x1
+    mov x1, #0x3C5
+    msr spsr_el2, x1
+    isb
+    eret
+1:  mov x1, #1
+    msr spsel, x1
+    mov sp, x2
+secondary_el1:
+    mov x1, #1
+    msr spsel, x1
+    ldr x0, =smp_boot_ctx
+    ldr x1, [x0, #0]
+    msr vbar_el1, x1
+    ldr x1, [x0, #8]
+    msr mair_el1, x1
+    ldr x1, [x0, #16]
+    msr tcr_el1, x1
+    ldr x1, [x0, #24]
+    msr ttbr0_el1, x1
+    isb
+    tlbi vmalle1
+    dsb sy
+    isb
+    ldr x1, [x0, #32]
+    msr sctlr_el1, x1               /* MMU + caches on, same kernel tables as the boot CPU */
+    isb
+    mov x0, x19
+    bl smp_secondary_main
+secondary_hang:
+    wfe
+    b secondary_hang
+
 .section .stack, "aw", %nobits
 .align 12
 stack:

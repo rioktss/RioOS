@@ -4,7 +4,7 @@
 #include "types.h"
 
 #define PAGE_SIZE_BYTES 4096ULL
-#define PAGE_ALLOC_MAX_PAGES 4096U
+#define PAGE_ALLOC_MAX_PAGES 8192U
 
 /* Result codes for page_free(). */
 #define PAGE_FREE_OK           0
@@ -30,6 +30,11 @@ void* allocate_page();
 
 /* Returns a PAGE_FREE_* code. Never corrupts allocator state. */
 int free_page(void* page);
+
+/* Copy-on-write support: take an extra reference / read the count. free_page()
+   drops one reference and only releases the page at zero. */
+int page_ref(void* page);
+int page_refcount(void* page);
 
 void page_alloc_get_stats(PageStats* out);
 int page_alloc_ready();

@@ -7,7 +7,7 @@
 #define L3_ENTRIES 512
 #define RAM_L3_TABLES 64
 #define MAX_USER_PAGES ((MMU_USER_LIMIT - MMU_USER_BASE) / MMU_PAGE_SIZE)
-#define USER_AS_MAX 32
+#define USER_AS_MAX 48
 #define USER_L2_FIRST 56
 #define USER_L2_COUNT 4
 #define STACK_L2_INDEX 63
@@ -43,6 +43,9 @@
 #define USER_R 1U
 #define USER_W 2U
 #define USER_X 4U
+#define USER_COW  8U   /* shared frame: hardware-read-only until first write */
+#define USER_LAZY 16U  /* reserved, backed on first touch (demand paging) */
+#define USER_PERM_MASK 7U
 
 static uint64_t l1_table[512]
     __attribute__((aligned(4096), section(".bss.mmu_tables")));
@@ -68,6 +71,11 @@ struct UserAddressSpace
     int used;
     int pid;
     int ready;
+    uint64_t brk_start;
+    uint64_t brk_cur;
+    uint64_t mmap_cur;
+    uint64_t cow_faults;
+    uint64_t demand_faults;
 };
 static UserAddressSpace user_spaces[USER_AS_MAX];
 static uint64_t user_l1[USER_AS_MAX][512] __attribute__((aligned(4096)));
@@ -213,6 +221,12 @@ static void map_devices()
         if(l2_low[index]==0)
             l2_low[index] = page_descriptor(address, device_rw_nx(), DESC_SH_OUTER);
     }
+
+    /* PCI: BAR window 0x10000000..0x13FFFFFF (assigned by the PCI driver) as 2 MB device blocks,
+       and the PCIe ECAM region (0x4010000000, inside the 1 GB block at L1[256]). */
+    for (uint64_t address = 0x10000000ULL; address < 0x14000000ULL; address += 0x200000ULL)
+        l2_low[(address >> 21) & 0x1FFULL] = page_descriptor(address, device_rw_nx(), DESC_SH_OUTER);
+    l1_table[256] = page_descriptor(0x4000000000ULL, device_rw_nx(), DESC_SH_OUTER);
 }
 
 static void map_ram()
@@ -417,6 +431,310 @@ int mmu_user_finish()
     return 0;
 }
 
+
+/* ---- P5+: demand paging, copy-on-write, brk/mmap, fork support ---------- */
+
+static void clean_entry(uint64_t* entry)
+{
+    asm volatile("dc cvac, %0\n dsb ish" :: "r"(entry) : "memory");
+}
+
+static uint64_t* image_entry(int slot, uint64_t idx)
+{
+    uint64_t va = MMU_USER_BASE + idx * MMU_PAGE_SIZE;
+    uint64_t table_index = (va - RAM_START) / 0x200000ULL;
+    return &user_l3_image[slot][table_index - USER_L2_FIRST][(va >> 12) & 0x1FFULL];
+}
+
+static void image_pte(int slot, uint64_t idx)
+{
+    uint64_t* e = image_entry(slot, idx);
+    uint64_t f = user_frames[slot][idx];
+    uint32_t m = user_space_modes[slot][idx];
+    if (f == 0) { *e = 0; clean_entry(e); return; }
+    uint32_t perm = m & USER_PERM_MASK;
+    if (m & USER_COW) perm &= ~USER_W;
+    if ((perm & (USER_R | USER_X)) == 0) perm |= USER_R;
+    *e = page_descriptor_l3(f, user_flags(perm), DESC_SH_INNER);
+    clean_entry(e);
+}
+
+static void stack_pte(int slot, uint64_t idx)
+{
+    uint64_t* e = &user_l3_stack[slot][USER_STACK_FIRST_L3 + idx];
+    uint64_t f = stack_frames[slot][idx];
+    uint32_t m = user_stack_modes[slot][idx];
+    if (f == 0) { *e = 0; clean_entry(e); return; }
+    uint32_t perm = m & USER_PERM_MASK;
+    if (m & USER_COW) perm &= ~USER_W;
+    *e = page_descriptor_l3(f, user_flags(perm), DESC_SH_INNER);
+    clean_entry(e);
+}
+
+static void copy_frame(uint64_t dst, uint64_t src)
+{
+    volatile uint64_t* d = (volatile uint64_t*)dst;
+    const volatile uint64_t* s2 = (const volatile uint64_t*)src;
+    for (uint64_t i = 0; i < MMU_PAGE_SIZE / 8ULL; ++i) d[i] = s2[i];
+}
+
+/* Resolve a lazy or copy-on-write page so that an access of the requested
+   kind succeeds. Returns 1 when the page is usable afterwards. */
+static int user_page_ensure(int slot, uint64_t va, int write)
+{
+    uint64_t* frame_slot = 0;
+    uint8_t* mode_slot = 0;
+    uint64_t idx = 0;
+    int is_stack = 0;
+    if (va >= MMU_USER_BASE && va < MMU_USER_LIMIT)
+    {
+        idx = (va - MMU_USER_BASE) / MMU_PAGE_SIZE;
+        frame_slot = &user_frames[slot][idx];
+        mode_slot = &user_space_modes[slot][idx];
+    }
+    else if (va >= MMU_USER_STACK_BASE && va < MMU_USER_STACK_TOP)
+    {
+        idx = (va - MMU_USER_STACK_BASE) / MMU_PAGE_SIZE;
+        if (idx >= USER_STACK_PAGES) return 0;
+        frame_slot = &stack_frames[slot][idx];
+        mode_slot = &user_stack_modes[slot][idx];
+        is_stack = 1;
+    }
+    else return 0;
+
+    uint32_t m = *mode_slot;
+    if ((m & USER_PERM_MASK) == 0) return 0;
+    if (write && (m & USER_W) == 0) return 0;
+
+    if (*frame_slot == 0)
+    {
+        if ((m & USER_LAZY) == 0) return 0;
+        void* fresh = allocate_page();
+        if (fresh == 0) return 0;
+        *frame_slot = (uint64_t)fresh;
+        *mode_slot = (uint8_t)(m & ~USER_LAZY);
+        ++user_spaces[slot].demand_faults;
+        if (is_stack) stack_pte(slot, idx); else image_pte(slot, idx);
+        tlb_flush_all();
+        m = *mode_slot;
+    }
+    if (write && (m & USER_COW))
+    {
+        uint64_t old = *frame_slot;
+        if (page_refcount((void*)old) > 1)
+        {
+            void* copy = allocate_page();
+            if (copy == 0) return 0;
+            copy_frame((uint64_t)copy, old);
+            (void)free_page((void*)old); /* drops one reference */
+            *frame_slot = (uint64_t)copy;
+        }
+        *mode_slot = (uint8_t)(m & ~USER_COW);
+        ++user_spaces[slot].cow_faults;
+        if (is_stack) stack_pte(slot, idx); else image_pte(slot, idx);
+        tlb_flush_all();
+    }
+    return 1;
+}
+
+int mmu_user_fault(uint64_t far, int is_write)
+{
+    if (active_user_space < 0) return 0;
+    return user_page_ensure(active_user_space, far & ~(MMU_PAGE_SIZE - 1ULL), is_write);
+}
+
+int mmu_user_space_clone(int src_pid, int dst_pid)
+{
+    int s = user_space_find(src_pid);
+    if (s < 0 || !user_spaces[s].ready) return -1;
+    int rc = mmu_user_space_create(dst_pid);
+    if (rc != 0) return rc;
+    int d = user_space_find(dst_pid);
+    if (d < 0) return -1;
+
+    /* The destination starts with its own top-of-stack frames; replace them
+       with shared copy-on-write references to the parent's pages. */
+    for (uint64_t i = 0; i < USER_STACK_PAGES; ++i)
+    {
+        if (stack_frames[d][i] != 0) { (void)free_page((void*)stack_frames[d][i]); stack_frames[d][i] = 0; }
+        user_stack_modes[d][i] = 0;
+    }
+
+    for (uint64_t i = 0; i < MAX_USER_PAGES; ++i)
+    {
+        uint8_t m = user_space_modes[s][i];
+        if (m == 0 && user_frames[s][i] == 0) continue;
+        if (user_frames[s][i] != 0)
+        {
+            if (page_ref((void*)user_frames[s][i]) != 0) { (void)mmu_user_space_destroy(dst_pid); return -5; }
+            if ((m & USER_W) != 0) { m = (uint8_t)(m | USER_COW); user_space_modes[s][i] = m; image_pte(s, i); }
+        }
+        user_frames[d][i] = user_frames[s][i];
+        user_space_modes[d][i] = m;
+        image_pte(d, i);
+    }
+    for (uint64_t i = 0; i < USER_STACK_PAGES; ++i)
+    {
+        uint8_t m = user_stack_modes[s][i];
+        if (stack_frames[s][i] != 0)
+        {
+            if (page_ref((void*)stack_frames[s][i]) != 0) { (void)mmu_user_space_destroy(dst_pid); return -5; }
+            if ((m & USER_W) != 0) { m = (uint8_t)(m | USER_COW); user_stack_modes[s][i] = m; stack_pte(s, i); }
+        }
+        stack_frames[d][i] = stack_frames[s][i];
+        user_stack_modes[d][i] = m;
+        stack_pte(d, i);
+    }
+    user_spaces[d].brk_start = user_spaces[s].brk_start;
+    user_spaces[d].brk_cur = user_spaces[s].brk_cur;
+    user_spaces[d].mmap_cur = user_spaces[s].mmap_cur;
+    user_spaces[d].ready = 1;
+    user_space_clean_tables(d);
+    user_space_clean_tables(s);
+    tlb_flush_all(); /* parent pages just became read-only */
+    return 0;
+}
+
+/* Swap an exec'd image in: destroy `pid`'s space and give its slot's identity
+   to the already-built replacement. */
+int mmu_user_space_replace(int pid, int built_pid)
+{
+    int old = user_space_find(pid);
+    int fresh = user_space_find(built_pid);
+    if (fresh < 0 || !user_spaces[fresh].ready) return -1;
+    if (old >= 0) (void)mmu_user_space_destroy(pid);
+    user_spaces[fresh].pid = pid;
+    return 0;
+}
+
+int mmu_user_brk(int pid, uint64_t new_brk, uint64_t* out)
+{
+    int slot = user_space_find(pid);
+    if (slot < 0) return -1;
+    UserAddressSpace* sp = &user_spaces[slot];
+    if (sp->brk_start == 0) return -1;
+    if (new_brk == 0 || new_brk == sp->brk_cur) { *out = sp->brk_cur; return 0; }
+    uint64_t want = (new_brk + MMU_PAGE_SIZE - 1ULL) & ~(MMU_PAGE_SIZE - 1ULL);
+    if (new_brk < sp->brk_start || want > sp->mmap_cur - 0x10000ULL) return -2;
+    uint64_t have = (sp->brk_cur + MMU_PAGE_SIZE - 1ULL) & ~(MMU_PAGE_SIZE - 1ULL);
+    if (want > have)
+    {
+        for (uint64_t va = have; va < want; va += MMU_PAGE_SIZE)
+        {
+            uint64_t i = (va - MMU_USER_BASE) / MMU_PAGE_SIZE;
+            if (user_space_modes[slot][i] != 0 || user_frames[slot][i] != 0) return -3;
+        }
+        for (uint64_t va = have; va < want; va += MMU_PAGE_SIZE)
+        {
+            uint64_t i = (va - MMU_USER_BASE) / MMU_PAGE_SIZE;
+            user_space_modes[slot][i] = (uint8_t)(USER_R | USER_W | USER_LAZY);
+            user_frames[slot][i] = 0;
+            image_pte(slot, i);
+        }
+    }
+    else if (want < have)
+    {
+        for (uint64_t va = want; va < have; va += MMU_PAGE_SIZE)
+        {
+            uint64_t i = (va - MMU_USER_BASE) / MMU_PAGE_SIZE;
+            if (user_frames[slot][i]) (void)free_page((void*)user_frames[slot][i]);
+            user_frames[slot][i] = 0;
+            user_space_modes[slot][i] = 0;
+            image_pte(slot, i);
+        }
+        tlb_flush_all();
+    }
+    sp->brk_cur = new_brk;
+    *out = new_brk;
+    return 0;
+}
+
+int mmu_user_mmap(int pid, uint64_t length, uint32_t prot, uint64_t* out)
+{
+    int slot = user_space_find(pid);
+    if (slot < 0 || length == 0 || prot == 0 || (prot & ~7U) != 0 ||
+        ((prot & USER_W) && (prot & USER_X)))
+        return -1;
+    UserAddressSpace* sp = &user_spaces[slot];
+    uint64_t len = (length + MMU_PAGE_SIZE - 1ULL) & ~(MMU_PAGE_SIZE - 1ULL);
+    uint64_t floor = (sp->brk_cur ? ((sp->brk_cur + MMU_PAGE_SIZE - 1ULL) & ~(MMU_PAGE_SIZE - 1ULL)) : sp->brk_start) + 0x10000ULL;
+    if (len > sp->mmap_cur || sp->mmap_cur - len < floor) return -2;
+    uint64_t base = sp->mmap_cur - len;
+    for (uint64_t va = base; va < base + len; va += MMU_PAGE_SIZE)
+    {
+        uint64_t i = (va - MMU_USER_BASE) / MMU_PAGE_SIZE;
+        user_space_modes[slot][i] = (uint8_t)(prot | USER_LAZY);
+        user_frames[slot][i] = 0;
+        image_pte(slot, i);
+    }
+    sp->mmap_cur = base;
+    *out = base;
+    return 0;
+}
+
+int mmu_user_munmap(int pid, uint64_t addr, uint64_t length)
+{
+    int slot = user_space_find(pid);
+    if (slot < 0 || length == 0 || (addr & (MMU_PAGE_SIZE - 1ULL)) != 0) return -1;
+    UserAddressSpace* sp = &user_spaces[slot];
+    uint64_t end = (addr + length + MMU_PAGE_SIZE - 1ULL) & ~(MMU_PAGE_SIZE - 1ULL);
+    /* Only the dynamic (brk/mmap) part of the window may be unmapped. */
+    if (addr < sp->brk_start || end > MMU_USER_LIMIT || end <= addr) return -1;
+    for (uint64_t va = addr; va < end; va += MMU_PAGE_SIZE)
+    {
+        uint64_t i = (va - MMU_USER_BASE) / MMU_PAGE_SIZE;
+        if (user_frames[slot][i]) (void)free_page((void*)user_frames[slot][i]);
+        user_frames[slot][i] = 0;
+        user_space_modes[slot][i] = 0;
+        image_pte(slot, i);
+    }
+    if (addr == sp->mmap_cur) sp->mmap_cur = end;
+    tlb_flush_all();
+    return 0;
+}
+
+int mmu_user_mprotect(int pid, uint64_t addr, uint64_t length, uint32_t prot)
+{
+    int slot = user_space_find(pid);
+    if (slot < 0 || length == 0 || (addr & (MMU_PAGE_SIZE - 1ULL)) != 0 || prot == 0 ||
+        (prot & ~7U) != 0 || ((prot & USER_W) && (prot & USER_X)))
+        return -22;
+    UserAddressSpace* sp = &user_spaces[slot];
+    uint64_t end = (addr + length + MMU_PAGE_SIZE - 1ULL) & ~(MMU_PAGE_SIZE - 1ULL);
+    if (addr < sp->brk_start || end > MMU_USER_LIMIT || end <= addr) return -22;
+    for (uint64_t va = addr; va < end; va += MMU_PAGE_SIZE)
+        if (user_space_modes[slot][(va - MMU_USER_BASE) / MMU_PAGE_SIZE] == 0) return -12;
+    for (uint64_t va = addr; va < end; va += MMU_PAGE_SIZE)
+    {
+        uint64_t i = (va - MMU_USER_BASE) / MMU_PAGE_SIZE;
+        uint8_t m = user_space_modes[slot][i];
+        user_space_modes[slot][i] = (uint8_t)((m & ~USER_PERM_MASK) | prot);
+        uint64_t f = user_frames[slot][i];
+        if (f && (prot & USER_X))
+            for (uint64_t o = 0; o < MMU_PAGE_SIZE; o += 64) asm volatile("dc cvau, %0" :: "r"(f + o) : "memory");
+        image_pte(slot, i);
+    }
+    asm volatile("dsb ish\n ic ialluis\n dsb ish\n isb" ::: "memory");
+    tlb_flush_all();
+    return 0;
+}
+
+int mmu_user_space_stats(int pid, uint64_t* resident, uint64_t* shared, uint64_t* cow_faults, uint64_t* demand_faults)
+{
+    int slot = user_space_find(pid);
+    if (slot < 0) return -1;
+    uint64_t r = 0, sh = 0;
+    for (uint64_t i = 0; i < MAX_USER_PAGES; ++i)
+        if (user_frames[slot][i]) { ++r; if (page_refcount((void*)user_frames[slot][i]) > 1) ++sh; }
+    for (uint64_t i = 0; i < USER_STACK_PAGES; ++i)
+        if (stack_frames[slot][i]) { ++r; if (page_refcount((void*)stack_frames[slot][i]) > 1) ++sh; }
+    if (resident) *resident = r;
+    if (shared) *shared = sh;
+    if (cow_faults) *cow_faults = user_spaces[slot].cow_faults;
+    if (demand_faults) *demand_faults = user_spaces[slot].demand_faults;
+    return 0;
+}
+
 int mmu_user_pointer_ok(uint64_t address, uint64_t length, int write)
 {
     if (address == 0 || length == 0) return 0;
@@ -430,21 +748,7 @@ int mmu_user_pointer_ok(uint64_t address, uint64_t length, int write)
         uint64_t pos = address & ~(MMU_PAGE_SIZE - 1ULL);
         while (pos < end)
         {
-            int okay = 0;
-            if (pos >= MMU_USER_BASE && pos < MMU_USER_LIMIT)
-            {
-                uint64_t idx = (pos - MMU_USER_BASE) / MMU_PAGE_SIZE;
-                uint8_t mode = user_space_modes[slot][idx];
-                okay = user_frames[slot][idx] != 0 && (mode & USER_R) != 0 &&
-                       (!write || (mode & USER_W) != 0);
-            }
-            else if (pos >= MMU_USER_STACK_BASE && pos < MMU_USER_STACK_TOP)
-            {
-                uint64_t idx = (pos - MMU_USER_STACK_BASE) / MMU_PAGE_SIZE;
-                okay = idx < USER_STACK_PAGES && stack_frames[slot][idx] != 0 &&
-                       (!write || (user_stack_modes[slot][idx] & USER_W) != 0);
-            }
-            if (!okay) return 0;
+            if (!user_page_ensure(slot, pos, write)) return 0;
             pos += MMU_PAGE_SIZE;
         }
         return 1;
@@ -528,8 +832,18 @@ int mmu_user_space_create(int pid)
     /* Only the top 64 KiB is mapped as EL0 stack. Each page has an independent
        physical backing page; the lower part of the previous 1 MiB range is a
        guard region, so underflow becomes a permission/translation fault. */
+    /* Only the top pages are backed up front; the rest of the 64 KiB stack is
+       demand-paged on first touch. Pages below USER_STACK_BASE stay a guard. */
     for (uint64_t i = 0; i < USER_STACK_PAGES; ++i)
     {
+        uint64_t l3_index = USER_STACK_FIRST_L3 + i;
+        if (i + 2 < USER_STACK_PAGES)
+        {
+            stack_frames[slot][i] = 0;
+            user_stack_modes[slot][i] = (uint8_t)(USER_R | USER_W | USER_LAZY);
+            user_l3_stack[slot][l3_index] = 0;
+            continue;
+        }
         void* frame = allocate_page();
         if (frame == 0)
         {
@@ -538,10 +852,12 @@ int mmu_user_space_create(int pid)
         }
         stack_frames[slot][i] = (uint64_t)frame;
         user_stack_modes[slot][i] = (uint8_t)(USER_R | USER_W);
-        uint64_t l3_index = USER_STACK_FIRST_L3 + i;
         user_l3_stack[slot][l3_index] =
             page_descriptor_l3((uint64_t)frame, user_flags(USER_R | USER_W), DESC_SH_INNER);
     }
+    user_spaces[slot].brk_start = user_spaces[slot].brk_cur = 0;
+    user_spaces[slot].mmap_cur = MMU_USER_LIMIT;
+    user_spaces[slot].cow_faults = user_spaces[slot].demand_faults = 0;
 
     user_space_clean_tables(slot);
     return 0;
@@ -650,6 +966,13 @@ int mmu_user_space_finish(int pid)
         if (user_frames[slot][i] != 0) mapped = 1;
     if (!mapped) return -2;
     user_spaces[slot].ready = 1;
+    {
+        uint64_t top = 0;
+        for (uint64_t i = 0; i < MAX_USER_PAGES; ++i)
+            if (user_frames[slot][i] != 0) top = i + 1;
+        user_spaces[slot].brk_start = user_spaces[slot].brk_cur =
+            MMU_USER_BASE + (top + 1) * MMU_PAGE_SIZE; /* one guard page above the image */
+    }
     user_space_clean_tables(slot);
     asm volatile("dsb sy" ::: "memory");
     return 0;

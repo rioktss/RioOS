@@ -35,9 +35,10 @@
 #define DESC_NEXT                1U
 #define DESC_WRITE               2U
 #define QUEUE_MAX                8U
-/* We do not negotiate VIRTIO_NET_F_MRG_RXBUF, so v1 uses the base 10-byte
-   virtio_net_hdr (not the 12-byte mergeable-RX header). */
-#define NET_HDR_SIZE             10U
+/* VIRTIO_F_VERSION_1 is negotiated, so the device always uses the 12-byte
+   header (virtio_net_hdr + num_buffers), even without VIRTIO_NET_F_MRG_RXBUF
+   (QEMU: guest_hdr_len = 12 when VERSION_1 is set). A 10-byte header shifts every frame by 2 bytes. */
+#define NET_HDR_SIZE             12U
 #define RX_BUFFER_SIZE           2048U
 #define TX_BUFFER_SIZE           2048U
 #define REQUEST_TIMEOUT_MS       2000ULL

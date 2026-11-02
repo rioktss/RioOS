@@ -65,3 +65,15 @@ the release build container when `qemu-system-aarch64` is unavailable.
 - TCP is a bounded outbound client: no passive listen/accept, congestion control, MSS negotiation, or out-of-order reassembly. HTTPS/TLS is not implemented; `httpget` is plain HTTP on port 80.
 - DHCP, IPv6, fragment reassembly, and ARP cache expiry are not implemented.
 - Actual QEMU networking tests (`ping 10.0.2.2`, `nslookup example.com`, `httpget neverssl.com /`) must be run outside the host-test environment.
+
+
+## Extended release (preemptive EL0, processes, security, FS journal, drivers, network, SMP)
+
+Host tests added to the build: `sha_host_test` (SHA-256, HMAC-SHA256, PBKDF2 vectors).
+
+QEMU regression: `QEMU_BIOS=<pc-bios> python3 tests/qemu_regression.py [qemu-system-aarch64]` (34 checks, throw-away disk copy):
+- session 1: `ktest` (28 checks: fork/COW, exec, wait, pipes, signals, mmap/brk/demand paging, privilege separation), `dltest` (dlopen/dlsym), shell scripting (`if/for/while/let/$?`), symlinks, remount ro/rw, journal, accounts (`su`, `useradd`, `/etc/passwd` PBKDF2 hashes)
+- session 1b: reboot after `jtest` (journal commit without apply) must replay the transaction
+- session 2: `-smp 4` secondary cores and `smp test`
+- session 3: PCIe enumeration, NVMe and AHCI self-tests, root filesystem on NVMe
+- session 4: DHCP, TCP server (`httpd`), IPv6 NDP/ICMPv6, ping against `tests/qemu_fake_peer.py` (needs QEMU `-netdev dgram`)

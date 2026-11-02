@@ -8,6 +8,7 @@
 #include "fs.h"
 #include "security.h"
 #include "history.h"
+#include "jobs.h"
 #include "string.h"
 
 static const char* command_names[] = {
@@ -180,6 +181,7 @@ void shell()
 
     while (1)
     {
+        jobs_poll();
         shell_prompt_text();
         int length = 0;
         int history_cursor = history_count();

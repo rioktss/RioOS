@@ -6,6 +6,8 @@
 #include "fault.h"
 #include "user.h"
 #include "process.h"
+#include "mmu.h"
+#include "task.h"
 
 extern "C" char exception_vectors_el1[];
 extern "C" void user_exit_return();
@@ -78,9 +80,20 @@ extern "C" void exception_sync_el0(void* raw)
     uint64_t ec = (frame->esr >> 26) & 0x3FULL;
     if (ec == 0x15ULL) { syscall_dispatch(frame, 1); return; }
 
+    /* Demand paging / copy-on-write: translation (0b0001xx) and permission
+       (0b0011xx) faults on a user page are resolved and the instruction retried. */
+    if (ec == 0x24ULL || ec == 0x20ULL)
+    {
+        uint64_t fsc = frame->esr & 0x3FULL;
+        int is_write = (ec == 0x24ULL) && ((frame->esr >> 6) & 1ULL);
+        if (((fsc >> 2) == 1ULL || (fsc >> 2) == 3ULL) && mmu_user_fault(frame->far, is_write))
+            return;
+    }
+
     fault_report(frame->esr, frame->elr, frame->far, frame->spsr);
     uart_puts("[EL0] Fatal user exception; terminating process.\r\n");
     user_set_exit_code(-14);
+    task_exit_current(-14, SIG_SEGV);       /* never returns */
     frame->x[0] = (uint64_t)-14;
     frame->spsr = 0x3C5ULL;
     frame->elr = (uint64_t)user_exit_return;

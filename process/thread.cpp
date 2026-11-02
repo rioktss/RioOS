@@ -18,6 +18,11 @@ static int preempt_on = 0;
 static volatile int need_resched = 0;
 static int slice_left = THREAD_SLICE_TICKS;
 static uint64_t switches = 0;
+static int tpid[THREAD_MAX];
+static uint64_t saved_sp0[THREAD_MAX];   /* user stack pointer: SP_EL0 is not part of the kernel context */
+static int user_task_count = 0;
+
+extern "C" void task_context_enter(int pid);
 
 static uint64_t irq_save()
 {
@@ -85,7 +90,9 @@ void thread_init()
         names[i][0] = 0;
         run_ticks[i] = 0;
         run_count[i] = 0;
+        tpid[i] = -1;
     }
+    user_task_count = 0;
 
     /* Adopt the running boot context (the shell) as thread 0. */
     sched[0].state = SCHED_RUNNING;
@@ -127,10 +134,15 @@ static void schedule()
     ++switches;
     ++run_count[next];
 
+    asm volatile("mrs %0, sp_el0" : "=r"(saved_sp0[prev]));
     thread_context_switch(&saved_sp[prev], saved_sp[next]);
+    asm volatile("msr sp_el0, %0" :: "r"(saved_sp0[current]));
+
+    /* We are the resumed thread again: re-establish our address space. */
+    task_context_enter(tpid[current]);
 }
 
-int thread_create(const char* name, ThreadEntry entry, void* arg, uint32_t priority)
+static int thread_create_inner(const char* name, ThreadEntry entry, void* arg, uint32_t priority, int pid)
 {
     if (!initialised || entry == 0)
         return -1;
@@ -175,11 +187,53 @@ int thread_create(const char* name, ThreadEntry entry, void* arg, uint32_t prior
     sched[slot].priority = priority;
     sched[slot].waited = 0;
     sched[slot].wake_ms = 0;
+    tpid[slot] = pid;
     sched[slot].state = SCHED_READY;
 
     irq_restore(flags);
 
     return slot;
+}
+
+int thread_create(const char* name, ThreadEntry entry, void* arg, uint32_t priority)
+{
+    return thread_create_inner(name, entry, arg, priority, -1);
+}
+
+int thread_create_for_pid(const char* name, ThreadEntry entry, void* arg, uint32_t priority, int pid)
+{
+    return thread_create_inner(name, entry, arg, priority, pid);
+}
+
+uint64_t thread_stack_top_current() { return (uint64_t)&stacks[current][THREAD_STACK_SIZE]; }
+
+int thread_pid(int t) { return (t >= 0 && t < THREAD_MAX) ? tpid[t] : -1; }
+int thread_current_pid() { return tpid[current]; }
+int thread_state_of(int t) { return (t >= 0 && t < THREAD_MAX) ? sched[t].state : SCHED_FREE; }
+
+int thread_kill(int t)
+{
+    if (t <= 0 || t >= THREAD_MAX || t == current) return -1;
+    uint64_t flags = irq_save();
+    sched[t].state = SCHED_DEAD;
+    tpid[t] = -1;
+    irq_restore(flags);
+    return 0;
+}
+
+void thread_set_user_tasks(int count) { user_task_count = count < 0 ? 0 : count; }
+int thread_user_tasks() { return user_task_count; }
+
+void thread_wait_ms(uint64_t ms)
+{
+    if (current == 0) { thread_sleep_ms(ms); return; }
+    thread_sleep_ms(ms);
+}
+
+extern "C" void thread_user_preempt()
+{
+    if (!initialised || !need_resched) return;
+    schedule();
 }
 
 void thread_yield()
@@ -255,7 +309,7 @@ void thread_timer_tick()
     if (sched_wake_sleepers(sched, THREAD_MAX, timer_millis()) > 0)
         need_resched = 1;
 
-    if (preempt_on && --slice_left <= 0)
+    if ((preempt_on || user_task_count > 0) && --slice_left <= 0)
         need_resched = 1;
 }
 
@@ -336,6 +390,7 @@ extern "C" void thread_entry_hook()
        inherited from schedule(); in particular, never unmask the CPU IRQ line
        as a side effect of creating/running a demo thread. */
     asm volatile("isb" ::: "memory");
+    task_context_enter(tpid[current]);
 }
 
 extern "C" void thread_exit()
@@ -343,6 +398,7 @@ extern "C" void thread_exit()
     (void)irq_save();
 
     sched[current].state = SCHED_DEAD;
+    tpid[current] = -1;
     schedule();
 
     /* A dead thread is never picked again. */

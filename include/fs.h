@@ -6,7 +6,8 @@
 enum FsNodeType
 {
     FS_FILE = 0,
-    FS_DIR = 1
+    FS_DIR = 1,
+    FS_SYMLINK = 2
 };
 
 enum FsAccessBits
@@ -28,7 +29,17 @@ struct FsStat
     uint64_t mtime;
 };
 
+struct FsJournalInfo { uint32_t enabled; uint64_t start_sector; uint64_t sectors; uint32_t commits; uint32_t replayed; };
 void fs_init();
+int fs_resolve_nofollow(const char* path, int cwd);
+int fs_symlink(const char* target, const char* linkpath, int cwd);   /* returns node id or -errno */
+int fs_link_target_of(int id, char* out, int cap);                     /* target of a symlink node */
+int fs_readlink(const char* path, int cwd, char* out, int cap);       /* length or -errno */
+void fs_set_readonly(int ro);                                         /* remount ro/rw; mutators return -30 when ro */
+int fs_is_readonly();
+int fs_sync();
+void fs_journal_status(FsJournalInfo* out);
+int fs_journal_crash_test(const char* path, int cwd);
 void fs_set_credentials(uint32_t uid, uint32_t gid);
 uint32_t fs_current_uid();
 uint32_t fs_current_gid();

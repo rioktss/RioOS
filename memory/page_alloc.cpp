@@ -5,6 +5,7 @@
    the allocator. */
 
 static uint8_t bitmap[PAGE_ALLOC_MAX_PAGES / 8U];
+static uint8_t refcnt[PAGE_ALLOC_MAX_PAGES];
 static uint64_t pool_base = 0;
 static uint64_t pool_pages = 0;
 static uint64_t hint = 0;
@@ -48,6 +49,8 @@ int page_alloc_init(void* base, uint64_t size_bytes)
 
     for (uint64_t i = 0; i < sizeof(bitmap); ++i)
         bitmap[i] = 0;
+    for (uint64_t i = 0; i < PAGE_ALLOC_MAX_PAGES; ++i)
+        refcnt[i] = 0;
 
     pool_base = start;
     pool_pages = pages;
@@ -80,6 +83,7 @@ void* allocate_page()
             continue;
 
         bit_set(index);
+        refcnt[index] = 1;
         hint = index + 1ULL;
         --stats.free_pages;
         ++stats.allocs;
@@ -116,6 +120,13 @@ int free_page(void* page)
         return PAGE_FREE_DOUBLE;
     }
 
+    /* Shared pages (copy-on-write) stay allocated until the last user drops them. */
+    if (refcnt[index] > 1U)
+    {
+        --refcnt[index];
+        return PAGE_FREE_OK;
+    }
+    refcnt[index] = 0;
     bit_clear(index);
     ++stats.free_pages;
     ++stats.frees;
@@ -143,4 +154,26 @@ void page_alloc_get_stats(PageStats* out)
 int page_alloc_ready()
 {
     return ready;
+}
+
+int page_ref(void* page)
+{
+    uint64_t address = (uint64_t)page;
+    if (!ready || address < pool_base || (address & (PAGE_SIZE_BYTES - 1ULL)) != 0 ||
+        address >= pool_base + pool_pages * PAGE_SIZE_BYTES)
+        return -1;
+    uint64_t index = (address - pool_base) / PAGE_SIZE_BYTES;
+    if (!bit_get(index) || refcnt[index] >= 250U) return -1;
+    ++refcnt[index];
+    return 0;
+}
+
+int page_refcount(void* page)
+{
+    uint64_t address = (uint64_t)page;
+    if (!ready || address < pool_base || (address & (PAGE_SIZE_BYTES - 1ULL)) != 0 ||
+        address >= pool_base + pool_pages * PAGE_SIZE_BYTES)
+        return 0;
+    uint64_t index = (address - pool_base) / PAGE_SIZE_BYTES;
+    return bit_get(index) ? (int)refcnt[index] : 0;
 }

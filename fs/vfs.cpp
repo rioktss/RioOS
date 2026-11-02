@@ -97,7 +97,7 @@ static void put_datetime(uint64_t seconds)
 static void put_permissions(int id)
 {
     uint32_t mode = fs_get_mode(id) & 0777U;
-    uart_putc(fs_get_type(id) == FS_DIR ? 'd' : '-');
+    uart_putc(fs_get_type(id) == FS_DIR ? 'd' : (fs_get_type(id) == FS_SYMLINK ? 'l' : '-'));
     const uint32_t bits[9] = {0400U,0200U,0100U, 0040U,0020U,0010U, 0004U,0002U,0001U};
     const char chars[9] = {'r','w','x','r','w','x','r','w','x'};
     for (int i = 0; i < 9; ++i)
@@ -110,6 +110,14 @@ static void ls_entry_short(int id)
     {
         uart_puts("[DIR]  ");
         uart_puts(fs_get_name(id));
+    }
+    else if (fs_get_type(id) == FS_SYMLINK)
+    {
+        char t[260];
+        uart_puts("[LINK] ");
+        uart_puts(fs_get_name(id));
+        uart_puts(" -> ");
+        uart_puts(fs_link_target_of(id, t, sizeof(t)) > 0 ? t : "?");
     }
     else
     {
@@ -133,6 +141,12 @@ static void ls_entry_long(int id)
     put_datetime(fs_get_mtime(id));
     uart_putc(' ');
     uart_puts(fs_get_name(id));
+    if (fs_get_type(id) == FS_SYMLINK)
+    {
+        char t[260];
+        uart_puts(" -> ");
+        uart_puts(fs_link_target_of(id, t, sizeof(t)) > 0 ? t : "?");
+    }
     uart_puts("\r\n");
 }
 
@@ -375,6 +389,7 @@ static void tree_recursive(int id, int depth)
     }
     for (int i = 0; i < depth; ++i) uart_puts("  ");
     if (fs_get_type(id) == FS_DIR) uart_puts("[DIR]  ");
+    else if (fs_get_type(id) == FS_SYMLINK) uart_puts("[LINK] ");
     else uart_puts("[FILE] ");
     uart_puts(fs_get_name(id));
     if (fs_get_type(id) == FS_FILE)
