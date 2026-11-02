@@ -1710,6 +1710,8 @@ static uint8_t dhcp_buf[MAX_FRAME] __attribute__((aligned(16)));
 static uint32_t dhcp_lease_s = 0;
 static uint32_t dhcp_server_ip = 0;
 static int dhcp_bound = 0;
+static uint64_t dhcp_bound_at = 0;
+static uint64_t dhcp_next_try = 0;
 
 static uint32_t dhcp_build(uint8_t type, uint32_t xid, uint32_t req_ip, uint32_t server_ip)
 {
@@ -1818,9 +1820,52 @@ int net_dhcp(uint32_t timeout_ms)
     cur_mask = mask ? mask : NET_MASK_DEFAULT;
     cur_gw = router ? router : cur_gw;
     if (dns) dns_server_ip = dns;
-    dhcp_lease_s = lease; dhcp_server_ip = server; dhcp_bound = 1;
+    dhcp_lease_s = lease; dhcp_server_ip = server; dhcp_bound = 1; dhcp_bound_at = timer_seconds();
     for (int i = 0; i < ARP_CACHE_SIZE; i++) arp_cache[i].valid = 0;
     return 0;
+}
+
+/* Renew: REQUEST for the current address to the lease server; ACK extends the lease. */
+int net_dhcp_renew(uint32_t timeout_ms)
+{
+    if (!ready_state) return -19;
+    if (!dhcp_bound) return -22;
+    uint32_t xid = (uint32_t)timer_millis() ^ 0x52454E57U;
+    uint32_t yi = 0, srv = 0, mask = 0, router = 0, dns = 0, lease = 0;
+    for (int attempt = 0; attempt < 3; ++attempt)
+    {
+        uint32_t n = dhcp_build(3, xid, cur_ip, dhcp_server_ip);
+        if (virtio_net_send(tx_frame, n) != 0) return -5;
+        int t = dhcp_wait(xid, timeout_ms / 3U, &yi, &srv, &mask, &router, &dns, &lease);
+        if (t == 5 && yi == cur_ip) { if (lease) dhcp_lease_s = lease; dhcp_bound_at = timer_seconds(); return 0; }
+        if (t == 6) { dhcp_bound = 0; return -13; }
+    }
+    return -110;
+}
+
+int net_dhcp_release()
+{
+    if (!dhcp_bound) return -22;
+    dhcp_bound = 0; dhcp_lease_s = 0;
+    return 0;
+}
+
+/* Seconds left on the lease (0 when unbound or expired). */
+uint32_t net_dhcp_remaining()
+{
+    if (!dhcp_bound) return 0;
+    uint64_t age = timer_seconds() - dhcp_bound_at;
+    return age >= dhcp_lease_s ? 0U : (uint32_t)(dhcp_lease_s - age);
+}
+
+/* Called from the shell prompt loop: renew once half of the lease has elapsed (retry every 60 s). */
+void net_dhcp_maintain()
+{
+    if (!ready_state || !dhcp_bound || dhcp_lease_s == 0) return;
+    uint64_t now = timer_seconds();
+    if (now - dhcp_bound_at < dhcp_lease_s / 2U || now < dhcp_next_try) return;
+    dhcp_next_try = now + 60U;
+    if (net_dhcp_renew(2000U) == 0) uart_puts("\r\n[dhcp] lease renewed\r\n");
 }
 
 void net_dhcp_info(uint32_t* server, uint32_t* lease, int* bound)

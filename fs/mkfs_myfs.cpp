@@ -5,18 +5,19 @@
 #include <sys/stat.h>
 
 static constexpr uint32_t MAGIC = 0x4D4B4653U;
-static constexpr uint32_t VERSION = 1U;
+static uint32_t VERSION = 2U;
 static constexpr uint64_t SECTOR = 512ULL;
-static constexpr uint32_t INODES = 64U;
+static uint32_t INODES = 256U;
 static constexpr uint32_t INODE_SIZE = 128U;
-static constexpr uint32_t INODE_SECTORS = 16U;
+static uint32_t INODE_SECTORS = 64U;
 static constexpr uint32_t BITMAP_SECTORS = 8U;
 static constexpr uint32_t INODE_START = 1U;
-static constexpr uint32_t BITMAP_START = 17U;
-static constexpr uint32_t DATA_START = 25U;
+static uint32_t BITMAP_START = 65U;
+static uint32_t DATA_START = 73U;
+static void set_layout(uint32_t v){VERSION=v;INODES=v==1?64U:256U;INODE_SECTORS=INODES/4U;BITMAP_START=1U+INODE_SECTORS;DATA_START=BITMAP_START+8U;}
 static constexpr uint32_t TOTAL_SECTORS = 32768U;
 static constexpr uint32_t NAME_SIZE = 64U;
-static constexpr uint32_t MAX_FILE_SECTORS = 2048U;
+static constexpr uint32_t MAX_FILE_SECTORS = 8192U;
 
 #pragma pack(push,1)
 struct Super {
@@ -53,7 +54,7 @@ static bool save_bitmap(FILE* f,const uint8_t* bm){for(uint32_t s=0;s<BITMAP_SEC
 static bool load_bitmap(FILE* f,uint8_t* bm){for(uint32_t s=0;s<BITMAP_SECTORS;s++)if(!read_sector(f,BITMAP_START+s,bm+s*512))return false;return true;}
 static bool save_super(FILE* f){Super sb{};sb.magic=MAGIC;sb.version=VERSION;sb.sector_size=SECTOR;sb.inode_size=INODE_SIZE;sb.inode_count=INODES;sb.inode_start=INODE_START;sb.inode_sectors=INODE_SECTORS;sb.bitmap_start=BITMAP_START;sb.bitmap_sectors=BITMAP_SECTORS;sb.data_start=DATA_START;sb.total_sectors=TOTAL_SECTORS;return write_sector(f,0,(const uint8_t*)&sb);}
 static bool read_super(FILE* f,Super& sb){return read_sector(f,0,(uint8_t*)&sb);}
-static bool valid_super(const Super& sb){return sb.magic==MAGIC&&sb.version==VERSION&&sb.sector_size==SECTOR&&sb.inode_size==INODE_SIZE&&sb.inode_count==INODES&&sb.data_start==DATA_START&&sb.total_sectors==TOTAL_SECTORS;}
+static bool valid_super(const Super& sb){if(sb.magic==MAGIC&&(sb.version==1||sb.version==2))set_layout(sb.version);return sb.magic==MAGIC&&sb.version==VERSION&&sb.sector_size==SECTOR&&sb.inode_size==INODE_SIZE&&sb.inode_count==INODES&&sb.data_start==DATA_START&&sb.total_sectors==TOTAL_SECTORS;}
 static bool write_host_file(FILE* f, uint64_t first, uint32_t sectors, const std::vector<uint8_t>& data){
     uint8_t sec[512];
     for(uint32_t s=0;s<sectors;s++){
@@ -110,7 +111,8 @@ int main(int argc,char**argv){
         std::fputc(0, f) == EOF) { std::fclose(f); return 1; }
     std::fflush(f);
     Super sb{}; bool valid=read_super(f,sb)&&valid_super(sb);
-    Inode ins[INODES]{}; uint8_t bm[4096]{};
+    Inode ins[256]{}; uint8_t bm[4096]{};
+    if(!valid)set_layout(2);
     if(valid){
         if(!load_inode_table(f,ins)||!load_bitmap(f,bm)){std::fprintf(stderr,"cannot read existing filesystem\n");std::fclose(f);return 1;}
     }else{

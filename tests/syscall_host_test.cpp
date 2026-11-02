@@ -229,7 +229,7 @@ int main()
     fs_set_credentials(0U, 0U);
     CHECK(call(SYS_FS_TRUNCATE, (uint64_t)kpath, 8, 0) == 0 && fake_size == 8);
     CHECK(fake_file[3] == 0 && fake_file[7] == 0);
-    CHECK(call(SYS_FS_TRUNCATE, (uint64_t)kpath, 1048577ULL, 0) == ERR(27));
+    CHECK(call(SYS_FS_TRUNCATE, (uint64_t)kpath, 4194305ULL, 0) == ERR(27));
     CHECK(call(SYS_FS_CHMOD, (uint64_t)kpath, 0600U, 0) == 0 && fake_mode == 0600U);
     CHECK(call(SYS_FS_CHMOD, (uint64_t)kpath, 01000U, 0) == ERR(22));
 

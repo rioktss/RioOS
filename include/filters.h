@@ -7,4 +7,8 @@ int filters_handle_pipeline(const char* line);          /* 1 if the line was a b
 int filters_is_filter(const char* name);
 int filters_run_file_command(const char* name, const char* args);   /* e.g. head -n 3 file; returns 1 if handled */
 
+int filters_capture(const char* cmd, char* out, int cap);           /* run a command, capture its output (NUL-terminated); returns length */
+int filters_handle_redirect(const char* line);                      /* > >> 2> 2>> &> 2>&1 for any built-in (echo keeps its legacy handler) */
+int filters_glob(const char* in, char* out, int cap);               /* expand * and ? in unquoted words after the command */
+
 #endif

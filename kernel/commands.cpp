@@ -2,6 +2,8 @@
 #include "jobs.h"
 #include "filters.h"
 #include "pci.h"
+#include "usb.h"
+#include "tls.h"
 #include "nvme.h"
 #include "ahci.h"
 #include "storage.h"
@@ -428,6 +430,11 @@ static void command_umount(const char* argument)
 }
 
 static void command_lspci() { pci_list(); }
+static void command_usb(const char* argument)
+{
+    if (argument && str_equal(argument, "selftest")) { int rc = usb_selftest(); uart_puts(rc == 0 ? "usb selftest: PASS\r\n" : "usb selftest: FAIL\r\n"); return; }
+    usb_status();
+}
 
 static void command_nvme(const char* argument)
 {
@@ -453,13 +460,31 @@ static void command_sata(const char* argument)
     ahci_status();
 }
 
-static void command_dhcp()
+static void command_dhcp(const char* argument)
 {
     if (!net_ready()) { uart_puts("dhcp: network unavailable\r\n"); return; }
+    char sub[16]; str_copy(sub, argument ? argument : "", sizeof(sub));
+    uint32_t srv, lease; int bound;
+    if (str_equal(sub, "status"))
+    {
+        net_dhcp_info(&srv, &lease, &bound);
+        if (!bound) { uart_puts("dhcp: not bound\r\n"); return; }
+        uart_puts("dhcp: bound, server "); net_print_ipv4(srv); uart_puts(", lease "); print_u64(lease); uart_puts(" s, remaining "); print_u64(net_dhcp_remaining()); uart_puts(" s\r\n");
+        return;
+    }
+    if (str_equal(sub, "renew"))
+    {
+        int rc = net_dhcp_renew(4000U);
+        if (rc == 0) { net_dhcp_info(&srv, &lease, &bound); uart_puts("dhcp: lease renewed, "); print_u64(lease); uart_puts(" s\r\n"); }
+        else if (rc == -22) uart_puts("dhcp: renew: no active lease (run dhcp first)\r\n");
+        else uart_puts("dhcp: renew failed\r\n");
+        return;
+    }
+    if (str_equal(sub, "release")) { uart_puts(net_dhcp_release() == 0 ? "dhcp: lease released (address kept until next dhcp)\r\n" : "dhcp: nothing to release\r\n"); return; }
+    if (sub[0]) { uart_puts("usage: dhcp [status|renew|release]\r\n"); return; }
     uart_puts("dhcp: requesting lease...\r\n");
     int rc = net_dhcp(8000U);
     if (rc != 0) { uart_puts("dhcp: no lease (timeout/NAK)\r\n"); return; }
-    uint32_t srv, lease; int bound;
     net_dhcp_info(&srv, &lease, &bound);
     uart_puts("dhcp: bound, server "); net_print_ipv4(srv); uart_puts(", lease "); print_u64(lease); uart_puts(" s\r\n");
     net_status();
@@ -555,7 +580,9 @@ static void command_free()
 {
     PageStats pg; page_alloc_get_stats(&pg);
     uart_puts("              total        used        free\r\n");
-    uart_puts("Heap   : "); print_u64(heap_used() + heap_free()); uart_puts("  "); print_u64(heap_used()); uart_puts("  "); print_u64(heap_free());
+    uint64_t pool = (uint64_t)pg.total_pages * 4096ULL;
+    uint64_t hu = heap_used(); hu = hu > pool ? hu - pool : 0;
+    uart_puts("Heap   : "); print_u64(hu + heap_free()); uart_puts("  "); print_u64(hu); uart_puts("  "); print_u64(heap_free());
     uart_puts("\r\nPages  : "); print_u64(pg.total_pages); uart_puts("  "); print_u64(pg.total_pages - pg.free_pages); uart_puts("  "); print_u64(pg.free_pages);
     uart_puts("   (4 KiB each)\r\n");
 }
@@ -716,7 +743,7 @@ static const ManualEntry manual_entries[] =
     {"chmod", "change file mode", "chmod <mode> <file>", "numeric 000-777; symbolic +r/+w/+x or -r/-w/-x; owner or root"},
     {"stat", "show file metadata", "stat <path>", "shows inode, type, mode, owner, size, sector count, modification time"},
     {"chown", "change file owner", "chown <uid> <gid> <path>", "root only; UID/GID are decimal numbers"},
-    {"truncate", "resize a file", "truncate <path> <size>", "size 0-1048576 bytes; extended bytes are zero-filled"},
+    {"truncate", "resize a file", "truncate <path> <size>", "size 0-4194304 bytes; extended bytes are zero-filled"},
     {"cp", "copy files or directories", "cp [-r] [-f] <source> <destination>", "-r recursive; -f overwrite destination"},
     {"mv", "move or rename files", "mv [-f] <source> <destination>", "-f overwrite destination"},
     {"rm", "remove files or directories", "rm [-r] [-f] <file|dir>...", "-r recursive; -f force/ignore missing"},
@@ -728,6 +755,10 @@ static const ManualEntry manual_entries[] =
     {"nano", "edit a text file", "nano <file>", "Runs the bundled text editor"},
     {"tree", "show filesystem tree", "tree", "No options"},
     {"mount", "show mounts / remount root", "mount [-o remount,ro|remount,rw]", "root only for remount; shows journal state"},
+    {"redirect", "shell output redirection", "cmd > f | cmd >> f | cmd 2> f | cmd 2>> f | cmd &> f | cmd > f 2>&1 | cmd < f", "works for every built-in; /dev/null discards; echo keeps its legacy handler"},
+    {"glob", "wildcard expansion", "cmd *.txt | cmd ?.c | cmd dir/pre*", "* any chars, ? one char in unquoted words; ls/cat/wc/rm/stat/head/tail run once per match"},
+    {"subst", "command substitution", "echo $(cmd) | echo `cmd`", "captures cmd output (newlines become spaces); nests up to 6 levels"},
+    {"function", "shell functions", "name() { cmd; cmd; } | function name { ...; } ; return [n]", "call as: name args ($1..$9 inside); up to 16 functions of 768 chars"},
     {"seq", "print a sequence of numbers", "seq [first] last", "pipeline source: seq 5 | sort -r"},
     {"basename", "strip directory from a path", "basename <path>", "No options"},
     {"dirname", "strip last path component", "dirname <path>", "No options"},
@@ -744,9 +775,14 @@ static const ManualEntry manual_entries[] =
     {"rmdir", "remove an empty directory", "rmdir <dir>", "No options"},
     {"free", "show heap and page usage", "free", "No options"},
     {"which", "locate a command", "which <name>", "built-in or /bin program"},
-    {"dhcp", "obtain an IPv4 lease via DHCP", "dhcp", "applies address, mask, gateway and DNS"},
+    {"dhcp", "obtain/renew an IPv4 lease via DHCP", "dhcp [status|renew|release]", "applies address, mask, gateway and DNS; boot tries DHCP automatically; lease is renewed at 50% of its time at the prompt"},
+    {"nc", "TCP connect/listen tool", "nc [-z] <host> <port> [text] | nc -l <port>", "send text and print the reply; -z only tests the port; -l accepts one connection and prints data"},
+    {"telnet", "interactive TCP terminal", "telnet <host> [port]", "default port 23; Ctrl-] quits; answers telnet option negotiation with WONT/DONT"},
+    {"wget", "download over HTTP or HTTPS", "wget <http[s]://host[:port]/path | host[:port] [path]> [outfile]", "GET up to 1 MiB saved to a file (default: last path part or index.html); https uses TLS 1.3 (AES-128-GCM, X25519) WITHOUT certificate verification"},
+    {"httpsget", "fetch an HTTPS page (TLS 1.3)", "httpsget <host[:port]> [path] | httpsget https://host/path", "prints the first 4096 bytes of the body; server certificate is NOT validated (encrypted but unauthenticated)"},
     {"ping6", "ICMPv6 echo to a link-local address", "ping6 <ipv6>", "uses NDP neighbor discovery"},
     {"httpd", "tiny HTTP server (TCP listen/accept)", "httpd <port> [requests]", "serves files from the filesystem; / is a greeting"},
+    {"usb", "xHCI USB controller / HID devices", "usb [selftest]", "lists devices on the xHCI root hub; keyboards type into the shell, mice are tracked (start QEMU with -device qemu-xhci -device usb-kbd)"},
     {"lspci", "list PCIe devices", "lspci", "bus 0 via ECAM; shows class and assigned BARs"},
     {"nvme", "NVMe disk status", "nvme [selftest]", "selftest is read-only on the root disk, read/write on others"},
     {"sata", "AHCI/SATA disk status", "sata [selftest]", "selftest is read-only on the root disk, read/write on others"},
@@ -1363,7 +1399,7 @@ static void command_truncate(char* argument)
     int rc = fs_truncate(words[0], vfs_cwd(), size);
     if (rc == 0) return;
     if (rc == -13) uart_puts("truncate: permission denied\r\n");
-    else if (rc == -27) uart_puts("truncate: file too large (max 1048576 bytes)\r\n");
+    else if (rc == -27) uart_puts("truncate: file too large (max 4194304 bytes)\r\n");
     else uart_puts("truncate: failed (path missing, not a file, or storage error)\r\n");
 }
 
@@ -1704,11 +1740,13 @@ static void command_help()
         "  chmod <mode> <file>  Change file mode (owner or root)\r\n"
         "  stat <path>          Show inode/permission/owner metadata\r\n"
         "  chown <uid> <gid> <path>  Change owner (root only)\r\n"
-        "  truncate <path> <size>  Resize file (max 1048576 bytes)\r\n"
+        "  truncate <path> <size>  Resize file (max 4194304 bytes)\r\n"
         "  env                  Show environment variables\r\n"
         "  export VAR=val       Set environment variable\r\n"
         "  unset VAR           Remove environment variable\r\n"
-        "  shell: > >> < |      Redirection; in-memory cat/echo -> grep/wc pipe\r\n"
+        "  shell: > >> 2> &> 2>&1 <  Redirection for all built-ins (man redirect)\r\n"
+        "  shell: *.txt ?.c     Wildcards (man glob);  $(cmd) `cmd`  substitution (man subst)\r\n"
+        "  name() { cmd; }      Shell functions, 'return n' (man function)\r\n"
         "  tree                 Show filesystem tree\r\n"
         "  ps                   Show processes\r\n"
         "  uptime               Show uptime\r\n"
@@ -1736,7 +1774,13 @@ static void command_help()
         "  ifconfig             Show IPv4/MAC/gateway/DNS settings\r\n"
         "  ping <ip>            Send ICMP echo request\r\n"
         "  nslookup <hostname>  Resolve a DNS A record over UDP\r\n"
+        "  usb [selftest]       xHCI USB status (HID keyboard/mouse)\r\n"
         "  httpget <host> [path] Fetch a plain HTTP page over TCP\r\n"
+        "  wget <url|host[:port] [path]> [file]  Download over HTTP/HTTPS to a file\r\n"
+        "  httpsget <host[:port]> [path]    HTTPS page (TLS 1.3, no cert check)\r\n"
+        "  nc [-z] <host> <port> [text]      TCP client; nc -l <port> listens once\r\n"
+        "  telnet <host> [port]  Interactive TCP session (Ctrl-] quits)\r\n"
+        "  dhcp [status|renew|release]  DHCP lease control (auto at boot)\r\n"
         "  dnsserver <ipv4>     Set DNS server (root only)\r\n"
         "  selftest             Run kernel integration checks\r\n"
         "  pages                Show physical page allocator\r\n"
@@ -2058,7 +2102,7 @@ static void command_write(
     }
 }
 
-#define CP_MAX_SIZE 1048576ULL
+#define CP_MAX_SIZE 4194304ULL
 static uint8_t cp_buffer[CP_MAX_SIZE];
 
 static int path_parent(const char* path, char* out, int cap)
@@ -2788,6 +2832,245 @@ static void command_httpget(const char* argument)
     (void)net_tcp_close(0, socket);
 }
 
+
+/* ---- nc / telnet / wget ------------------------------------------------------------- */
+static int net_resolve_host(const char* name, uint32_t* ip, const char* who)
+{
+    if (net_parse_ipv4(name, ip)) return 0;
+    if (net_dns_resolve(name, ip, 3000U) != 0) { uart_puts(who); uart_puts(": cannot resolve "); uart_puts(name); uart_puts("\r\n"); return -1; }
+    return 0;
+}
+
+static int ctrl_break_seen = 0;
+static int ctrl_break_filter(int c) { if (c == 3 || c == 0x1D) { ctrl_break_seen = 1; return 1; } return 0; }
+
+static void command_nc(const char* argument)
+{
+    char buf[200]; str_copy(buf, argument ? argument : "", sizeof(buf));
+    char* w[16]; int n = split_words(buf, w, 16);
+    int listen_mode = 0, zero = 0, a = 0;
+    while (a < n && w[a][0] == '-' && w[a][1]) { if (w[a][1] == 'l') listen_mode = 1; else if (w[a][1] == 'z') zero = 1; else { uart_puts("nc: unknown option\r\n"); return; } ++a; }
+    if (!net_ready()) { uart_puts("nc: network not ready\r\n"); return; }
+    if (listen_mode)
+    {
+        int port = a < n ? parse_uint(w[a], -1) : -1;
+        if (port <= 0 || port > 65535) { uart_puts("usage: nc -l <port>\r\n"); return; }
+        int ls = net_tcp_socket(0);
+        if (ls < 0 || net_tcp_listen(0, ls, (uint16_t)port) != 0) { uart_puts("nc: cannot listen\r\n"); if (ls >= 0) net_tcp_close(0, ls); return; }
+        uart_puts("nc: listening on port "); print_u64((uint64_t)port); uart_puts(" (Ctrl-C aborts)\r\n");
+        uint32_t pip = 0; uint16_t pp = 0; int cs = -1;
+        ctrl_break_seen = 0;
+        for (int t = 0; t < 60 && cs < 0 && !ctrl_break_seen; ++t)
+        {
+            uart_poll_job_keys(ctrl_break_filter);
+            cs = net_tcp_accept(0, ls, &pip, &pp, 500U);
+        }
+        net_tcp_close(0, ls);
+        if (cs < 0) { uart_puts("nc: no connection\r\n"); return; }
+        uart_puts("nc: connection from "); net_print_ipv4(pip); uart_puts("\r\n");
+        char rb[256];
+        for (int idle = 0; idle < 10 && !ctrl_break_seen; )
+        {
+            uart_poll_job_keys(ctrl_break_filter);
+            int g = net_tcp_recv(0, cs, rb, sizeof(rb), 500U);
+            if (g == 0) break;
+            if (g < 0) { ++idle; continue; }
+            idle = 0;
+            for (int i = 0; i < g; ++i) if (rb[i] != '\r') uart_putc(rb[i]);
+        }
+        net_tcp_close(0, cs);
+        uart_puts("\r\nnc: closed\r\n");
+        return;
+    }
+    if (n - a < 2) { uart_puts("usage: nc [-z] <host> <port> [text...]  |  nc -l <port>\r\n"); return; }
+    uint32_t ip; int port = parse_uint(w[a + 1], -1);
+    if (port <= 0 || port > 65535) { uart_puts("nc: bad port\r\n"); return; }
+    if (net_resolve_host(w[a], &ip, "nc") != 0) return;
+    int sk = net_tcp_socket(0);
+    if (sk < 0) { uart_puts("nc: no socket\r\n"); return; }
+    if (net_tcp_connect(0, sk, ip, (uint16_t)port, 4000U) != 0)
+    {
+        uart_puts(zero ? "nc: " : "nc: connect failed: "); uart_puts(w[a]); uart_puts(" "); uart_puts(w[a + 1]); uart_puts(zero ? " closed\r\n" : "\r\n");
+        net_tcp_close(0, sk); return;
+    }
+    if (zero) { uart_puts("nc: "); uart_puts(w[a]); uart_puts(" "); uart_puts(w[a + 1]); uart_puts(" open\r\n"); net_tcp_close(0, sk); return; }
+    if (a + 2 < n)
+    {
+        char msg[160]; int mp = 0;
+        for (int i = a + 2; i < n; ++i) { if (mp) msg[mp++] = ' '; for (const char* q = w[i]; *q && mp < 156; ++q) msg[mp++] = *q; }
+        msg[mp++] = '\n';
+        net_tcp_send(0, sk, msg, (uint32_t)mp, 3000U);
+    }
+    char rb[256]; int got_any = 0;
+    for (int idle = 0; idle < 4; )
+    {
+        int g = net_tcp_recv(0, sk, rb, sizeof(rb), 800U);
+        if (g == 0) break;
+        if (g < 0) { ++idle; continue; }
+        got_any = 1;
+        for (int i = 0; i < g; ++i) if (rb[i] != '\r') uart_putc(rb[i]);
+    }
+    if (got_any) uart_puts("\r\n");
+    net_tcp_close(0, sk);
+}
+
+static void command_telnet(const char* argument)
+{
+    char buf[120]; str_copy(buf, argument ? argument : "", sizeof(buf));
+    char* w[4]; int n = split_words(buf, w, 4);
+    if (n < 1) { uart_puts("usage: telnet <host> [port]   (Ctrl-] quits)\r\n"); return; }
+    if (!net_ready()) { uart_puts("telnet: network not ready\r\n"); return; }
+    int port = n > 1 ? parse_uint(w[1], -1) : 23;
+    uint32_t ip;
+    if (port <= 0 || port > 65535) { uart_puts("telnet: bad port\r\n"); return; }
+    if (net_resolve_host(w[0], &ip, "telnet") != 0) return;
+    int sk = net_tcp_socket(0);
+    if (sk < 0) { uart_puts("telnet: no socket\r\n"); return; }
+    uart_puts("Trying "); net_print_ipv4(ip); uart_puts("...\r\n");
+    if (net_tcp_connect(0, sk, ip, (uint16_t)port, 5000U) != 0) { uart_puts("telnet: connection failed\r\n"); net_tcp_close(0, sk); return; }
+    uart_puts("Connected. Escape character is '^]'.\r\n");
+    ctrl_break_seen = 0;
+    uint8_t rb[256];
+    int closed = 0;
+    while (!ctrl_break_seen && !closed)
+    {
+        uart_poll_job_keys(ctrl_break_filter);
+        int c;
+        while ((c = uart_try_getc()) >= 0)
+        {
+            char out[2]; int ol = 0;
+            if (c == '\r') { out[0] = '\r'; out[1] = '\n'; ol = 2; } else { out[0] = (char)c; ol = 1; }
+            net_tcp_send(0, sk, out, (uint32_t)ol, 1000U);
+        }
+        int g = net_tcp_recv(0, sk, rb, sizeof(rb), 30U);
+        if (g == 0) { closed = 1; break; }
+        if (g < 0) continue;
+        for (int i = 0; i < g; ++i)
+        {
+            if (rb[i] == 0xFF && i + 2 < g + 0 && i + 2 <= g - 1 + 0)
+            {
+                uint8_t cmd = rb[i + 1], opt = rb[i + 2];
+                if (cmd == 253 || cmd == 251) { uint8_t rep[3] = {0xFF, (uint8_t)(cmd == 253 ? 252 : 254), opt}; net_tcp_send(0, sk, rep, 3, 500U); }
+                i += 2; continue;
+            }
+            if (rb[i] == '\r') continue;
+            if (rb[i] == '\n') uart_putc('\r');
+            uart_putc((char)rb[i]);
+        }
+    }
+    net_tcp_close(0, sk);
+    uart_puts(closed ? "\r\nConnection closed by foreign host.\r\n" : "\r\ntelnet: connection closed.\r\n");
+}
+
+/* HTTP(S) GET into a freshly allocated buffer (caller kfree()s). Returns body length or <0. */
+static int http_fetch(const char* host, int port, const char* path, int use_tls, uint8_t** out_body, int* out_status, const char* who)
+{
+    uint32_t ip;
+    if (net_resolve_host(host, &ip, who) != 0) return -1;
+    int sk = net_tcp_socket(0);
+    if (sk < 0) { uart_puts(who); uart_puts(": no socket\r\n"); return -1; }
+    if (net_tcp_connect(0, sk, ip, (uint16_t)port, 5000U) != 0) { uart_puts(who); uart_puts(": connection failed\r\n"); net_tcp_close(0, sk); return -1; }
+    if (use_tls)
+    {
+        int rc = tls_connect(sk, host);
+        if (rc != 0) { uart_puts(who); uart_puts(": TLS handshake failed ("); print_u64((uint64_t)(-rc)); uart_puts(")\r\n"); net_tcp_close(0, sk); return -1; }
+    }
+    char req[512]; uint32_t rl = 0; req[0] = 0;
+    http_append(req, sizeof(req), &rl, "GET "); http_append(req, sizeof(req), &rl, path);
+    http_append(req, sizeof(req), &rl, " HTTP/1.0\r\nHost: "); http_append(req, sizeof(req), &rl, host);
+    http_append(req, sizeof(req), &rl, "\r\nUser-Agent: RioOS/1.0\r\nConnection: close\r\n\r\n");
+    int sent = use_tls ? tls_send(req, rl) : net_tcp_send(0, sk, req, rl, 4000U);
+    if (sent < 0) { uart_puts(who); uart_puts(": send failed\r\n"); if (use_tls) tls_close(); net_tcp_close(0, sk); return -1; }
+    const uint32_t CAP = 1048576U;
+    uint8_t* body = (uint8_t*)kmalloc(CAP);
+    if (!body) { uart_puts(who); uart_puts(": out of memory\r\n"); if (use_tls) tls_close(); net_tcp_close(0, sk); return -1; }
+    uint32_t total = 0; int idle = 0;
+    ctrl_break_seen = 0;
+    while (total < CAP && idle < 6 && !ctrl_break_seen)
+    {
+        uart_poll_job_keys(ctrl_break_filter);
+        uint32_t want = CAP - total > 1024U ? 1024U : CAP - total;
+        int g = use_tls ? tls_recv(body + total, want, 1000U) : net_tcp_recv(0, sk, body + total, want, 1000U);
+        if (g == 0) break;
+        if (g < 0) { if (use_tls && g != -110) break; ++idle; continue; }
+        idle = 0; total += (uint32_t)g;
+    }
+    if (use_tls) tls_close();
+    net_tcp_close(0, sk);
+    uint32_t hdr = 0; int found = 0;
+    for (uint32_t i = 0; i + 3 < total; ++i) if (body[i] == '\r' && body[i+1] == '\n' && body[i+2] == '\r' && body[i+3] == '\n') { hdr = i + 4; found = 1; break; }
+    if (!found || total < 12) { uart_puts(who); uart_puts(": no valid HTTP response\r\n"); kfree(body); return -1; }
+    char status[48]; uint32_t sl = 0;
+    while (sl < 47 && sl < total && body[sl] != '\r' && body[sl] != '\n') { status[sl] = (char)body[sl]; ++sl; }
+    status[sl] = 0;
+    uart_puts(status); uart_puts("\r\n");
+    *out_status = (sl > 9 && status[9] >= '0' && status[9] <= '9') ? (status[9] - '0') : 0;
+    uint32_t blen = total - hdr;
+    for (uint32_t i = 0; i < blen; ++i) body[i] = body[hdr + i];
+    *out_body = body;
+    return (int)blen;
+}
+
+/* Parse "[http[s]://]host[:port][/path]" or "host[:port] [path]". */
+static int parse_url_args(char** w, int n, char* host, int host_cap, int* port, char* path, int path_cap, int* use_tls, int* next)
+{
+    const char* u = w[0]; *use_tls = 0; *port = 80; *next = 1;
+    int has_scheme = 0;
+    if (u[0]=='h'&&u[1]=='t'&&u[2]=='t'&&u[3]=='p'&&u[4]==':'&&u[5]=='/'&&u[6]=='/') { u += 7; has_scheme = 1; }
+    else if (u[0]=='h'&&u[1]=='t'&&u[2]=='t'&&u[3]=='p'&&u[4]=='s'&&u[5]==':'&&u[6]=='/'&&u[7]=='/') { u += 8; *use_tls = 1; *port = 443; has_scheme = 1; }
+    int i = 0;
+    while (u[i] && u[i] != ':' && u[i] != '/' && i < host_cap - 1) { host[i] = u[i]; ++i; }
+    host[i] = 0;
+    if (!host[0]) return -1;
+    if (u[i] == ':') { *port = parse_uint(u + i + 1, -1); while (u[i] && u[i] != '/') ++i; }
+    if (*port <= 0 || *port > 65535) return -1;
+    const char* pa = "/";
+    if (u[i] == '/') pa = u + i;
+    else if (!has_scheme && n > 1 && w[1][0] != 0) { pa = w[1]; *next = 2; }
+    if (pa[0] != '/') { path[0] = '/'; str_copy(path + 1, pa, path_cap - 1); } else str_copy(path, pa, path_cap);
+    return 0;
+}
+
+/* wget <url | host[:port] [path]> [outfile] : HTTP/1.0 or HTTPS (TLS 1.3, certificate NOT verified) download. */
+static void command_wget(const char* argument)
+{
+    char buf[400]; str_copy(buf, argument ? argument : "", sizeof(buf));
+    char* w[8]; int n = split_words(buf, w, 8);
+    if (n < 1) { uart_puts("usage: wget <http[s]://host[:port]/path | host[:port] [path]> [outfile]\r\n"); return; }
+    if (!net_ready()) { uart_puts("wget: network not ready\r\n"); return; }
+    char host[128], path[200]; int port, tls, next;
+    if (parse_url_args(w, n, host, sizeof(host), &port, path, sizeof(path), &tls, &next) != 0) { uart_puts("wget: bad URL\r\n"); return; }
+    char outname[64];
+    if (next < n) str_copy(outname, w[next], sizeof(outname));
+    else { const char* b = path; for (const char* q = path; *q; ++q) if (*q == '/') b = q + 1; str_copy(outname, *b ? b : "index.html", sizeof(outname)); }
+    uint8_t* body = 0; int status = 0;
+    int blen = http_fetch(host, port, path, tls, &body, &status, "wget");
+    if (blen < 0) return;
+    if (status != 2) { uart_puts("wget: server returned an error, nothing saved\r\n"); kfree(body); return; }
+    if (fs_write_data(outname, vfs_cwd(), body, (uint64_t)blen) < 0) { uart_puts("wget: cannot write "); uart_puts(outname); uart_puts("\r\n"); kfree(body); return; }
+    uart_puts("saved "); uart_puts(outname); uart_puts(" ("); print_u64((uint64_t)blen); uart_puts(" bytes)\r\n");
+    kfree(body);
+}
+
+/* httpsget <host[:port]> [path] | httpsget https://host/path : print an HTTPS response body (TLS 1.3). */
+static void command_httpsget(const char* argument)
+{
+    char buf[400]; str_copy(buf, argument ? argument : "", sizeof(buf));
+    char* w[8]; int n = split_words(buf, w, 8);
+    if (n < 1) { uart_puts("usage: httpsget <host[:port]> [path]   (certificate is NOT verified)\r\n"); return; }
+    if (!net_ready()) { uart_puts("httpsget: network not ready\r\n"); return; }
+    char host[128], path[200]; int port, tls, next;
+    if (parse_url_args(w, n, host, sizeof(host), &port, path, sizeof(path), &tls, &next) != 0) { uart_puts("httpsget: bad URL\r\n"); return; }
+    if (!tls) { tls = 1; if (port == 80) port = 443; }
+    uint8_t* body = 0; int status = 0;
+    int blen = http_fetch(host, port, path, 1, &body, &status, "httpsget");
+    if (blen < 0) return;
+    uart_puts("--- body ("); print_u64((uint64_t)blen); uart_puts(" bytes, first 4096 shown) ---\r\n");
+    for (int i = 0; i < blen && i < 4096; ++i) { if (body[i] == '\n') uart_putc('\r'); uart_putc((char)body[i]); }
+    uart_puts("\r\n--- end ---\r\n");
+    kfree(body);
+}
+
 static void command_dnsserver(const char* argument)
 {
     if (!security_is_root())
@@ -2939,6 +3222,43 @@ static void execute_command_inner(
 
     if (filters_handle_pipeline(line))
         return;
+
+    if (filters_handle_redirect(line))
+        return;
+
+    {
+        static char globbed[1024];
+        filters_glob(line, globbed, sizeof(globbed));
+        if (!str_equal(globbed, line))
+        {
+            /* single-operand built-ins run once per expanded name */
+            char tmp[1024]; str_copy(tmp, globbed, sizeof(tmp));
+            char* w[40]; int n = 0; char* p = tmp;
+            while (*p && n < 40) { while (*p == ' ') ++p; if (!*p) break; w[n++] = p; while (*p && *p != ' ') ++p; if (*p) *p++ = 0; }
+            const char* c = n ? w[0] : "";
+            if (n > 2 && (str_equal(c, "ls") || str_equal(c, "cat") || str_equal(c, "wc") || str_equal(c, "rm") || str_equal(c, "stat") || str_equal(c, "head") || str_equal(c, "tail")))
+            {
+                int fl = 1; while (fl < n && w[fl][0] == '-') ++fl;
+                if (n - fl > 1)
+                {
+                    for (int k = fl; k < n; ++k)
+                    {
+                        char one[300]; int op = 0;
+                        for (const char* q = c; *q && op < 250; ++q) one[op++] = *q;
+                        for (int f = 1; f < fl; ++f) { one[op++] = ' '; for (const char* q = w[f]; *q && op < 270; ++q) one[op++] = *q; }
+                        one[op++] = ' ';
+                        for (const char* q = w[k]; *q && op < 298; ++q) one[op++] = *q;
+                        one[op] = 0;
+                        if (!str_equal(c, "rm") && !str_equal(c, "ls")) { uart_puts("==> "); uart_puts(w[k]); uart_puts(" <==\r\n"); }
+                        execute_command(one);
+                    }
+                    return;
+                }
+            }
+        }
+        str_copy(expanded, globbed, sizeof(expanded));
+        line = expanded;
+    }
 
     if (handle_shell_operators(line))
         return;
@@ -3166,10 +3486,15 @@ static void execute_command_inner(
     if (str_equal(command, "rmdir")) { command_rmdir(argument); return; }
     if (str_equal(command, "free")) { command_free(); return; }
     if (str_equal(command, "which")) { command_which(argument); return; }
-    if (str_equal(command, "dhcp")) { command_dhcp(); return; }
+    if (str_equal(command, "dhcp")) { command_dhcp(argument); return; }
+    if (str_equal(command, "nc")) { command_nc(argument); return; }
+    if (str_equal(command, "telnet")) { command_telnet(argument); return; }
+    if (str_equal(command, "wget")) { command_wget(argument); return; }
+    if (str_equal(command, "httpsget")) { command_httpsget(argument); return; }
     if (str_equal(command, "ping6")) { command_ping6(argument); return; }
     if (str_equal(command, "httpd")) { command_httpd(argument); return; }
     if (str_equal(command, "lspci")) { command_lspci(); return; }
+    if (str_equal(command, "usb")) { command_usb(argument); return; }
     if (str_equal(command, "nvme")) { command_nvme(argument); return; }
     if (str_equal(command, "sata")) { command_sata(argument); return; }
     if (str_equal(command, "umount")) { command_umount(argument); return; }

@@ -1,3 +1,4 @@
+#include "filters.h"
 #include "script.h"
 #include "commands.h"
 #include "env.h"
@@ -53,6 +54,33 @@ int script_expand(const char* line, char* out, int cap)
             {
                 /* single quotes: literal text, no expansion; quotes removed */
                 for (int k = i + 1; k < j && ep < cap - 1; ++k) out[ep++] = line[k];
+                i = j + 1;
+                continue;
+            }
+        }
+        if (line[i] == '`' || (line[i] == '$' && line[i + 1] == '('))
+        {
+            int bt = line[i] == '`';
+            int st = i + (bt ? 1 : 2), j = st, depth = 1;
+            while (line[j])
+            {
+                if (bt) { if (line[j] == '`') break; }
+                else { if (line[j] == '(') ++depth; else if (line[j] == ')' && --depth == 0) break; }
+                ++j;
+            }
+            if (line[j])
+            {
+                char cmd[256]; int cl = 0;
+                for (int k = st; k < j && cl < 255; ++k) cmd[cl++] = line[k];
+                cmd[cl] = 0;
+                char* buf = (char*)kmalloc(4096);
+                if (buf)
+                {
+                    int n = filters_capture(cmd, buf, 4096);
+                    while (n > 0 && buf[n - 1] == '\n') buf[--n] = 0;
+                    for (int k = 0; k < n && ep < cap - 1; ++k) out[ep++] = (buf[k] == '\n') ? ' ' : buf[k];
+                    kfree(buf);
+                }
                 i = j + 1;
                 continue;
             }
@@ -375,6 +403,80 @@ static int exec_stmt(char* stmt)
     return 0;
 }
 
+static int run_text(char* text, const char* name, const char* args);
+
+/* ---- shell functions: name() { ...; }   function name { ...; }   return [n] -------------- */
+#define FN_MAX 16
+#define FN_BODY 768
+struct ShFunc { char name[32]; char body[FN_BODY]; int used; };
+static ShFunc g_funcs[FN_MAX];
+
+static ShFunc* fn_find(const char* name)
+{
+    for (int i = 0; i < FN_MAX; ++i) if (g_funcs[i].used && str_equal(g_funcs[i].name, name)) return &g_funcs[i];
+    return 0;
+}
+
+/* Is stmt a function header? On success fills name and points *rest after '{'. */
+static int fn_header(char* t, char* name, char** rest)
+{
+    char* p = skip_ws(t); int n = 0;
+    if (first_word_is(p, "function")) { p = skip_ws(p + 8); }
+    while (is_name_char(*p, n == 0) && n < 31) name[n++] = *p++;
+    name[n] = 0;
+    if (!n) return 0;
+    p = skip_ws(p);
+    if (p[0] == '(' ) { p = skip_ws(p + 1); if (*p != ')') return 0; p = skip_ws(p + 1); }
+    else if (!first_word_is(t, "function") && !(0)) return 0;
+    if (*p != '{') return 0;
+    *rest = p + 1;
+    return 1;
+}
+
+static int fn_define(Prog* pg, int i, int e, char* name, char* rest)
+{
+    int j = i; char body[FN_BODY]; int bl = 0; int closed = 0;
+    char* r = skip_ws(rest);
+    int len = str_len(r);
+    if (len > 0 && r[len - 1] == '}') { closed = 1; }
+    for (int k = 0; r[k] && bl < FN_BODY - 4; ++k) { if (closed && r[k + 1] == 0 && r[k] == '}') break; body[bl++] = r[k]; }
+    if (bl) body[bl++] = ';';
+    while (!closed && ++j < e)
+    {
+        char* u = skip_ws(pg->st[j]);
+        if (u[0] == '}' && (u[1] == 0 || u[1] == ' ')) { closed = 1; break; }
+        for (int k = 0; u[k] && bl < FN_BODY - 4; ++k) body[bl++] = u[k];
+        body[bl++] = ';';
+    }
+    if (!closed) { uart_puts("script: function: missing '}'\r\n"); g_status = 2; return -1; }
+    body[bl] = 0;
+    ShFunc* f = fn_find(name);
+    if (!f) for (int k = 0; k < FN_MAX; ++k) if (!g_funcs[k].used) { f = &g_funcs[k]; break; }
+    if (!f) { uart_puts("script: too many functions\r\n"); g_status = 2; return -1; }
+    f->used = 1; str_copy(f->name, name, sizeof(f->name)); str_copy(f->body, body, sizeof(f->body));
+    g_status = 0;
+    return j;
+}
+
+int script_call_function(const char* line)
+{
+    char name[32]; int n = 0; const char* p = line;
+    while (*p == ' ') ++p;
+    while (is_name_char(*p, n == 0) && n < 31) name[n++] = *p++;
+    name[n] = 0;
+    if (!n || (*p && *p != ' ')) return 0;
+    ShFunc* f = fn_find(name);
+    if (!f) return 0;
+    char* body = (char*)kmalloc(FN_BODY + 4);
+    if (!body) return 1;
+    str_copy(body, f->body, FN_BODY + 4);
+    while (*p == ' ') ++p;
+    char argsbuf[128]; str_copy(argsbuf, p, sizeof(argsbuf));
+    (void)run_text(body, name, argsbuf);
+    kfree(body);
+    return 1;
+}
+
 static int ctrlc_filter(int c) { if (c == 3) { g_abort = 5; return 1; } return 0; }
 
 static int run_range(Prog* pg, int s, int e)
@@ -384,6 +486,16 @@ static int run_range(Prog* pg, int s, int e)
     {
         char* t = pg->st[i];
         int flow = FLOW_NORMAL;
+        {
+            char fname[32]; char* frest;
+            if (fn_header(t, fname, &frest))
+            {
+                int j = fn_define(pg, i, e, fname, frest);
+                if (j < 0) return FLOW_EXIT;
+                i = j + 1;
+                continue;
+            }
+        }
         if (first_word_is(t, "if"))
         {
             int fi = find_end(pg, i, e, "if", 0, "fi");
@@ -429,14 +541,14 @@ static int run_range(Prog* pg, int s, int e)
             if (done < 0 || i + 1 >= e || !first_word_is(pg->st[i + 1], "do")) { uart_puts("script: syntax error near loop\r\n"); g_status = 2; return FLOW_EXIT; }
             if (is_for)
             {
-                char hdr[512]; script_expand(skip_ws(t + 3), hdr, sizeof(hdr));
+                char hdr[2048]; script_expand(skip_ws(t + 3), hdr, sizeof(hdr));
                 char* p = hdr; char var[32]; int vn = 0;
                 while (*p && *p != ' ' && vn < 31) var[vn++] = *p++;
                 var[vn] = 0;
                 p = skip_ws(p);
                 if (p[0] == 'i' && p[1] == 'n' && (p[2] == ' ' || p[2] == 0)) p += 2;
                 else { uart_puts("script: for: expected 'in'\r\n"); return FLOW_EXIT; }
-                char* w[32]; int n = words_split(p, w, 32);
+                char* w[256]; int n = words_split(p, w, 256);
                 for (int k = 0; k < n; ++k)
                 {
                     uart_poll_job_keys(ctrlc_filter);
@@ -604,6 +716,12 @@ static int has_list_ops(const char* line)
 int script_handle_compound(const char* line)
 {
     while (*line == ' ') ++line;
+    if (!has_list_ops(line) && script_call_function(line)) return 1;
+    if (first_word_is(line, "return"))
+    {
+        const char* a = skip_ws((char*)line + 6); int ok = 1; long v = *a ? parse_int(a, &ok) : g_status;
+        g_status = ok ? (int)v : 2; g_abort = 2; return 1;
+    }
     if (has_list_ops(line) && !first_word_is(line, "if") && !first_word_is(line, "for") && !first_word_is(line, "while"))
     {
         int l = str_len(line);

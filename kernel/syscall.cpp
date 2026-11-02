@@ -573,7 +573,7 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
                 result = (uint64_t)-14;
                 break;
             }
-            if (frame->x[1] > 1048576ULL)
+            if (frame->x[1] > 4194304ULL)
             {
                 result = (uint64_t)-27;
                 break;

@@ -47,6 +47,10 @@ int net_tcp_accept(int owner_pid, int socket_handle, uint32_t* peer_ip, uint16_t
 
 /* DHCP client (DISCOVER/OFFER/REQUEST/ACK): applies address, mask, router and DNS on success. */
 int net_dhcp(uint32_t timeout_ms);
+int net_dhcp_renew(uint32_t timeout_ms);
+int net_dhcp_release();
+uint32_t net_dhcp_remaining();
+void net_dhcp_maintain();
 void net_dhcp_info(uint32_t* server, uint32_t* lease_seconds, int* bound);
 
 /* IPv6 link-local (fe80::/64 from the MAC), NDP and ICMPv6 echo. */

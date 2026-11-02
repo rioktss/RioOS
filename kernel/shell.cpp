@@ -9,6 +9,7 @@
 #include "security.h"
 #include "history.h"
 #include "jobs.h"
+#include "netstack.h"
 #include "string.h"
 
 static const char* command_names[] = {
@@ -17,7 +18,8 @@ static const char* command_names[] = {
     "elf","syscall","user","userdemo","su","logout","exit","level","mmu","disk","diskread",
     "diskwrite","diskflush","apps","uname","whoami","net","ping","selftest","pages","tasks",
     "mount","stats","log","irq","grep","find","history","date","du","df","wc","chmod","env","export",
-    "ifconfig","nslookup","httpget","dnsserver","smp","fbinfo"
+    "ifconfig","nslookup","httpget","dnsserver","smp","fbinfo",
+    "stat","chown","truncate","seq","basename","dirname","poweroff","reboot","head","tail","sort","uniq","cut","tr","tee","sleep","rmdir","free","which","dhcp","ping6","httpd","lspci","nvme","sata","umount","sync","ln","readlink","jtest","threads","thread-demo","unset","fds","sh","source","jobs","fg","bg","kill","let","test","true","false","read","useradd","userdel","passwd","id","users","return","nc","wget","telnet","usb","httpsget"
 };
 
 static void shell_prompt_text()
@@ -182,6 +184,7 @@ void shell()
     while (1)
     {
         jobs_poll();
+        net_dhcp_maintain();
         shell_prompt_text();
         int length = 0;
         int history_cursor = history_count();

@@ -1,3 +1,4 @@
+#include "usb.h"
 #include "storage.h"
 #include "virtio_blk.h"
 #include "pci.h"
@@ -15,6 +16,7 @@ void storage_init()
     virtio_blk_init();
     pci_init();
     nvme_init();
+    usb_init();
     ahci_init();
     if (virtio_blk_ready()) backend = BK_VIRTIO;
     else if (nvme_ready()) { backend = BK_NVME; uart_puts("Storage: root disk on NVMe.\r\n"); }

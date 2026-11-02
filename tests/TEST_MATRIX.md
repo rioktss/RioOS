@@ -77,3 +77,8 @@ QEMU regression: `QEMU_BIOS=<pc-bios> python3 tests/qemu_regression.py [qemu-sys
 - session 2: `-smp 4` secondary cores and `smp test`
 - session 3: PCIe enumeration, NVMe and AHCI self-tests, root filesystem on NVMe
 - session 4: DHCP, TCP server (`httpd`), IPv6 NDP/ICMPv6, ping against `tests/qemu_fake_peer.py` (needs QEMU `-netdev dgram`)
+
+Round 2: host test `tls_host_test` (RFC 7748 X25519 vectors, NIST AES-GCM cases 2 and 4, RFC 5869 HKDF extract); QEMU sessions added:
+- session 5: redirects, wildcards, `$()`, functions, `/tmp` volatility, `free`, >64 inodes
+- session 6: xHCI + usb-kbd + usb-mouse via the QEMU monitor (`sendkey`, `mouse_move`)
+- session 7: `tests/qemu_fake_peer2.py` TCP server (HTTP, echo, RST) and relay to `tests/tls_test_server.py` (real OpenSSL TLS 1.3): `dhcp renew`, `wget`, `nc`, `httpsget`, `wget https://`

@@ -258,6 +258,7 @@ uint64_t virtio_net_base() { return 0; }
 int virtio_net_irq() { return -1; }
 void virtio_net_status() {}
 uint64_t timer_millis() { return fake_ms++; }
+uint64_t timer_seconds() { return fake_ms / 1000; }
 
 int main()
 {

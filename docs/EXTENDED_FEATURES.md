@@ -43,5 +43,14 @@ All additions keep the existing commands, syscalls, drivers, FS layout and build
 ## SMP
 - Secondary cores are released with PSCI CPU_ON (`-smp N`), run on the kernel page tables and execute offloaded jobs (`smp`, `smp test`). The scheduler, heap and drivers remain on CPU0.
 
+## Round 2 additions
+- **Shell**: redirects for every built-in (`> >> 2> 2>> &> 2>&1`, `/dev/null`; `<` keeps the legacy `cmd < file`), wildcards `* ?` (`ls *.txt`; `ls cat wc rm stat head tail` run once per match), command substitution `$(cmd)` and backticks (nested, 6 levels), shell functions (`name() { ...; }`, `function name { ...; }`, `return n`, arguments `$1..$9`), `for` lists up to 256 words, tab completion knows all commands.
+- **`free`**: heap "used" no longer counts the 32 MB page pool.
+- **Filesystem v2**: 256 inodes (was 64) and files up to 4 MiB (was 1 MiB). New disks are formatted v2; v1 images still mount unchanged (layout read from the superblock). `truncate`, `cp` and the truncate syscall use the 4 MiB limit.
+- **/tmp**: created if missing (mode 0777) and emptied at every boot ("volatile"; the data lives on the same disk, it is not RAM-backed).
+- **Network**: DHCP runs automatically at boot (1.6 s timeout, static 10.0.2.15 otherwise); `dhcp status|renew|release`; the lease is renewed automatically at 50% of its time when the shell shows a prompt; `nc [-z] host port [text]`, `nc -l port`, `telnet host [port]` (Ctrl-] quits), `wget url|host[:port] [path] [file]`.
+- **HTTPS**: TLS 1.3 client (TLS_AES_128_GCM_SHA256, X25519, HKDF, AES-128-GCM implemented in `net/tls.cpp`, vector-tested in `tests/tls_host_test.cpp`): `httpsget`, `wget https://...`. The server Finished MAC is verified, but the certificate chain is **not** validated (no trust store) and the random source is a weak timer-based hash: encrypted, not authenticated.
+- **USB**: xHCI driver (`drivers/usb.cpp`), polling: HID boot keyboard (types into the shell) and HID boot mouse (deltas/buttons counted); `usb`, `usb selftest`. Use `-device qemu-xhci -device usb-kbd -device usb-mouse`.
+
 ## Not implemented
-HTTPS/TLS, USB/HID, scheduler running on several CPUs, multi-mount VFS (single root mount), DHCP lease renewal, IPv6 global addressing/TCP/UDP.
+Scheduler running EL0 processes on several CPUs (secondaries still only run offloaded jobs), multi-mount VFS / mounting a second disk as a directory (single root mount; `/tmp` is a volatile directory, not a separate filesystem), IPv6 global addressing/TCP/UDP, TLS certificate validation and TLS 1.2, USB hubs/storage/tablet devices.

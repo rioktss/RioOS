@@ -85,12 +85,34 @@ extern "C" void kernel_main()
 
     uart_puts("[7] Initializing network...\r\n");
     net_init();
+    if (net_ready())
+    {
+        if (net_dhcp(1600U) == 0) { uart_puts("DHCP: lease acquired, "); net_status(); }
+        else uart_puts("DHCP: no server, keeping static address.\r\n");
+    }
 
     uart_puts("[8] Initializing filesystem...\r\n");
     fs_init();
 
     uart_puts("[9] Initializing VFS...\r\n");
     vfs_init();
+    {
+        /* /tmp is volatile: created if missing, emptied on every boot, world-writable. */
+        int root = fs_get_root();
+        int t = fs_resolve("/tmp", root);
+        if (t < 0) { (void)fs_mkdir("/tmp", root); t = fs_resolve("/tmp", root); if (t >= 0) (void)fs_set_mode(t, 0777U); }
+        else if (fs_get_type(t) == FS_DIR)
+        {
+            int total_cleared = 0;
+            for (int round = 0; round < 32; ++round) {
+            int n = fs_get_child_count(t);
+            char names[16][64]; int cnt = 0;
+            for (int i = 0; i < n && cnt < 16; ++i) { int c = fs_get_child(t, i); if (c >= 0) { const char* nm = fs_get_name(c); int k2 = 0; while (nm[k2] && k2 < 63) { names[cnt][k2] = nm[k2]; ++k2; } names[cnt][k2] = 0; ++cnt; } }
+            for (int i = 0; i < cnt; ++i) (void)fs_rm_recursive(names[i], t);
+            total_cleared += cnt; if (cnt == 0) break; }
+            if (total_cleared > 0) uart_puts("VFS: /tmp cleared (volatile).\r\n");
+        }
+    }
 
     uart_puts("[10] Initializing process manager...\r\n");
     process_init();

@@ -115,7 +115,7 @@ int main(){
         CHECK(fs_read_file(owned, root, readbuf, sizeof(readbuf), &readsize) == 0);
         CHECK(readsize == 5 && readbuf[0] == 'a' && readbuf[1] == 'b' && readbuf[2] == 'c' && readbuf[3] == 0 && readbuf[4] == 0);
         CHECK(fs_truncate(owned, root, 1) == 0);
-        CHECK(fs_truncate(owned, root, 1048577ULL) == -27);
+        CHECK(fs_truncate(owned, root, 4194305ULL) == -27);
 
         /* Search permission must be required before processing dot-dot. */
         fs_set_credentials(1000U, 1000U);

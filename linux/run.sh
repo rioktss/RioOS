@@ -9,7 +9,6 @@ KERNEL="${KERNEL:-build/kernel.elf}"
 DISK="${DISK:-storage/disk.img}"
 MEM="${RIOOS_MEM:-128M}"
 CPU="${RIOOS_CPU:-cortex-a72}"
-SMP="${RIOOS_SMP:-4}"
 
 command -v "$QEMU" >/dev/null 2>&1 || {
     echo "ERROR: qemu-system-aarch64 not found."
@@ -24,7 +23,6 @@ exec "$QEMU" \
     -global virtio-mmio.force-legacy=false \
     -cpu "$CPU" \
     -m "$MEM" \
-    -smp "$SMP" \
     -nographic \
     -monitor none \
     -kernel "$KERNEL" \

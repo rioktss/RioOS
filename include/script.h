@@ -10,4 +10,6 @@ int script_run_file(const char* path, const char* args);  /* returns exit status
 void script_set_status(int status);
 int script_status();
 
+int script_call_function(const char* line);
+
 #endif

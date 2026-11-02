@@ -11,17 +11,33 @@ static uint64_t rtc_now()
 
 #define FS_MAGIC            0x4D4B4653U
 #define FS_META_TAG         0x52494F53U /* "RIOS" metadata extension marker */
-#define FS_VERSION          1U
+#define FS_VERSION_V1       1U
+#define FS_VERSION          2U   /* v2: 256 inodes, 4 MiB files; v1 (64 inodes) images still mount */
 #define FS_SECTOR_SIZE      512ULL
-#define FS_MAX_NODES        64
+#define FS_NODE_CAP         256
 #define FS_NAME_SIZE        64
 #define FS_INODE_SIZE       128
-#define FS_INODE_SECTORS    16
 #define FS_BITMAP_SECTORS   8
 #define FS_INODE_START      1ULL
-#define FS_BITMAP_START     (FS_INODE_START + FS_INODE_SECTORS)
-#define FS_DATA_START       (FS_BITMAP_START + FS_BITMAP_SECTORS)
-#define FS_MAX_FILE_SIZE    (1024ULL * 1024ULL)
+#define FS_MAX_FILE_SIZE    (4096ULL * 1024ULL)
+/* runtime layout (set by set_layout) */
+static int node_count = 256;
+static uint64_t g_inode_sectors = 64;
+static uint64_t g_bitmap_start = 65;
+static uint64_t g_data_start = 73;
+static uint32_t g_version = 2;
+#define FS_MAX_NODES        node_count
+#define FS_INODE_SECTORS    g_inode_sectors
+#define FS_BITMAP_START     g_bitmap_start
+#define FS_DATA_START       g_data_start
+static void set_layout(uint32_t version)
+{
+    g_version = version;
+    node_count = version == FS_VERSION_V1 ? 64 : 256;
+    g_inode_sectors = (uint64_t)node_count * 128ULL / 512ULL;
+    g_bitmap_start = 1ULL + g_inode_sectors;
+    g_data_start = g_bitmap_start + 8ULL;
+}
 #define FS_MAX_DISK_SECTORS 32768ULL
 #define FS_DEFAULT_DISK_SECTORS 32768ULL
 #define FS_MAX_BITMAP_BYTES (FS_MAX_DISK_SECTORS / 8ULL)
@@ -70,13 +86,13 @@ struct FsNode
     char name[FS_NAME_SIZE];
 };
 
-static FsNode nodes[FS_MAX_NODES];
+static FsNode nodes[FS_NODE_CAP];
 static uint8_t bitmap[FS_MAX_BITMAP_BYTES];
 static uint64_t disk_sectors = 0;
 static int root_id = -1;
 static int mounted = 0;
 static uint8_t io_buffer[FS_SECTOR_SIZE] __attribute__((aligned(16)));
-static uint8_t legacy_metadata[FS_MAX_NODES];
+static uint8_t legacy_metadata[FS_NODE_CAP];
 static uint32_t current_uid = 0;
 static uint32_t current_gid = 0;
 static uint8_t truncate_buffer[FS_MAX_FILE_SIZE];
@@ -375,7 +391,7 @@ static int save_super()
     DiskSuper sb;
     clear_bytes(&sb, sizeof(sb));
     sb.magic = FS_MAGIC;
-    sb.version = FS_VERSION;
+    sb.version = g_version;
     sb.sector_size = FS_SECTOR_SIZE;
     sb.inode_size = FS_INODE_SIZE;
     sb.inode_count = FS_MAX_NODES;
@@ -400,9 +416,10 @@ static int load_super()
     DiskSuper sb;
     for (uint64_t i = 0; i < sizeof(sb); ++i)
         ((uint8_t*)&sb)[i] = io_buffer[i];
-    if (sb.magic != FS_MAGIC || sb.version != FS_VERSION ||
-        sb.sector_size != FS_SECTOR_SIZE || sb.inode_size != FS_INODE_SIZE ||
-        sb.inode_count != FS_MAX_NODES ||
+    if (sb.magic != FS_MAGIC || (sb.version != FS_VERSION && sb.version != FS_VERSION_V1)) return -2;
+    set_layout(sb.version);
+    if (sb.sector_size != FS_SECTOR_SIZE || sb.inode_size != FS_INODE_SIZE ||
+        sb.inode_count != (uint32_t)FS_MAX_NODES ||
         sb.inode_start != FS_INODE_START || sb.inode_sectors != FS_INODE_SECTORS ||
         sb.bitmap_start != FS_BITMAP_START || sb.bitmap_sectors != FS_BITMAP_SECTORS ||
         sb.data_start != FS_DATA_START)
@@ -591,6 +608,7 @@ static void reserve_metadata()
 
 static int format_fs()
 {
+    set_layout(FS_VERSION);
     disk_sectors = FS_DEFAULT_DISK_SECTORS;
     jnl_enabled = 1;
     uart_puts("FS: formatting persistent filesystem...\r\n");

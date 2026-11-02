@@ -12,12 +12,40 @@
 #define MAX_LINES 4096
 
 /* ---- output capture ---------------------------------------------------- */
-static char* cap_buf = 0;
-static uint32_t cap_len = 0;
+struct CapFrame { char* buf; uint32_t len; uint32_t cap; };
+static CapFrame cap_stack[6];
+static int cap_depth = 0;
 static void cap_hook(char c)
 {
-    if (c == '\r' || !cap_buf) return;
-    if (cap_len < FBUF - 1U) cap_buf[cap_len++] = c;
+    if (c == '\r' || cap_depth <= 0) return;
+    CapFrame* f = &cap_stack[cap_depth - 1];
+    if (f->len < f->cap - 1U) f->buf[f->len++] = c;
+}
+static int cap_push(char* buf, uint32_t cap)
+{
+    if (cap_depth >= 6) return -1;
+    cap_stack[cap_depth].buf = buf; cap_stack[cap_depth].len = 0; cap_stack[cap_depth].cap = cap;
+    ++cap_depth;
+    uart_set_output_hook(cap_hook, 0);
+    return 0;
+}
+static uint32_t cap_pop()
+{
+    uint32_t n = cap_stack[--cap_depth].len;
+    if (cap_depth == 0) uart_clear_output_hook();
+    return n;
+}
+
+/* Run a command line and capture everything it prints (CR removed, NUL-terminated). */
+int filters_capture(const char* cmd, char* out, int cap)
+{
+    if (!out || cap < 2) return -1;
+    if (cap_push(out, (uint32_t)cap) != 0) { out[0] = 0; return -1; }
+    char line[512]; str_copy(line, cmd, sizeof(line));
+    execute_command(line);
+    uint32_t n = cap_pop();
+    out[n] = 0;
+    return (int)n;
 }
 
 /* ---- tokenizer with quotes -------------------------------------------- */
@@ -53,6 +81,7 @@ static int to_int(const char* s, int fb)
     return neg ? -v : v;
 }
 
+static int str_cmp_local(const char* a, const char* b) { while (*a && *a == *b) { ++a; ++b; } return (unsigned char)*a - (unsigned char)*b; }
 static int lower(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
 
 static int contains(const char* line, uint32_t len, const char* pat, int icase)
@@ -338,14 +367,12 @@ int filters_handle_pipeline(const char* text)
     char* a = (char*)kmalloc(FBUF); char* b = (char*)kmalloc(FBUF);
     if (!a || !b) { if (a) kfree(a); if (b) kfree(b); kfree(line); return 0; }
     /* stage 0: run the command with output captured */
-    cap_buf = a; cap_len = 0;
-    uart_set_output_hook(cap_hook, 0);
+    if (cap_push(a, FBUF) != 0) { kfree(a); kfree(b); kfree(line); return 0; }
     {
         char cmd[512]; str_copy(cmd, stage[0], sizeof(cmd));
         execute_command(cmd);
     }
-    uart_clear_output_hook();
-    uint32_t len = cap_len;
+    uint32_t len = cap_pop();
     char* in = a; char* out = b;
     int failed = 0;
     for (int i = 1; i < ns && !failed; ++i)
@@ -362,6 +389,173 @@ int filters_handle_pipeline(const char* text)
     }
     if (!failed) print_buf(in, len);
     kfree(a); kfree(b); kfree(line);
-    cap_buf = 0;
     return 1;
+}
+
+/* ---- redirection: cmd > f, cmd >> f, cmd 2> f, cmd 2>> f, cmd &> f, 2>&1 ------------------ */
+static int write_target(const char* path, const char* data, uint32_t len, int append)
+{
+    if (str_equal(path, "/dev/null")) return 0;
+    uint32_t total = len;
+    char* buf = (char*)kmalloc(FBUF + 16U);
+    if (!buf) return -1;
+    uint32_t old = 0;
+    if (append)
+    {
+        uint64_t sz = 0;
+        if (fs_read_file(path, vfs_cwd(), (uint8_t*)buf, FBUF - 1U, &sz) == 0) old = (uint32_t)sz;
+    }
+    if (old + len > FBUF) { kfree(buf); return -2; }
+    for (uint32_t i = 0; i < len; ++i) buf[old + i] = data[i];
+    total = old + len;
+    int rc = fs_write_data(path, vfs_cwd(), (const uint8_t*)buf, total);
+    kfree(buf);
+    return rc < 0 ? rc : 0;
+}
+
+static int is_error_line(const char* l, uint32_t n, const char* cmdname)
+{
+    uint32_t cl = (uint32_t)str_len(cmdname);
+    if (cl > 0 && n > cl && l[cl] == ':') { uint32_t i = 0; while (i < cl && l[i] == cmdname[i]) ++i; if (i == cl) return 1; }
+    const char* unk = "Unknown command:";
+    uint32_t i = 0; while (unk[i] && i < n && l[i] == unk[i]) ++i;
+    return unk[i] == 0;
+}
+
+int filters_handle_redirect(const char* text)
+{
+    char* line = (char*)kmalloc(1024);
+    if (!line) return 0;
+    str_copy(line, text, 1024);
+    char* w = line; while (*w == ' ') ++w;
+    if ((w[0] == 'e' && w[1] == 'c' && w[2] == 'h' && w[3] == 'o' && (w[4] == ' ' || w[4] == 0))) { kfree(line); return 0; }  /* legacy echo handler */
+    char out_t[160] = "", err_t[160] = ""; int out_app = 0, err_app = 0, merge = 0, found = 0;
+    char cmd[512]; int cn = 0; char q = 0;
+    for (int i = 0; line[i]; )
+    {
+        char c = line[i];
+        if (q) { if (c == q) q = 0; if (cn < 510) cmd[cn++] = c; ++i; continue; }
+        if (c == '"' || c == '\'') { q = c; if (cn < 510) cmd[cn++] = c; ++i; continue; }
+        int fd = 1, j = i;
+        if (c == '2' && line[i + 1] == '>' && (i == 0 || line[i - 1] == ' ')) { fd = 2; j = i + 1; }
+        else if (c == '&' && line[i + 1] == '>') { fd = 3; j = i + 1; }
+        else if (c != '>') { if (cn < 510) cmd[cn++] = c; ++i; continue; }
+        /* j points at '>' */
+        int app = line[j + 1] == '>';
+        int k = j + 1 + (app ? 1 : 0);
+        if (line[k] == '&' && line[k + 1] == '1') { merge = 1; found = 1; i = k + 2; continue; }
+        while (line[k] == ' ') ++k;
+        char tgt[160]; int t = 0;
+        while (line[k] && line[k] != ' ' && line[k] != '\t' && t < 159) tgt[t++] = line[k++];
+        tgt[t] = 0;
+        if (!tgt[0]) { uart_puts("shell: redirection target missing\r\n"); kfree(line); return 1; }
+        found = 1;
+        if (fd == 2) { str_copy(err_t, tgt, sizeof(err_t)); err_app = app; }
+        else { str_copy(out_t, tgt, sizeof(out_t)); out_app = app; if (fd == 3) { str_copy(err_t, tgt, sizeof(err_t)); err_app = app; merge = 1; } }
+        i = k;
+    }
+    if (!found) { kfree(line); return 0; }
+    while (cn > 0 && cmd[cn - 1] == ' ') --cn;
+    cmd[cn] = 0;
+    char* buf = (char*)kmalloc(FBUF);
+    if (!buf) { kfree(line); return 0; }
+    int n = filters_capture(cmd, buf, (int)FBUF);
+    if (n < 0) n = 0;
+    char name[32]; int nl = 0; { char* c = cmd; while (*c == ' ') ++c; while (c[nl] && c[nl] != ' ' && nl < 31) { name[nl] = c[nl]; ++nl; } name[nl] = 0; }
+    char* so = (char*)kmalloc(FBUF); char* se = (char*)kmalloc(FBUF);
+    if (!so || !se) { if (so) kfree(so); if (se) kfree(se); kfree(buf); kfree(line); return 1; }
+    uint32_t ol = 0, el = 0;
+    for (int i = 0; i < n; )
+    {
+        int e = i; while (e < n && buf[e] != '\n') ++e;
+        int len = e - i; int has_nl = e < n;
+        int err = is_error_line(buf + i, (uint32_t)len, name);
+        char* dst = err && !merge ? se : so; uint32_t* dl = err && !merge ? &el : &ol;
+        for (int k = 0; k < len; ++k) dst[(*dl)++] = buf[i + k];
+        if (has_nl) dst[(*dl)++] = '\n';
+        i = e + 1;
+    }
+    int rc = 0;
+    if (out_t[0]) { if (write_target(out_t, so, ol, out_app) != 0) { uart_puts("redirect: cannot write "); uart_puts(out_t); uart_puts("\r\n"); rc = 1; } }
+    else print_buf(so, ol);
+    if (err_t[0] && !merge) { if (write_target(err_t, se, el, err_app) != 0) { uart_puts("redirect: cannot write "); uart_puts(err_t); uart_puts("\r\n"); rc = 1; } }
+    else if (!merge) print_buf(se, el);
+    (void)rc;
+    kfree(so); kfree(se); kfree(buf); kfree(line);
+    return 1;
+}
+
+/* ---- wildcard expansion (* ?) in unquoted words after the command name ------------------ */
+static int wild_match(const char* p, const char* s)
+{
+    while (*p)
+    {
+        if (*p == '*')
+        {
+            while (*p == '*') ++p;
+            if (!*p) return 1;
+            for (; *s; ++s) if (wild_match(p, s)) return 1;
+            return 0;
+        }
+        if (!*s) return 0;
+        if (*p != '?' && *p != *s) return 0;
+        ++p; ++s;
+    }
+    return *s == 0;
+}
+
+int filters_glob(const char* in, char* out, int cap)
+{
+    int op = 0, i = 0, first = 1;
+    while (in[i] && op < cap - 1)
+    {
+        if (in[i] == ' ' || in[i] == '\t') { out[op++] = in[i++]; continue; }
+        int start = i; char q = 0; int quoted = 0, wild = 0;
+        while (in[i] && (q || (in[i] != ' ' && in[i] != '\t')))
+        {
+            if (q) { if (in[i] == q) q = 0; }
+            else if (in[i] == '"' || in[i] == '\'') { q = in[i]; quoted = 1; }
+            else if (in[i] == '*' || in[i] == '?') wild = 1;
+            ++i;
+        }
+        int wl = i - start;
+        int expanded = 0;
+        if (!first && wild && !quoted && wl < 150 && in[start] != '-')
+        {
+            char word[160]; for (int k = 0; k < wl; ++k) word[k] = in[start + k]; word[wl] = 0;
+            int slash = -1; for (int k = 0; k < wl; ++k) if (word[k] == '/') slash = k;
+            char dir[160]; const char* pat;
+            if (slash < 0) { dir[0] = '.'; dir[1] = 0; pat = word; }
+            else { for (int k = 0; k < slash; ++k) dir[k] = word[k]; dir[slash] = 0; if (slash == 0) { dir[0] = '/'; dir[1] = 0; } pat = word + slash + 1; }
+            int d = fs_resolve(dir, vfs_cwd());
+            if (d >= 0 && fs_get_type(d) == FS_DIR && fs_check_access(d, FS_ACCESS_READ | FS_ACCESS_EXEC) == 0)
+            {
+                const char* names[64]; int nm = 0;
+                int cnt = fs_get_child_count(d);
+                for (int c = 0; c < cnt && nm < 64; ++c)
+                {
+                    int id = fs_get_child(d, c);
+                    if (id < 0) continue;
+                    const char* name = fs_get_name(id);
+                    if (name[0] == '.' && pat[0] != '.') continue;
+                    if (wild_match(pat, name)) names[nm++] = name;
+                }
+                for (int a = 1; a < nm; ++a) { const char* t = names[a]; int b = a; while (b > 0 && str_cmp_local(names[b - 1], t) > 0) { names[b] = names[b - 1]; --b; } names[b] = t; }
+                if (nm > 0)
+                {
+                    for (int m = 0; m < nm; ++m)
+                    {
+                        if (m) { if (op < cap - 1) out[op++] = ' '; }
+                        if (slash >= 0) for (int k = 0; k <= slash && op < cap - 1; ++k) out[op++] = word[k];
+                        for (int k = 0; names[m][k] && op < cap - 1; ++k) out[op++] = names[m][k];
+                    }
+                    expanded = 1;
+                }
+            }
+        }
+        if (!expanded) for (int k = 0; k < wl && op < cap - 1; ++k) out[op++] = in[start + k];
+        first = 0;
+    }
+    out[op] = 0;
+    return op;
 }
