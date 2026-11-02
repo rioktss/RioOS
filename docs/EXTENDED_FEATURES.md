@@ -28,6 +28,11 @@ All additions keep the existing commands, syscalls, drivers, FS layout and build
 ## Shell scripting
 `sh file [args]`, `source`, `.`: `NAME=value`, `$VAR ${VAR} $? $# $0-$9`, `if/elif/else/fi`, `for/while/do/done`, `break/continue/exit/shift`, `test`/`[ ]` (`-f -d -e -L -r -w -x -z -n = != -eq -ne -lt -le -gt -ge !`), `let NAME=expr`, `true/false`. `$?` is the exit status of ELF programs; built-in commands report 0.
 
+## Shell additions
+- Exit status for built-ins (a command that prints `name: ...` or `Unknown command` sets `$?` to 1/127), `a && b`, `a || b`, `a; b`.
+- Pipelines whose first stage is any built-in (`ls /bin | sort | tail -n 2`); filters: `grep wc head tail sort uniq cut tr tee`; also `head/tail/sort/uniq/cut FILE`.
+- `seq`, `sleep`, `rmdir`, `free`, `which`, `basename`, `dirname`, `read`, `poweroff`/`halt`/`reboot` (PSCI).
+
 ## Drivers
 - PCIe ECAM enumeration with BAR assignment (`lspci`), NVMe (`nvme`), AHCI/SATA (`sata`). With no virtio-blk disk the root filesystem mounts from NVMe, then AHCI.
 

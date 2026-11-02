@@ -66,11 +66,12 @@ print("== session 1: core, ELF, jobs, scripting, security, FS")
 log = run(C("ktest", "dltest", "id", "echo hello > /home/user/a.txt", "ln -s a.txt /home/user/l1", "cat /home/user/l1",
             "readlink /home/user/l1", "ls /home/user", "N=0", "while [ $N -lt 3 ]; do let N=N+1; done", "echo n=$N",
             "for i in 1 2; do echo it$i; done", "hello | upper", "spin 1 &", "jobs", "wait",
-            "su", "123", "useradd bob", "pw", "pw", "users", "cat /etc/passwd", "mount -o remount,ro", "touch /x",
+            "cat nofile || echo fb-ok", "frobnicate", "echo st=$?", "seq 5 | sort -r | head -n 2", "ls /bin | grep elf | wc -l", "echo a:b:c | cut -d : -f 2", "sleep 1", "which hello", "su", "123", "useradd bob", "pw", "pw", "users", "cat /etc/passwd", "mount -o remount,ro", "touch /x",
             "mount -o remount,rw", "jtest /jt.txt", "mount"), wait=3)
 check("core", log, "ktest: 28/28 passed", "dltest ALL PASS", "uid=1000(user)")
 check("fs", log, "[LINK] l1 -> a.txt", "hello", "a.txt", "remounted read-only", "remounted read-write", "journal        : on")
 check("script", log, "n=3", "it1", "it2")
+check("shell", log, "fb-ok", "st=127", "/bin/hello.elf", "\n9\r")
 check("security", log, "Switched to root", "bob  uid=1001", "$rio$3000$", "User created")
 print("== session 1b: reboot recovers the journal")
 log = run(C("cat /jt.txt", "mount"))

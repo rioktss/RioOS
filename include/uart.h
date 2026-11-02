@@ -12,6 +12,10 @@ void uart_putc_serial_only(char c);
 void uart_puts_serial_only(const char* s);
 /* Non-blocking serial input: returns the next byte (0..255) or -1 when none is pending. */
 int uart_try_getc();
+
+struct UartProbeState { const char* name; int len; int hit; };
+void uart_error_probe_begin(const char* name, int len, UartProbeState* save);
+int uart_error_probe_end(const UartProbeState* restore);   /* 0 none, 1 "<name>: error", 2 "Unknown command" */
 void uart_poll_job_keys(int (*filter)(int));
 int uart_has_data();
 char uart_getc();

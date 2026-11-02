@@ -113,7 +113,7 @@ ASMFLAGS=(
 
 MODULES=(
     uart memory string fs vfs process sched_policy scheduler timer interrupt keyboard
-    commands version shell history env rtc exceptions syscall user mmu virtio_mmio virtio_input virtio_blk storage thread fd task jobs sha256 script pci nvme ahci
+    commands version shell history env rtc exceptions syscall user mmu virtio_mmio virtio_input virtio_blk storage thread fd task jobs sha256 script pci nvme ahci filters
     fb console console_font
     elf virtio_net netstack page_alloc fault diag security smp
     kernel
@@ -229,7 +229,7 @@ step "6/9" "Linking"
     build/commands.o build/version.o build/shell.o build/history.o build/env.o build/rtc.o build/exceptions.o build/syscall.o build/user.o build/mmu.o \
     build/virtio_mmio.o build/virtio_input.o build/virtio_blk.o build/storage.o build/elf.o build/virtio_net.o \
     build/netstack.o build/page_alloc.o build/fault.o build/diag.o build/security.o \
-    build/fb.o build/console.o build/console_font.o build/thread.o build/fd.o build/smp.o build/task.o build/jobs.o build/sha256.o build/script.o build/pci.o build/nvme.o build/ahci.o \
+    build/fb.o build/console.o build/console_font.o build/thread.o build/fd.o build/smp.o build/task.o build/jobs.o build/sha256.o build/script.o build/pci.o build/nvme.o build/ahci.o build/filters.o \
     -o build/kernel.elf
 
 step "7/9" "Verifying ELF"

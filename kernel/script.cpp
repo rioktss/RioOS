@@ -6,6 +6,7 @@
 #include "memory.h"
 #include "string.h"
 #include "uart.h"
+#include "thread.h"
 #include "types.h"
 
 #define SCRIPT_MAX_DEPTH 4
@@ -255,6 +256,32 @@ int script_handle_simple(char* line)
             return 1;
         }
     }
+    if (first_word_is(line, "read"))
+    {
+        char* nm = skip_ws(line + 4);
+        char var[32]; int vn = 0;
+        while (*nm && *nm != ' ' && vn < 31) var[vn++] = *nm++;
+        var[vn] = 0;
+        if (!vn) { uart_puts("read: usage: read NAME\r\n"); g_status = 1; return 1; }
+        char text[110]; int tn = 0;
+        for (;;)
+        {
+            int c = uart_try_getc();
+            if (c < 0) { thread_yield(); asm volatile("wfi"); continue; }
+            if (c == '\r' || c == '\n') { uart_puts("\r\n"); break; }
+            if (c == 3) { g_status = 130; uart_puts("^C\r\n"); return 1; }
+            if ((c == 127 || c == 8) && tn > 0) { --tn; uart_puts("\b \b"); continue; }
+            if (c >= 32 && c < 127 && tn < 100) { text[tn++] = (char)c; uart_putc((char)c); }
+        }
+        text[tn] = 0;
+        char asg[160]; int ap = 0;
+        for (int i = 0; var[i]; ++i) asg[ap++] = var[i];
+        asg[ap++] = '=';
+        for (int i = 0; text[i]; ++i) asg[ap++] = text[i];
+        asg[ap] = 0;
+        g_status = env_set(asg) == 0 ? 0 : 1;
+        return 1;
+    }
     if (first_word_is(line, "let")) { g_status = do_let(line + 3); return 1; }
     if (first_word_is(line, "true") || str_equal(line, ":")) { g_status = 0; return 1; }
     if (first_word_is(line, "false")) { g_status = 1; return 1; }
@@ -297,30 +324,54 @@ static int find_end(Prog* pg, int from, int e, const char* open1, const char* op
     return -1;
 }
 
+static void exec_andor(const char* stmt);
+
 static int eval_cond(const char* cond)
 {
-    char text[512];
-    script_expand(cond, text, sizeof(text));
-    char* t = skip_ws(text);
+    char* t = skip_ws((char*)cond);
     int neg = 0;
     if (*t == '!' && (t[1] == ' ')) { neg = 1; t = skip_ws(t + 1); }
     g_status = 0;
-    char copy[512]; str_copy(copy, t, sizeof(copy));
-    if (!script_handle_simple(copy))
-    {
-        str_copy(copy, t, sizeof(copy));
-        execute_command(copy);
-    }
+    exec_andor(t);
     int ok = g_status == 0;
     return neg ? !ok : ok;
 }
 
+/* a && b || c : sequential evaluation by exit status (quotes protect operators) */
+static void exec_andor(const char* stmt)
+{
+    char buf[512];
+    str_copy(buf, stmt, sizeof(buf));
+    char* seg = buf; char quote = 0; int op = 0;     /* 0 first, 1 '&&', 2 '||' */
+    for (char* p = buf; ; ++p)
+    {
+        char c = *p;
+        int end = c == '\0';
+        int is_and = !end && !quote && c == '&' && p[1] == '&';
+        int is_or = !end && !quote && c == '|' && p[1] == '|';
+        if (!end && !is_and && !is_or) { if (quote) { if (c == quote) quote = 0; } else if (c == '"' || c == '\'') quote = c; continue; }
+        *p = '\0';
+        char* t = skip_ws(seg);
+        int l = str_len(t);
+        while (l > 0 && (t[l - 1] == ' ' || t[l - 1] == '\t')) t[--l] = 0;
+        int run = op == 0 || (op == 1 && g_status == 0) || (op == 2 && g_status != 0);
+        if (run && *t)
+        {
+            char cmd[512]; str_copy(cmd, t, sizeof(cmd));
+            g_status = 0;
+            execute_command(cmd);
+        }
+        if (end) break;
+        op = is_and ? 1 : 2;
+        ++p;
+        seg = p + 1;
+    }
+}
+
 static int exec_stmt(char* stmt)
 {
-    char copy[512];
-    str_copy(copy, stmt, sizeof(copy));
     g_status = 0;
-    execute_command(copy);
+    exec_andor(stmt);
     return 0;
 }
 
@@ -536,9 +587,35 @@ int script_run_file(const char* path, const char* args)
     return rc;
 }
 
+static int has_list_ops(const char* line)
+{
+    char quote = 0;
+    for (const char* p = line; *p; ++p)
+    {
+        char c = *p;
+        if (quote) { if (c == quote) quote = 0; continue; }
+        if (c == '"' || c == '\'') { quote = c; continue; }
+        if (c == ';') return 1;
+        if ((c == '&' && p[1] == '&') || (c == '|' && p[1] == '|')) return 1;
+    }
+    return 0;
+}
+
 int script_handle_compound(const char* line)
 {
     while (*line == ' ') ++line;
+    if (has_list_ops(line) && !first_word_is(line, "if") && !first_word_is(line, "for") && !first_word_is(line, "while"))
+    {
+        int l = str_len(line);
+        char* buf = (char*)kmalloc((uint64_t)l + 2);
+        if (!buf) return 1;
+        str_copy(buf, line, l + 1);
+        int saved = g_status;
+        (void)saved;
+        (void)run_text(buf, "sh", 0);
+        kfree(buf);
+        return 1;
+    }
     if (first_word_is(line, "if") || first_word_is(line, "for") || first_word_is(line, "while"))
     {
         int l = str_len(line);

@@ -1,5 +1,6 @@
 #include "commands.h"
 #include "jobs.h"
+#include "filters.h"
 #include "pci.h"
 #include "nvme.h"
 #include "ahci.h"
@@ -519,6 +520,97 @@ static void command_httpd(const char* argument)
     uart_puts("httpd: stopped\r\n");
 }
 
+static int g_sleep_abort = 0;
+static int sleep_key_filter(int c) { if (c == 3) { g_sleep_abort = 1; return 1; } return 0; }
+
+static void command_sleep(const char* argument)
+{
+    int secs = parse_uint(argument, -1);
+    if (secs < 0 || secs > 3600) { uart_puts("sleep: usage: sleep <seconds 0-3600>\r\n"); return; }
+    g_sleep_abort = 0;
+    uint64_t end = timer_millis() + (uint64_t)secs * 1000ULL;
+    while (timer_millis() < end && !g_sleep_abort)
+    {
+        uart_poll_job_keys(sleep_key_filter);
+        thread_yield();
+        asm volatile("wfi");
+    }
+    if (g_sleep_abort) { uart_puts("sleep: interrupted\r\n"); script_set_status(130); }
+}
+
+static void command_rmdir(const char* argument)
+{
+    if (!argument || !argument[0]) { uart_puts("rmdir: missing operand\r\n"); return; }
+    int id = fs_resolve_nofollow(argument, vfs_cwd());
+    if (id < 0) { uart_puts("rmdir: not found\r\n"); return; }
+    if (fs_get_type(id) != FS_DIR) { uart_puts("rmdir: not a directory\r\n"); return; }
+    if (fs_get_child_count(id) > 0) { uart_puts("rmdir: directory not empty\r\n"); return; }
+    int rc = fs_rm(argument, vfs_cwd());
+    if (rc == -13) uart_puts("rmdir: permission denied\r\n");
+    else if (rc == -30) uart_puts("rmdir: read-only filesystem\r\n");
+    else if (rc != 0) uart_puts("rmdir: failed\r\n");
+}
+
+static void command_free()
+{
+    PageStats pg; page_alloc_get_stats(&pg);
+    uart_puts("              total        used        free\r\n");
+    uart_puts("Heap   : "); print_u64(heap_used() + heap_free()); uart_puts("  "); print_u64(heap_used()); uart_puts("  "); print_u64(heap_free());
+    uart_puts("\r\nPages  : "); print_u64(pg.total_pages); uart_puts("  "); print_u64(pg.total_pages - pg.free_pages); uart_puts("  "); print_u64(pg.free_pages);
+    uart_puts("   (4 KiB each)\r\n");
+}
+
+static int is_builtin_name(const char* name);
+
+static void command_which(const char* argument)
+{
+    if (!argument || !argument[0]) { uart_puts("which: missing operand\r\n"); return; }
+    char path[96];
+    if (is_builtin_name(argument)) { uart_puts(argument); uart_puts(": shell built-in\r\n"); return; }
+    if (jobs_resolve_program(argument, path, sizeof(path))) { uart_puts(path); uart_puts("\r\n"); return; }
+    uart_puts("which: "); uart_puts(argument); uart_puts(" not found\r\n");
+}
+
+static void command_seq(const char* argument)
+{
+    char buf[48]; str_copy(buf, argument ? argument : "", sizeof(buf));
+    char* w[3]; int n = split_words(buf, w, 3);
+    int a = 1, b = 0;
+    if (n == 1) b = parse_uint(w[0], -1);
+    else if (n == 2) { a = parse_uint(w[0], -1); b = parse_uint(w[1], -1); }
+    else { uart_puts("usage: seq [first] last\r\n"); return; }
+    if (a < 0 || b < 0 || b - a > 100000) { uart_puts("seq: bad range\r\n"); return; }
+    for (int i = a; i <= b; ++i) { print_u64((uint64_t)i); uart_puts("\r\n"); }
+}
+
+static void command_basename(const char* argument, int dir)
+{
+    if (!argument || !argument[0]) { uart_puts(dir ? "dirname" : "basename"); uart_puts(": missing operand\r\n"); return; }
+    char t[128]; str_copy(t, argument, sizeof(t));
+    int l = str_len(t);
+    while (l > 1 && t[l - 1] == '/') t[--l] = 0;
+    int slash = -1;
+    for (int i = 0; i < l; ++i) if (t[i] == '/') slash = i;
+    if (dir)
+    {
+        if (slash < 0) uart_puts(".");
+        else if (slash == 0) uart_puts("/");
+        else { t[slash] = 0; uart_puts(t); }
+    }
+    else uart_puts(slash < 0 ? t : t + slash + 1);
+    uart_puts("\r\n");
+}
+
+/* PSCI SYSTEM_OFF / SYSTEM_RESET (QEMU virt exits on either; with -no-reboot reset also exits) */
+static void command_power(int reset)
+{
+    (void)fs_sync();
+    uart_puts(reset ? "Rebooting...\r\n" : "Powering off...\r\n");
+    register uint64_t x0 asm("x0") = reset ? 0x84000009ULL : 0x84000008ULL;
+    asm volatile("smc #0" : "+r"(x0) :: "memory", "x1", "x2", "x3");
+    uart_puts("power: PSCI call failed\r\n");
+}
+
 static void command_sync()
 {
     uart_puts(fs_sync() == 0 ? "synced.\r\n" : "sync: I/O error\r\n");
@@ -554,6 +646,9 @@ static void command_jtest(const char* argument)
     if (rc == 0) uart_puts("Journal committed, in-place apply skipped (simulated power loss). Reset the machine; mount must replay it.\r\n");
     else uart_puts("jtest: failed\r\n");
 }
+
+static int is_builtin_name_impl(const char* name);
+static int is_builtin_name(const char* name) { return is_builtin_name_impl(name); }
 
 static void command_stats()
 {
@@ -633,6 +728,22 @@ static const ManualEntry manual_entries[] =
     {"nano", "edit a text file", "nano <file>", "Runs the bundled text editor"},
     {"tree", "show filesystem tree", "tree", "No options"},
     {"mount", "show mounts / remount root", "mount [-o remount,ro|remount,rw]", "root only for remount; shows journal state"},
+    {"seq", "print a sequence of numbers", "seq [first] last", "pipeline source: seq 5 | sort -r"},
+    {"basename", "strip directory from a path", "basename <path>", "No options"},
+    {"dirname", "strip last path component", "dirname <path>", "No options"},
+    {"poweroff", "power the machine off (also halt, shutdown)", "poweroff", "syncs the filesystem, then PSCI SYSTEM_OFF"},
+    {"reboot", "restart the machine", "reboot", "syncs the filesystem, then PSCI SYSTEM_RESET"},
+    {"head", "print the first lines", "head [-n N] <file>", "also a pipeline stage; default 10 lines"},
+    {"tail", "print the last lines", "tail [-n N] <file>", "also a pipeline stage; default 10 lines"},
+    {"sort", "sort lines", "sort [-r] [-n] [-u] <file>", "also a pipeline stage"},
+    {"uniq", "collapse adjacent duplicate lines", "uniq [-c] <file>", "also a pipeline stage"},
+    {"cut", "select a delimited field", "cut -d <c> -f <n> <file>", "also a pipeline stage"},
+    {"tr", "translate characters", "<cmd> | tr <set1> <set2>", "pipeline stage only"},
+    {"tee", "write a pipeline to a file and pass it on", "<cmd> | tee <file>", "pipeline stage"},
+    {"sleep", "wait for N seconds", "sleep <seconds>", "Ctrl-C interrupts"},
+    {"rmdir", "remove an empty directory", "rmdir <dir>", "No options"},
+    {"free", "show heap and page usage", "free", "No options"},
+    {"which", "locate a command", "which <name>", "built-in or /bin program"},
     {"dhcp", "obtain an IPv4 lease via DHCP", "dhcp", "applies address, mask, gateway and DNS"},
     {"ping6", "ICMPv6 echo to a link-local address", "ping6 <ipv6>", "uses NDP neighbor discovery"},
     {"httpd", "tiny HTTP server (TCP listen/accept)", "httpd <port> [requests]", "serves files from the filesystem; / is a greeting"},
@@ -657,6 +768,16 @@ static const ManualEntry manual_entries[] =
     {"httpget", "fetch a plain-HTTP URL over TCP", "httpget <hostname> [path]", "Outbound IPv4 TCP + HTTP/1.0; HTTPS/TLS is not implemented"},
     {"dnsserver", "set the DNS server address", "dnsserver <ipv4>", "Root only; default for QEMU user networking is 10.0.2.3"}
 };
+
+static int is_builtin_name_impl(const char* name)
+{
+    for (unsigned i = 0; i < sizeof(manual_entries) / sizeof(manual_entries[0]); ++i)
+        if (str_equal(name, manual_entries[i].name)) return 1;
+    static const char* extra[] = {"cd", "pwd", "exit", "help", "man", "clear", "su", "logout", "whoami", "export", "jobs", "fg", "bg", "kill", "wait", "sh", "source", "let", "test", "true", "false", "mkdir", "touch", "cat", "echo", "ls"};
+    for (unsigned i = 0; i < sizeof(extra) / sizeof(extra[0]); ++i)
+        if (str_equal(name, extra[i])) return 1;
+    return 0;
+}
 
 static void command_man(const char* argument);
 static void put_date_2(uint64_t value)
@@ -2176,7 +2297,7 @@ static void command_rm(char* argument)
     int failures = 0;
     for (int i = 0; i < n; ++i)
     {
-        int id = fs_resolve(operands[i], vfs_cwd());
+        int id = fs_resolve_nofollow(operands[i], vfs_cwd());
         if (id < 0)
         {
             if (!force) { uart_puts("rm: not found\r\n"); failures = 1; }
@@ -2765,7 +2886,27 @@ static void command_man(const char* argument)
     uart_puts("\r\n");
 }
 
+static void execute_command_inner(char* line);
+
 void execute_command(
+    char* line
+)
+{
+    if (line == 0) return;
+    char* w = line;
+    while (*w == ' ') ++w;
+    char name[24]; int nl = 0;
+    while (w[nl] && w[nl] != ' ' && nl < 23) { name[nl] = w[nl]; ++nl; }
+    name[nl] = 0;
+    UartProbeState saved;
+    uart_error_probe_begin(name, nl, &saved);
+    execute_command_inner(line);
+    int hit = uart_error_probe_end(&saved);
+    if (hit == 2) script_set_status(127);
+    else if (hit == 1) script_set_status(1);
+}
+
+static void execute_command_inner(
     char* line
 )
 {
@@ -2791,8 +2932,12 @@ void execute_command(
 
     if (script_handle_simple(line))
         return;
+    script_set_status(0);
 
     if (jobs_handle_line(line))
+        return;
+
+    if (filters_handle_pipeline(line))
         return;
 
     if (handle_shell_operators(line))
@@ -3011,6 +3156,16 @@ void execute_command(
     if (str_equal(command, "fbinfo")) { command_fbinfo(); return; }
     if (str_equal(command, "fds")) { fd_list(); return; }
     if (str_equal(command, "thread-demo")) { command_thread_demo(); return; }
+    if (filters_run_file_command(command, argument)) return;
+    if (str_equal(command, "seq")) { command_seq(argument); return; }
+    if (str_equal(command, "basename")) { command_basename(argument, 0); return; }
+    if (str_equal(command, "dirname")) { command_basename(argument, 1); return; }
+    if (str_equal(command, "poweroff") || str_equal(command, "halt") || str_equal(command, "shutdown")) { command_power(0); return; }
+    if (str_equal(command, "reboot")) { command_power(1); return; }
+    if (str_equal(command, "sleep")) { command_sleep(argument); return; }
+    if (str_equal(command, "rmdir")) { command_rmdir(argument); return; }
+    if (str_equal(command, "free")) { command_free(); return; }
+    if (str_equal(command, "which")) { command_which(argument); return; }
     if (str_equal(command, "dhcp")) { command_dhcp(); return; }
     if (str_equal(command, "ping6")) { command_ping6(argument); return; }
     if (str_equal(command, "httpd")) { command_httpd(argument); return; }

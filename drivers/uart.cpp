@@ -77,8 +77,52 @@ void uart_puts_serial_only(const char* s)
         uart_putc_serial_only(*s++);
 }
 
+/* Error probe: a built-in command that fails prints "<name>: ..." (or "Unknown command:") at the
+   start of a line. The shell uses this to give built-ins a real exit status. */
+static const char* probe_name = 0;
+static int probe_len = 0;
+static int probe_pos = -1;
+static int probe_line_start = 1;
+static int probe_hit = 0;
+
+void uart_error_probe_begin(const char* name, int len, UartProbeState* save)
+{
+    if (save) { save->name = probe_name; save->len = probe_len; save->hit = probe_hit; }
+    probe_name = name; probe_len = len; probe_pos = -1; probe_hit = 0; probe_line_start = 1;
+}
+
+int uart_error_probe_end(const UartProbeState* restore)
+{
+    int hit = probe_hit;
+    if (restore) { probe_name = restore->name; probe_len = restore->len; probe_hit = restore->hit; }
+    else { probe_name = 0; probe_len = 0; probe_hit = 0; }
+    probe_pos = -1;
+    return hit;
+}
+
+static void probe_feed(char c)
+{
+    if (!probe_name) return;
+    static const char unk[] = "Unknown command:";
+    static int unk_pos = -1;
+    if (probe_line_start) { probe_pos = 0; unk_pos = 0; }
+    if (probe_pos >= 0)
+    {
+        if (probe_pos < probe_len) { if (c == probe_name[probe_pos]) ++probe_pos; else probe_pos = -1; }
+        else { if (c == ':' && probe_len > 0) probe_hit = probe_hit ? probe_hit : 1; probe_pos = -1; }
+    }
+    if (unk_pos >= 0)
+    {
+        if (unk[unk_pos] == '\0') { probe_hit = 2; unk_pos = -1; }
+        else if (c == unk[unk_pos]) { ++unk_pos; if (unk[unk_pos] == '\0') { probe_hit = 2; unk_pos = -1; } }
+        else unk_pos = -1;
+    }
+    probe_line_start = (c == '\n');
+}
+
 void uart_putc(char c)
 {
+    probe_feed(c);
     if (output_hook != 0)
     {
         output_hook(c);
