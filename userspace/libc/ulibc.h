@@ -164,6 +164,44 @@ void* dlsym(void* handle, const char* name);
 int dlclose(void* handle);
 const char* dlerror(void);
 
+
+/* ---- libc part 2 (ulibc2.cpp): buffered stdio ---- */
+typedef struct FILE FILE;
+extern FILE* stdin; extern FILE* stdout; extern FILE* stderr;
+#define EOF (-1)
+FILE* fopen(const char* path, const char* mode);   /* r w a r+ w+ a+ */
+int fclose(FILE* f);
+int fflush(FILE* f);                                /* NULL flushes all */
+int fgetc(FILE* f); int getc(FILE* f); int ungetc(int c, FILE* f);
+char* fgets(char* s, int cap, FILE* f);
+size_t fread(void* buf, size_t sz, size_t n, FILE* f);
+size_t fwrite(const void* buf, size_t sz, size_t n, FILE* f);
+int fputc(int c, FILE* f); int putc(int c, FILE* f); int fputs(const char* s, FILE* f);
+int fprintf(FILE* f, const char* fmt, ...);
+int vfprintf(FILE* f, const char* fmt, va_list ap);
+int fseek(FILE* f, long off, int whence); long ftell(FILE* f); void rewind(FILE* f);
+int feof(FILE* f); int ferror(FILE* f); void clearerr(FILE* f); int fileno(FILE* f);
+void perror(const char* s);
+int sscanf(const char* s, const char* fmt, ...);    /* %d %i %u %x %s %c with l/ll */
+int vsscanf(const char* s, const char* fmt, va_list ap);
+
+/* string / stdlib extras */
+size_t strnlen(const char* s, size_t n); char* strncat(char* d, const char* s, size_t n);
+void* memchr(const void* s, int c, size_t n);
+int strcasecmp(const char* a, const char* b); int strncasecmp(const char* a, const char* b, size_t n);
+size_t strspn(const char* s, const char* set); size_t strcspn(const char* s, const char* set); char* strpbrk(const char* s, const char* set);
+char* strtok(char* s, const char* delim); char* strtok_r(char* s, const char* delim, char** save);
+const char* strerror(int e);
+long atol(const char* s); long long atoll(const char* s);
+long long strtoll(const char* s, char** end, int base); unsigned long long strtoull(const char* s, char** end, int base);
+long labs(long v); long long llabs(long long v);
+void* bsearch(const void* key, const void* base, size_t n, size_t sz, int (*cmp)(const void*, const void*));
+int isxdigit(int c); int isprint(int c); int ispunct(int c);
+
+/* integer math (no FPU in the kernel/libc) */
+unsigned long isqrt_u(unsigned long v); long gcd_l(long a, long b); long lcm_l(long a, long b);
+long ipow_l(long base, unsigned exp); long clamp_l(long v, long lo, long hi);
+
 #ifdef __cplusplus
 }
 #endif

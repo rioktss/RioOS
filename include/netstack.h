@@ -60,10 +60,28 @@ void net_ip6_local(uint8_t out[16]);
 int net_ping6(const uint8_t target[16], uint32_t timeout_ms);   /* RTT ms or negative errno */
 void net_ip6_stats(uint32_t* ns_received, uint32_t* na_sent, uint32_t* echo_requests);
 
+/* UDP/TCP over IPv6 link-local (neighbours resolved with NDP). Sockets come from net_udp_socket()/net_tcp_socket();
+   a TCP listener accepts both IPv4 and IPv6 clients (net_tcp_peer6 tells which). */
+int net_udp6_sendto(int owner_pid, int socket_handle, const uint8_t target[16], uint16_t target_port, const void* data, uint32_t length);
+int net_udp6_recvfrom(int owner_pid, int socket_handle, uint8_t source[16], uint16_t* source_port, void* data, uint32_t capacity, uint32_t timeout_ms);
+int net_tcp6_connect(int owner_pid, int socket_handle, const uint8_t target[16], uint16_t target_port, uint32_t timeout_ms);
+int net_tcp_peer6(int owner_pid, int socket_handle, uint8_t out[16]);
+
 /* DNS A-record lookup; IP addresses use the same 0xAABBCCDD representation
    as net_parse_ipv4(). The default DNS server is QEMU user-net (10.0.2.3). */
 int net_dns_set_server(uint32_t server_ip);
 uint32_t net_dns_server();
 int net_dns_resolve(const char* hostname, uint32_t* out_ip, uint32_t timeout_ms);
+
+
+/* packet filter (IPv4). Rules are ordered, first match wins; unmatched traffic follows the per-direction default.
+   Inbound rules apply to new connections only; DHCP/DNS are exempt. */
+struct NetFwRule { uint8_t used; uint8_t allow; uint8_t dir; uint8_t proto; uint32_t ip; uint8_t prefix; uint16_t port; };   /* dir 0 in, 1 out, 2 both; proto 0 any 1 icmp 6 tcp 17 udp */
+int net_fw_add(const NetFwRule* rule, int position);      /* index or -errno; position -1 appends */
+int net_fw_del(int index);
+void net_fw_flush();
+int net_fw_get(int index, NetFwRule* out);
+void net_fw_set_default(int dir, int allow);
+void net_fw_get_state(int* def_in, int* def_out, uint32_t* drop_in, uint32_t* drop_out);
 
 #endif

@@ -4,6 +4,105 @@
 #include "string.h"
 #include "rtc.h"
 
+/* Every public fs_* entry point below is the single-mount implementation (*_impl, local ids); the real API at the end of
+   this file routes calls to the right mounted filesystem and encodes ids as (mount << 12) | local id. */
+#define fs_check_access_as fs_check_access_as_impl
+#define fs_check_access fs_check_access_impl
+#define fs_init fs_init_impl
+#define fs_get_root fs_get_root_impl
+#define fs_resolve fs_resolve_impl
+#define fs_resolve_nofollow fs_resolve_nofollow_impl
+#define fs_symlink fs_symlink_impl
+#define fs_readlink fs_readlink_impl
+#define fs_link_target_of fs_link_target_of_impl
+#define fs_set_readonly fs_set_readonly_impl
+#define fs_is_readonly fs_is_readonly_impl
+#define fs_sync fs_sync_impl
+#define fs_journal_status fs_journal_status_impl
+#define fs_journal_crash_test fs_journal_crash_test_impl
+#define fs_mkdir fs_mkdir_impl
+#define fs_touch fs_touch_impl
+#define fs_mkdir_p fs_mkdir_p_impl
+#define fs_write_data fs_write_data_impl
+#define fs_write fs_write_impl
+#define fs_read_file fs_read_file_impl
+#define fs_read_file_for_update fs_read_file_for_update_impl
+#define fs_cat fs_cat_impl
+#define fs_cat_numbered fs_cat_numbered_impl
+#define fs_rm fs_rm_impl
+#define fs_rm_recursive fs_rm_recursive_impl
+#define fs_rename fs_rename_impl
+#define fs_file_size fs_file_size_impl
+#define fs_get_type fs_get_type_impl
+#define fs_get_name fs_get_name_impl
+#define fs_get_parent fs_get_parent_impl
+#define fs_get_child_count fs_get_child_count_impl
+#define fs_get_child fs_get_child_impl
+#define fs_get_mode fs_get_mode_impl
+#define fs_get_mtime fs_get_mtime_impl
+#define fs_get_uid fs_get_uid_impl
+#define fs_get_gid fs_get_gid_impl
+#define fs_set_mode fs_set_mode_impl
+#define fs_set_owner fs_set_owner_impl
+#define fs_set_owner_path fs_set_owner_path_impl
+#define fs_stat_path fs_stat_path_impl
+#define fs_truncate fs_truncate_impl
+#define fs_total_sectors fs_total_sectors_impl
+#define fs_used_sectors fs_used_sectors_impl
+#define fs_set_mode_path fs_set_mode_path_impl
+#define fs_persistent fs_persistent_impl
+#define fs_link_hard fs_link_hard_impl
+#define fs_link_count fs_link_count_impl
+#define fs_fsck fs_fsck_impl
+#define fs_quota_set fs_quota_set_impl
+#define fs_quota_get fs_quota_get_impl
+/* forward declarations of the single-mount implementations (names redirected by the macros above) */
+void fs_init();
+int fs_resolve_nofollow(const char* path, int cwd);
+int fs_symlink(const char* target, const char* linkpath, int cwd);   /* returns node id or -errno */
+int fs_link_target_of(int id, char* out, int cap);                     /* target of a symlink node */
+int fs_readlink(const char* path, int cwd, char* out, int cap);       /* length or -errno */
+void fs_set_readonly(int ro);                                         /* remount ro/rw; mutators return -30 when ro */
+int fs_is_readonly();
+int fs_sync();
+void fs_journal_status(FsJournalInfo* out);
+int fs_journal_crash_test(const char* path, int cwd);
+int fs_check_access(int id, uint32_t requested);
+int fs_check_access_as(int id, uint32_t uid, uint32_t gid, uint32_t requested);
+int fs_stat_path(const char* path, int cwd, FsStat* out);
+int fs_set_owner(int id, uint32_t uid, uint32_t gid);
+int fs_set_owner_path(const char* path, int cwd, uint32_t uid, uint32_t gid);
+int fs_truncate(const char* path, int cwd, uint64_t size);
+int fs_get_root();
+int fs_resolve(const char* path, int cwd);
+int fs_mkdir(const char* path, int cwd);
+int fs_touch(const char* path, int cwd);
+int fs_write(const char* path, int cwd, const char* content);
+int fs_write_data(const char* path, int cwd, const uint8_t* data, uint64_t size);
+int fs_read_file(const char* path, int cwd, uint8_t* buffer, uint64_t capacity, uint64_t* out_size);
+int fs_read_file_for_update(const char* path, int cwd, uint8_t* buffer, uint64_t capacity, uint64_t* out_size);
+int fs_cat(const char* path, int cwd);
+int fs_cat_numbered(const char* path, int cwd);
+int fs_rm(const char* path, int cwd);
+int fs_rm_recursive(const char* path, int cwd);
+int fs_rename(const char* from, const char* to, int cwd);
+int fs_mkdir_p(const char* path, int cwd);
+uint64_t fs_file_size(int id);
+int fs_get_type(int id);
+const char* fs_get_name(int id);
+int fs_get_parent(int id);
+uint32_t fs_get_mode(int id);
+uint64_t fs_get_mtime(int id);
+uint32_t fs_get_uid(int id);
+uint32_t fs_get_gid(int id);
+int fs_set_mode(int id, uint32_t mode);
+int fs_set_mode_path(const char* path, int cwd, uint32_t mode);
+uint64_t fs_total_sectors();
+uint64_t fs_used_sectors();
+int fs_get_child_count(int id);
+int fs_get_child(int id, int index);
+int fs_persistent();
+
 static uint64_t rtc_now()
 {
     return rtc_get_epoch();
@@ -20,24 +119,10 @@ static uint64_t rtc_now()
 #define FS_BITMAP_SECTORS   8
 #define FS_INODE_START      1ULL
 #define FS_MAX_FILE_SIZE    (4096ULL * 1024ULL)
-/* runtime layout (set by set_layout) */
-static int node_count = 256;
-static uint64_t g_inode_sectors = 64;
-static uint64_t g_bitmap_start = 65;
-static uint64_t g_data_start = 73;
-static uint32_t g_version = 2;
 #define FS_MAX_NODES        node_count
 #define FS_INODE_SECTORS    g_inode_sectors
 #define FS_BITMAP_START     g_bitmap_start
 #define FS_DATA_START       g_data_start
-static void set_layout(uint32_t version)
-{
-    g_version = version;
-    node_count = version == FS_VERSION_V1 ? 64 : 256;
-    g_inode_sectors = (uint64_t)node_count * 128ULL / 512ULL;
-    g_bitmap_start = 1ULL + g_inode_sectors;
-    g_data_start = g_bitmap_start + 8ULL;
-}
 #define FS_MAX_DISK_SECTORS 32768ULL
 #define FS_DEFAULT_DISK_SECTORS 32768ULL
 #define FS_MAX_BITMAP_BYTES (FS_MAX_DISK_SECTORS / 8ULL)
@@ -84,15 +169,68 @@ struct FsNode
     uint64_t first_sector;
     uint32_t sector_count;
     char name[FS_NAME_SIZE];
+    int mount_ctx;                      /* >0: another filesystem is mounted on this directory (in-memory only) */
 };
 
-static FsNode nodes[FS_NODE_CAP];
-static uint8_t bitmap[FS_MAX_BITMAP_BYTES];
-static uint64_t disk_sectors = 0;
-static int root_id = -1;
-static int mounted = 0;
+/* ---- per-mount context: every mounted filesystem has its own inode table, bitmap, journal and device ---- */
+#define FS_MAX_CTX 8
+struct FsCtx
+{
+    FsNode nodes[FS_NODE_CAP];
+    uint8_t bitmap[FS_MAX_BITMAP_BYTES];
+    uint8_t legacy_metadata[FS_NODE_CAP];
+    uint64_t disk_sectors;
+    int root_id, mounted, node_count;
+    uint64_t g_inode_sectors, g_bitmap_start, g_data_start;
+    uint32_t g_version;
+    int jnl_enabled, fs_ro;
+    uint32_t jnl_seq;
+    int inuse, dev, quiet, no_journal;
+    uint64_t fmt_sectors;
+    int mp_ctx, mp_local;
+};
+static FsCtx ctxs[FS_MAX_CTX];
+static FsCtx* cur = &ctxs[0];
+#define nodes           (cur->nodes)
+#define bitmap          (cur->bitmap)
+#define legacy_metadata (cur->legacy_metadata)
+#define disk_sectors    (cur->disk_sectors)
+#define root_id         (cur->root_id)
+#define mounted         (cur->mounted)
+#define node_count      (cur->node_count)
+#define g_inode_sectors (cur->g_inode_sectors)
+#define g_bitmap_start  (cur->g_bitmap_start)
+#define g_data_start    (cur->g_data_start)
+#define g_version       (cur->g_version)
+#define jnl_enabled     (cur->jnl_enabled)
+#define fs_ro           (cur->fs_ro)
+#define jnl_seq         (cur->jnl_seq)
+static void set_layout(uint32_t version)
+{
+    g_version = version;
+    node_count = version == FS_VERSION_V1 ? 64 : 256;
+    g_inode_sectors = (uint64_t)node_count * 128ULL / 512ULL;
+    g_bitmap_start = 1ULL + g_inode_sectors;
+    g_data_start = g_bitmap_start + 8ULL;
+}
+static int fs_verbose = 1;
+#define fs_say(s) do { if (fs_verbose && !cur->quiet) uart_puts(s); } while (0)
+
+/* Device routing: device 0 = the root storage backend (storage_*); others through storage_dev_* (weak: absent in host tests). */
+__attribute__((weak)) int storage_dev_read(int dev, uint64_t sector, void* buffer);
+__attribute__((weak)) int storage_dev_write(int dev, uint64_t sector, const void* buffer);
+__attribute__((weak)) int storage_dev_flush(int dev);
+__attribute__((weak)) uint64_t storage_dev_sectors(int dev);
+static int dev_read(uint64_t sector, void* buf) { return cur->dev == 0 ? storage_read_sector(sector, buf) : (storage_dev_read ? storage_dev_read(cur->dev, sector, buf) : -1); }
+static int dev_write(uint64_t sector, const void* buf) { return cur->dev == 0 ? storage_write_sector(sector, buf) : (storage_dev_write ? storage_dev_write(cur->dev, sector, buf) : -1); }
+static int dev_flush() { return cur->dev == 0 ? storage_flush() : (storage_dev_flush ? storage_dev_flush(cur->dev) : -1); }
+static int dev_ready() { return cur->dev == 0 ? storage_ready() : (storage_dev_sectors ? storage_dev_sectors(cur->dev) != 0 : 0); }
+#define storage_read_sector(s, b)  dev_read((s), (b))
+#define storage_write_sector(s, b) dev_write((s), (b))
+#define storage_flush()            dev_flush()
+#define storage_ready()            dev_ready()
+
 static uint8_t io_buffer[FS_SECTOR_SIZE] __attribute__((aligned(16)));
-static uint8_t legacy_metadata[FS_NODE_CAP];
 static uint32_t current_uid = 0;
 static uint32_t current_gid = 0;
 static uint8_t truncate_buffer[FS_MAX_FILE_SIZE];
@@ -115,12 +253,9 @@ struct __attribute__((packed)) JnlHeader
     uint32_t checksum;
     uint64_t target[JNL_MAX];
 };
-static int jnl_enabled = 0;
 static int tx_depth = 0;
 static int tx_count = 0;
-static int fs_ro = 0;
 static int jnl_crash_armed = 0;
-static uint32_t jnl_seq = 0;
 static uint32_t jnl_commits = 0;
 static uint32_t jnl_replayed = 0;
 static uint64_t tx_sector[JNL_MAX];
@@ -427,7 +562,7 @@ static int load_super()
     if (sb.total_sectors < FS_DATA_START || sb.total_sectors > FS_MAX_DISK_SECTORS)
         return -3;
     disk_sectors = sb.total_sectors;
-    jnl_enabled = disk_sectors >= FS_DATA_START + 256ULL;
+    jnl_enabled = !cur->no_journal && disk_sectors >= FS_DATA_START + 256ULL;
     return 0;
 }
 
@@ -477,6 +612,13 @@ static int rebuild_bitmap_from_inodes()
             nodes[i].sector_count > disk_sectors - nodes[i].first_sector ||
             nodes[i].sector_count > FS_MAX_FILE_SIZE / FS_SECTOR_SIZE)
             return -1;
+
+        /* hard links share one extent: only the first holder marks it */
+        int dup = 0;
+        for (int j = 0; j < i; ++j)
+            if (nodes[j].used && nodes[j].type == FS_FILE && nodes[i].type == FS_FILE &&
+                nodes[j].first_sector == nodes[i].first_sector && nodes[j].sector_count == nodes[i].sector_count) { dup = 1; break; }
+        if (dup) continue;
 
         for (uint32_t s = 0; s < nodes[i].sector_count; ++s)
         {
@@ -578,6 +720,8 @@ static int validate_mounted_fs()
                 continue;
             uint64_t b0 = nodes[b].first_sector;
             uint64_t b1 = b0 + nodes[b].sector_count;
+            if (a0 == b0 && a1 == b1 && nodes[a].type == FS_FILE && nodes[b].type == FS_FILE && nodes[a].size == nodes[b].size)
+                continue;                                   /* hard links */
             if (a0 < b1 && b0 < a1)
                 return 0;
         }
@@ -609,9 +753,9 @@ static void reserve_metadata()
 static int format_fs()
 {
     set_layout(FS_VERSION);
-    disk_sectors = FS_DEFAULT_DISK_SECTORS;
-    jnl_enabled = 1;
-    uart_puts("FS: formatting persistent filesystem...\r\n");
+    disk_sectors = cur->fmt_sectors ? cur->fmt_sectors : FS_DEFAULT_DISK_SECTORS;
+    jnl_enabled = !cur->no_journal && disk_sectors >= FS_DATA_START + 256ULL;
+    fs_say("FS: formatting persistent filesystem...\r\n");
     clear_bytes(bitmap, sizeof(bitmap));
     for (int i = 0; i < FS_MAX_NODES; ++i)
         clear_bytes(&nodes[i], sizeof(nodes[i]));
@@ -637,7 +781,7 @@ static int format_fs()
         nodes[i].used = 0;
 
     mounted = 1;
-    uart_puts("FS: persistent filesystem ready.\r\n");
+    fs_say("FS: persistent filesystem ready.\r\n");
     return 0;
 }
 
@@ -854,30 +998,29 @@ static void fs_assign_legacy_owner_policy()
     }
 }
 
-void fs_init()
+/* Mount the filesystem found on cur->dev into the current context (cur). allow_format: blank device -> format. */
+static void quota_load();
+static int mount_current(int allow_format)
 {
-    uart_puts("FS: starting persistent mount...\r\n");
     root_id = -1;
     mounted = 0;
     disk_sectors = 0;
-
-    for (int i = 0; i < FS_MAX_NODES; ++i)
+    for (int i = 0; i < FS_NODE_CAP; ++i)
         clear_bytes(&nodes[i], sizeof(nodes[i]));
     clear_bytes(bitmap, sizeof(bitmap));
     clear_bytes(legacy_metadata, sizeof(legacy_metadata));
 
     if (!storage_ready())
     {
-        uart_puts("FS: storage unavailable, using empty RAM fallback.\r\n");
-        ram_fallback();
-        return;
+        fs_say("FS: storage unavailable, using empty RAM fallback.\r\n");
+        return -19;
     }
 
     int rc = load_super();
     if (rc == 0)
     {
-        if (jnl_recover() != 0) uart_puts("FS: journal recovery I/O error.\r\n");
-        else if (jnl_replayed) { uart_puts("FS: journal replayed, filesystem recovered.\r\n"); }
+        if (jnl_recover() != 0) fs_say("FS: journal recovery I/O error.\r\n");
+        else if (jnl_replayed) { fs_say("FS: journal replayed, filesystem recovered.\r\n"); }
         rc = load_super();
     }
     if (rc == -2)
@@ -886,40 +1029,16 @@ void fs_init()
         if (storage_read_sector(0, io_buffer) == 0)
         {
             for (int i = 0; i < 512; ++i)
-            {
-                if (io_buffer[i] != 0)
-                {
-                    blank = 0;
-                    break;
-                }
-            }
+                if (io_buffer[i] != 0) { blank = 0; break; }
         }
-        else
-        {
-            blank = 0;
-        }
-
-        if (blank)
-            rc = format_fs();
-        else
-            rc = -10;
+        else blank = 0;
+        rc = (blank && allow_format) ? format_fs() : -10;
     }
-
-    if (rc != 0)
-    {
-        uart_puts("FS: mount failed, RAM fallback enabled.\r\n");
-        ram_fallback();
-        return;
-    }
+    if (rc != 0) return rc;
 
     if (mounted == 0)
     {
-        if (load_all_inodes() != 0)
-        {
-            uart_puts("FS: inode table read failed.\r\n");
-            ram_fallback();
-            return;
-        }
+        if (load_all_inodes() != 0) { fs_say("FS: inode table read failed.\r\n"); return -11; }
         root_id = 0;
 
         /* Old images may keep data where the journal now lives: then run without it. */
@@ -931,38 +1050,33 @@ void fs_init()
 
         /* Rebuild the allocation bitmap from authoritative inode extents.
            This also repairs a stale/corrupt on-disk bitmap during mount. */
-        if (rebuild_bitmap_from_inodes() != 0)
-        {
-            uart_puts("FS: extent integrity check failed.\r\n");
-            ram_fallback();
-            return;
-        }
-
-        if (!validate_mounted_fs())
-        {
-            uart_puts("FS: inode integrity check failed.\r\n");
-            ram_fallback();
-            return;
-        }
+        if (rebuild_bitmap_from_inodes() != 0) { fs_say("FS: extent integrity check failed.\r\n"); return -12; }
+        if (!validate_mounted_fs()) { fs_say("FS: inode integrity check failed.\r\n"); return -13; }
         fs_assign_legacy_owner_policy();
-        if (write_bitmap() != 0)
-        {
-            uart_puts("FS: bitmap repair failed.\r\n");
-            ram_fallback();
-            return;
-        }
+        if (write_bitmap() != 0) { fs_say("FS: bitmap repair failed.\r\n"); return -14; }
         for (int i = 0; i < FS_MAX_NODES; ++i)
         {
-            if (nodes[i].used && legacy_metadata[i] && save_inode(i) != 0)
-            {
-                uart_puts("FS: owner metadata migration failed.\r\n");
-                ram_fallback();
-                return;
-            }
+            if (nodes[i].used && legacy_metadata[i] && save_inode(i) != 0) { fs_say("FS: owner metadata migration failed.\r\n"); return -15; }
             legacy_metadata[i] = 0;
         }
         mounted = 1;
-        uart_puts("FS: filesystem mounted, verified and repaired.\r\n");
+        fs_say("FS: filesystem mounted, verified and repaired.\r\n");
+    }
+    return 0;
+}
+
+void fs_init()
+{
+    uart_puts("FS: starting persistent mount...\r\n");
+    for (int c = 0; c < FS_MAX_CTX; ++c) { clear_bytes(&ctxs[c], sizeof(ctxs[c])); ctxs[c].mp_ctx = -1; ctxs[c].mp_local = -1; }
+    cur = &ctxs[0];
+    cur->inuse = 1; cur->dev = 0;
+    set_layout(FS_VERSION);
+    if (mount_current(1) != 0)
+    {
+        uart_puts("FS: mount failed, RAM fallback enabled.\r\n");
+        ram_fallback();
+        return;
     }
 
     int storage_dir = ensure_dir_path("/storage");
@@ -987,6 +1101,8 @@ void fs_init()
             (storage_home >= 0 && fs_is_descendant_of(i, storage_home)))
             (void)fs_set_owner(i, 1000U, 1000U);
     }
+    ensure_dir_path("/etc");
+    quota_load();
 }
 
 int fs_get_root() { return root_id; }
@@ -1174,6 +1290,61 @@ int fs_mkdir_p(const char* path, int cwd)
     return current;
 }
 
+
+/* ---- hard links: FILE nodes whose (first_sector, sector_count, size) are identical share one extent ---- */
+static int extent_shared_with_others(int self, uint64_t first, uint32_t count)
+{
+    if (count == 0) return 0;
+    for (int j = 0; j < FS_MAX_NODES; ++j)
+        if (j != self && nodes[j].used && nodes[j].type == FS_FILE && nodes[j].first_sector == first && nodes[j].sector_count == count)
+            return 1;
+    return 0;
+}
+static int link_count_of(int id)
+{
+    if (nodes[id].type != FS_FILE || nodes[id].sector_count == 0) return 1;
+    int n = 1;
+    for (int j = 0; j < FS_MAX_NODES; ++j)
+        if (j != id && nodes[j].used && nodes[j].type == FS_FILE && nodes[j].first_sector == nodes[id].first_sector &&
+            nodes[j].sector_count == nodes[id].sector_count && nodes[j].size == nodes[id].size) ++n;
+    return n;
+}
+static void propagate_extent(int self, const FsNode* old)
+{
+    if (old->sector_count == 0) return;
+    for (int j = 0; j < FS_MAX_NODES; ++j)
+    {
+        if (j == self || !nodes[j].used || nodes[j].type != FS_FILE) continue;
+        if (nodes[j].first_sector != old->first_sector || nodes[j].sector_count != old->sector_count || nodes[j].size != old->size) continue;
+        nodes[j].first_sector = nodes[self].first_sector;
+        nodes[j].sector_count = nodes[self].sector_count;
+        nodes[j].size = nodes[self].size;
+        nodes[j].mtime = nodes[self].mtime;
+        (void)save_inode(j);
+    }
+}
+
+/* ---- per-user quota (bytes of allocated sectors); limits live in /etc/quota ("uid bytes" lines), 0 = none ---- */
+#define QUOTA_MAX 16
+static uint32_t quota_uid[QUOTA_MAX]; static uint64_t quota_bytes[QUOTA_MAX]; static int quota_n = 0;
+static uint64_t quota_limit_for(uint32_t uid)
+{
+    for (int i = 0; i < quota_n; ++i) if (quota_uid[i] == uid) return quota_bytes[i];
+    return 0;
+}
+static uint64_t usage_of_uid(uint32_t uid)
+{
+    uint64_t sectors = 0;
+    for (int i = 0; i < FS_MAX_NODES; ++i)
+    {
+        if (!nodes[i].used || nodes[i].uid != uid || nodes[i].sector_count == 0) continue;
+        int dup = 0;
+        for (int j = 0; j < i; ++j) if (nodes[j].used && nodes[j].type == FS_FILE && nodes[i].type == FS_FILE && nodes[j].first_sector == nodes[i].first_sector && nodes[j].sector_count == nodes[i].sector_count) { dup = 1; break; }
+        if (!dup) sectors += nodes[i].sector_count;
+    }
+    return sectors * FS_SECTOR_SIZE;
+}
+
 int fs_write_data(const char* path, int cwd, const uint8_t* data, uint64_t size)
 {
     FS_RW_CHECK();
@@ -1197,6 +1368,20 @@ int fs_write_data(const char* path, int cwd, const uint8_t* data, uint64_t size)
 
     FsNode old; copy_node(&old, &nodes[id]);
     uint32_t need = (uint32_t)((size + FS_SECTOR_SIZE - 1ULL) / FS_SECTOR_SIZE);
+    if (current_uid != 0U)
+    {
+        uint64_t lim = quota_limit_for(current_uid);
+        if (lim)
+        {
+            uint64_t used = usage_of_uid(current_uid);
+            uint64_t mine = (nodes[id].uid == current_uid) ? (uint64_t)old.sector_count * FS_SECTOR_SIZE : 0;
+            if (used - (mine < used ? mine : used) + (uint64_t)need * FS_SECTOR_SIZE > lim)
+            {
+                if (created) { clear_bytes(&nodes[id], sizeof(nodes[id])); (void)save_inode(id); }
+                return -122;                                   /* EDQUOT */
+            }
+        }
+    }
     uint64_t new_first = 0;
     if (alloc_contiguous(need, &new_first) != 0)
         return -3;
@@ -1241,6 +1426,8 @@ int fs_write_data(const char* path, int cwd, const uint8_t* data, uint64_t size)
         (void)write_bitmap();
         return -5;
     }
+
+    propagate_extent(id, &old);                             /* hard links follow the new extent */
 
     /* Publish allocation before releasing the old extent. */
     if (write_bitmap() != 0)
@@ -1367,6 +1554,7 @@ int fs_rm(const char* path, int cwd)
     int id = fs_resolve_nofollow(path, cwd);
     if (id < 0) return -1;
     if (id == root_id) return -3;
+    if (nodes[id].mount_ctx > 0) return -16;                   /* a filesystem is mounted here */
     if (fs_parent_writable(id) != 0) return -13;
     if (nodes[id].type == FS_DIR)
     {
@@ -1384,7 +1572,8 @@ int fs_rm(const char* path, int cwd)
         return -4;
     }
 
-    free_sectors(old.first_sector, old.sector_count);
+    if (!(old.type == FS_FILE && extent_shared_with_others(id, old.first_sector, old.sector_count)))
+        free_sectors(old.first_sector, old.sector_count);
     if (write_bitmap() != 0)
         return -5;
 
@@ -1395,6 +1584,7 @@ static int rm_node_recursive(int id)
 {
     if (id < 0 || id >= FS_MAX_NODES || !nodes[id].used) return -1;
     if (id == root_id) return -3;
+    if (nodes[id].mount_ctx > 0) return -16;
     if (fs_parent_writable(id) != 0) return -13;
     if (nodes[id].type == FS_DIR && fs_check_access(id, FS_ACCESS_WRITE | FS_ACCESS_EXEC) != 0) return -13;
 
@@ -1413,7 +1603,8 @@ static int rm_node_recursive(int id)
     FsNode old; copy_node(&old, &nodes[id]);
     clear_bytes(&nodes[id], sizeof(nodes[id]));
     if (save_inode(id) != 0) { copy_node(&nodes[id], &old); return -4; }
-    free_sectors(old.first_sector, old.sector_count);
+    if (!(old.type == FS_FILE && extent_shared_with_others(id, old.first_sector, old.sector_count)))
+        free_sectors(old.first_sector, old.sector_count);
     if (write_bitmap() != 0) return -5;
     return storage_flush();
 }
@@ -1679,3 +1870,510 @@ int fs_set_mode_path(const char* path, int cwd, uint32_t mode)
 }
 
 int fs_persistent() { return mounted; }
+
+
+/* hard link: linkpath becomes another name for the data of target (same extent) */
+int fs_link_hard(const char* target, const char* linkpath, int cwd)
+{
+    FS_RW_CHECK();
+    FsTx fs_tx_scope;
+    int src = fs_resolve(target, cwd);
+    if (src < 0) return -2;
+    if (nodes[src].type != FS_FILE) return -21;                 /* directories and symlinks cannot be hard-linked */
+    if (nodes[src].sector_count == 0) return -22;               /* empty files have no extent to share */
+    if (fs_check_access(src, FS_ACCESS_READ) != 0) return -13;
+    if (fs_resolve_nofollow(linkpath, cwd) >= 0) return -17;
+    int id = create_path(linkpath, cwd, FS_FILE);
+    if (id < 0) return id;
+    nodes[id].size = nodes[src].size;
+    nodes[id].first_sector = nodes[src].first_sector;
+    nodes[id].sector_count = nodes[src].sector_count;
+    nodes[id].mode = nodes[src].mode;
+    nodes[id].uid = nodes[src].uid;
+    nodes[id].gid = nodes[src].gid;
+    nodes[id].mtime = nodes[src].mtime;
+    if (save_inode(id) != 0) { clear_bytes(&nodes[id], sizeof(nodes[id])); (void)save_inode(id); return -5; }
+    return id;
+}
+int fs_link_count(int id)
+{
+    if (id < 0 || id >= FS_MAX_NODES || !nodes[id].used) return 0;
+    return link_count_of(id);
+}
+
+/* consistency check; repair rewrites the allocation bitmap from the inode table */
+int fs_fsck(int repair, FsckInfo* out)
+{
+    if (!out) return -22;
+    clear_bytes(out, sizeof(*out));
+    if (repair) { FS_RW_CHECK(); }
+    for (int i = 0; i < FS_MAX_NODES; ++i)
+    {
+        if (!nodes[i].used) continue;
+        ++out->inodes;
+        if (nodes[i].type == FS_DIR) ++out->dirs;
+        else if (nodes[i].type == FS_SYMLINK) ++out->symlinks;
+        else { ++out->files; if (link_count_of(i) > 1) ++out->hardlinks; }
+    }
+    out->structure_ok = validate_mounted_fs();
+    static uint8_t saved[FS_MAX_BITMAP_BYTES];
+    uint64_t nbytes = (disk_sectors + 7ULL) / 8ULL; if (nbytes > sizeof(saved)) nbytes = sizeof(saved);
+    for (uint64_t i = 0; i < nbytes; ++i) saved[i] = bitmap[i];
+    if (rebuild_bitmap_from_inodes() != 0)
+    {
+        for (uint64_t i = 0; i < nbytes; ++i) bitmap[i] = saved[i];
+        out->bitmap_ok = 0; out->structure_ok = 0;
+        return 0;
+    }
+    for (uint64_t sct = 0; sct < disk_sectors; ++sct)
+    {
+        int a = (saved[sct >> 3] >> (sct & 7)) & 1, b = bitmap_get(sct);
+        if (a && !b) ++out->leaked;
+        else if (!a && b) ++out->missing;
+        if (b) ++out->sectors_used;
+    }
+    out->bitmap_ok = out->leaked == 0 && out->missing == 0;
+    if (repair && !out->bitmap_ok)
+    {
+        FsTx fs_tx_scope;
+        if (write_bitmap() != 0) return -5;
+        out->repaired = 1;
+    }
+    else for (uint64_t i = 0; i < nbytes; ++i) bitmap[i] = saved[i];
+    return 0;
+}
+
+int fs_quota_set(uint32_t uid, uint64_t bytes)
+{
+    FS_RW_CHECK();
+    int slot = -1;
+    for (int i = 0; i < quota_n; ++i) if (quota_uid[i] == uid) slot = i;
+    if (slot < 0) { if (quota_n >= QUOTA_MAX) return -24; slot = quota_n++; quota_uid[slot] = uid; }
+    quota_bytes[slot] = bytes;
+    if (bytes == 0) { quota_uid[slot] = quota_uid[quota_n - 1]; quota_bytes[slot] = quota_bytes[quota_n - 1]; --quota_n; }
+    static char b[QUOTA_MAX * 32]; int p = 0;
+    for (int i = 0; i < quota_n; ++i)
+    {
+        char t[24]; int n = 0; uint64_t v = quota_uid[i]; do { t[n++] = (char)('0' + v % 10); v /= 10; } while (v);
+        while (n) b[p++] = t[--n];
+        b[p++] = ' ';
+        v = quota_bytes[i]; do { t[n++] = (char)('0' + v % 10); v /= 10; } while (v);
+        while (n) b[p++] = t[--n];
+        b[p++] = '\n';
+    }
+    uint32_t saved_uid = current_uid; current_uid = 0;
+    int rc = fs_write_data("/etc/quota", root_id, (const uint8_t*)b, (uint64_t)p);
+    current_uid = saved_uid;
+    return rc < 0 ? rc : 0;
+}
+int fs_quota_get(uint32_t uid, uint64_t* limit, uint64_t* used)
+{
+    if (limit) *limit = quota_limit_for(uid);
+    if (used) *used = usage_of_uid(uid);
+    return 0;
+}
+static void quota_load()
+{
+    static uint8_t b[QUOTA_MAX * 32 + 8]; uint64_t sz = 0; quota_n = 0;
+    if (fs_read_file("/etc/quota", root_id, b, sizeof(b) - 1, &sz) != 0) return;
+    uint64_t i = 0;
+    while (i < sz && quota_n < QUOTA_MAX)
+    {
+        uint64_t u = 0, v = 0;
+        while (i < sz && b[i] >= '0' && b[i] <= '9') u = u * 10 + (b[i++] - '0');
+        if (i < sz && b[i] == ' ') ++i;
+        while (i < sz && b[i] >= '0' && b[i] <= '9') v = v * 10 + (b[i++] - '0');
+        while (i < sz && b[i] != '\n') ++i;
+        ++i;
+        if (v) { quota_uid[quota_n] = (uint32_t)u; quota_bytes[quota_n] = v; ++quota_n; }
+    }
+}
+
+/* ============================================================================================
+   Public API with multi-mount support.
+   Global node id = (mount index << 12) | local inode index (mount 0 = root, so root ids are unchanged).
+   Path functions first walk the path to the mount that holds it (crossing mount points and '..'
+   back out of them), then call the single-mount implementation on that mount.
+   ============================================================================================ */
+#undef fs_check_access_as
+#undef fs_check_access
+#undef fs_init
+#undef fs_get_root
+#undef fs_resolve
+#undef fs_resolve_nofollow
+#undef fs_symlink
+#undef fs_readlink
+#undef fs_link_target_of
+#undef fs_set_readonly
+#undef fs_is_readonly
+#undef fs_sync
+#undef fs_journal_status
+#undef fs_journal_crash_test
+#undef fs_mkdir
+#undef fs_touch
+#undef fs_mkdir_p
+#undef fs_write_data
+#undef fs_write
+#undef fs_read_file
+#undef fs_read_file_for_update
+#undef fs_cat
+#undef fs_cat_numbered
+#undef fs_rm
+#undef fs_rm_recursive
+#undef fs_rename
+#undef fs_file_size
+#undef fs_get_type
+#undef fs_get_name
+#undef fs_get_parent
+#undef fs_get_child_count
+#undef fs_get_child
+#undef fs_get_mode
+#undef fs_get_mtime
+#undef fs_get_uid
+#undef fs_get_gid
+#undef fs_set_mode
+#undef fs_set_owner
+#undef fs_set_owner_path
+#undef fs_stat_path
+#undef fs_truncate
+#undef fs_total_sectors
+#undef fs_used_sectors
+#undef fs_set_mode_path
+#undef fs_persistent
+#undef fs_link_hard
+#undef fs_link_count
+#undef fs_fsck
+#undef fs_quota_set
+#undef fs_quota_get
+
+#undef nodes
+#undef bitmap
+#undef legacy_metadata
+#undef disk_sectors
+#undef root_id
+#undef mounted
+#undef node_count
+#undef g_inode_sectors
+#undef g_bitmap_start
+#undef g_data_start
+#undef g_version
+#undef jnl_enabled
+#undef fs_ro
+#undef jnl_seq
+static int enc(int c, int l) { return l < 0 ? l : ((c << 12) | l); }
+static int gid_ok(int g) { if (g < 0) return 0; int c = g >> 12; return c < FS_MAX_CTX && ctxs[c].inuse; }
+static void act(int c) { cur = &ctxs[c]; }
+
+struct Route { int ctx; int cwd; const char* rest; char buf[200]; };
+
+static void route(const char* path, int cwd_gid, Route* r, int cross_last)
+{
+    int c = 0, loc = cwd_gid;
+    if (cwd_gid >= 0) { if (gid_ok(cwd_gid)) { c = cwd_gid >> 12; loc = cwd_gid & 0xFFF; } else { c = 0; loc = -1; } }
+    r->rest = path;
+    if (!path) { act(c); r->ctx = c; r->cwd = loc; return; }
+    if (path[0] == '/') { c = 0; loc = 0; }
+    act(c);
+    r->ctx = c; r->cwd = loc;
+    if (loc < 0) return;
+    if (str_len(path) >= (int)sizeof(r->buf)) return;                 /* too long: leave it to the implementation */
+    char* b = r->buf;
+    str_copy(b, path, sizeof(r->buf));
+    int n = str_len(b);
+    while (n > 0 && b[n - 1] == '/') b[--n] = 0;
+    int i = 0;
+    for (;;)
+    {
+        while (b[i] == '/') ++i;
+        if (!b[i]) { r->rest = b + i; break; }
+        int st = i;
+        while (b[i] && b[i] != '/') ++i;
+        int ce = i;
+        int k = i; while (b[k] == '/') ++k;
+        int more = b[k] != 0;
+        char save = b[ce]; b[ce] = 0;
+        const char* comp = b + st;
+        int is_dot = comp[0] == '.' && comp[1] == 0;
+        int is_dd = comp[0] == '.' && comp[1] == '.' && comp[2] == 0;
+        int stop = 0;
+        if (is_dot) { }
+        else if (is_dd)
+        {
+            if (fs_check_access_impl(loc, FS_ACCESS_EXEC) != 0) stop = 1;
+            else if (loc == 0)
+            {
+                if (c > 0)
+                {
+                    int pc = ctxs[c].mp_ctx, pl = ctxs[c].mp_local;
+                    c = pc; act(c); loc = pl;
+                    if (loc != 0 && cur->nodes[loc].parent >= 0) loc = cur->nodes[loc].parent;
+                }
+            }
+            else if (cur->nodes[loc].parent >= 0) loc = cur->nodes[loc].parent;
+        }
+        else
+        {
+            if (fs_check_access_impl(loc, FS_ACCESS_EXEC) != 0) stop = 1;
+            else
+            {
+                int ch = find_child(loc, comp);
+                if (ch < 0) stop = 1;
+                else if (cur->nodes[ch].mount_ctx > 0 && (more || cross_last)) { c = cur->nodes[ch].mount_ctx; act(c); loc = 0; }
+                else if (!more) stop = 1;
+                else if (cur->nodes[ch].type != FS_DIR) stop = 1;
+                else loc = ch;
+            }
+        }
+        b[ce] = save;
+        if (stop) { r->rest = b + st; break; }
+    }
+    r->ctx = c; r->cwd = loc;
+}
+
+/* path of directory `loc` inside mount c, from that mount's root (no leading mount prefix) */
+static void ctx_rel_path(int c, int loc, char* out, int cap)
+{
+    act(c);
+    char parts[12][FS_NAME_SIZE]; int n = 0;
+    while (loc > 0 && n < 12 && cur->nodes[loc].used) { str_copy(parts[n++], cur->nodes[loc].name, FS_NAME_SIZE); loc = cur->nodes[loc].parent; }
+    int p = 0;
+    out[p++] = '/';
+    for (int i = n - 1; i >= 0 && p < cap - 2; --i)
+    {
+        for (const char* q = parts[i]; *q && p < cap - 2; ++q) out[p++] = *q;
+        if (i > 0) out[p++] = '/';
+    }
+    out[p] = 0;
+}
+
+int fs_check_access_as(int id, uint32_t uid, uint32_t gid, uint32_t requested)
+{ if (!gid_ok(id)) return -2; act(id >> 12); return fs_check_access_as_impl(id & 0xFFF, uid, gid, requested); }
+int fs_check_access(int id, uint32_t requested) { return fs_check_access_as(id, current_uid, current_gid, requested); }
+int fs_get_root() { return 0; }
+int fs_resolve(const char* path, int cwd) { Route r; route(path, cwd, &r, 1); int v = fs_resolve_impl(r.rest, r.cwd); return enc(r.ctx, v); }
+int fs_resolve_nofollow(const char* path, int cwd) { Route r; route(path, cwd, &r, 1); int v = fs_resolve_nofollow_impl(r.rest, r.cwd); return enc(r.ctx, v); }
+int fs_symlink(const char* target, const char* linkpath, int cwd) { Route r; route(linkpath, cwd, &r, 0); int v = fs_symlink_impl(target, r.rest, r.cwd); return enc(r.ctx, v); }
+int fs_readlink(const char* path, int cwd, char* out, int cap) { Route r; route(path, cwd, &r, 1); return fs_readlink_impl(r.rest, r.cwd, out, cap); }
+int fs_link_target_of(int id, char* out, int cap) { if (!gid_ok(id)) return -1; act(id >> 12); return fs_link_target_of_impl(id & 0xFFF, out, cap); }
+void fs_set_readonly(int ro) { act(0); fs_set_readonly_impl(ro); }
+int fs_is_readonly() { act(0); return fs_is_readonly_impl(); }
+int fs_sync()
+{
+    int rc = 0;
+    for (int c = 0; c < FS_MAX_CTX; ++c) if (ctxs[c].inuse) { act(c); int r = fs_sync_impl(); if (r != 0) rc = r; }
+    act(0);
+    return rc;
+}
+void fs_journal_status(FsJournalInfo* out) { act(0); fs_journal_status_impl(out); }
+int fs_journal_crash_test(const char* path, int cwd) { Route r; route(path, cwd, &r, 0); return fs_journal_crash_test_impl(r.rest, r.cwd); }
+int fs_mkdir(const char* path, int cwd) { Route r; route(path, cwd, &r, 0); int v = fs_mkdir_impl(r.rest, r.cwd); return enc(r.ctx, v); }
+int fs_touch(const char* path, int cwd) { Route r; route(path, cwd, &r, 0); int v = fs_touch_impl(r.rest, r.cwd); return enc(r.ctx, v); }
+int fs_mkdir_p(const char* path, int cwd) { Route r; route(path, cwd, &r, 0); int v = fs_mkdir_p_impl(r.rest, r.cwd); return enc(r.ctx, v); }
+int fs_write_data(const char* path, int cwd, const uint8_t* data, uint64_t size) { Route r; route(path, cwd, &r, 0); return fs_write_data_impl(r.rest, r.cwd, data, size); }
+int fs_write(const char* path, int cwd, const char* content) { Route r; route(path, cwd, &r, 0); return fs_write_impl(r.rest, r.cwd, content); }
+int fs_read_file(const char* path, int cwd, uint8_t* buffer, uint64_t capacity, uint64_t* out_size) { Route r; route(path, cwd, &r, 1); return fs_read_file_impl(r.rest, r.cwd, buffer, capacity, out_size); }
+int fs_read_file_for_update(const char* path, int cwd, uint8_t* buffer, uint64_t capacity, uint64_t* out_size) { Route r; route(path, cwd, &r, 1); return fs_read_file_for_update_impl(r.rest, r.cwd, buffer, capacity, out_size); }
+int fs_cat(const char* path, int cwd) { Route r; route(path, cwd, &r, 1); return fs_cat_impl(r.rest, r.cwd); }
+int fs_cat_numbered(const char* path, int cwd) { Route r; route(path, cwd, &r, 1); return fs_cat_numbered_impl(r.rest, r.cwd); }
+int fs_rm(const char* path, int cwd) { Route r; route(path, cwd, &r, 1); return fs_rm_impl(r.rest, r.cwd); }
+int fs_rm_recursive(const char* path, int cwd) { Route r; route(path, cwd, &r, 1); return fs_rm_recursive_impl(r.rest, r.cwd); }
+int fs_rename(const char* from, const char* to, int cwd)
+{
+    Route a, b;
+    route(from, cwd, &a, 1);
+    route(to, cwd, &b, 0);
+    if (a.ctx != b.ctx) return -18;                              /* EXDEV: different filesystems (cp + rm instead) */
+    if (!a.rest || !b.rest) { act(a.ctx); return fs_rename_impl(a.rest, b.rest, a.cwd); }
+    char fa[200], fb[200], da[200], db[200];
+    ctx_rel_path(a.ctx, a.cwd, da, sizeof(da));
+    ctx_rel_path(b.ctx, b.cwd, db, sizeof(db));
+    int p = 0; for (const char* q = da; *q && p < 150; ++q) fa[p++] = *q;
+    if (p > 1 && a.rest[0]) fa[p++] = '/';
+    for (const char* q = a.rest; *q && p < 198; ++q) fa[p++] = *q;
+    fa[p] = 0;
+    p = 0; for (const char* q = db; *q && p < 150; ++q) fb[p++] = *q;
+    if (p > 1 && b.rest[0]) fb[p++] = '/';
+    for (const char* q = b.rest; *q && p < 198; ++q) fb[p++] = *q;
+    fb[p] = 0;
+    act(a.ctx);
+    return fs_rename_impl(fa, fb, 0);
+}
+uint64_t fs_file_size(int id) { if (!gid_ok(id)) return 0; act(id >> 12); return fs_file_size_impl(id & 0xFFF); }
+int fs_get_type(int id) { if (!gid_ok(id)) return -1; act(id >> 12); return fs_get_type_impl(id & 0xFFF); }
+const char* fs_get_name(int id)
+{
+    if (!gid_ok(id)) return "";
+    int c = id >> 12;
+    if ((id & 0xFFF) == 0 && c > 0) { act(ctxs[c].mp_ctx); return fs_get_name_impl(ctxs[c].mp_local); }
+    act(c); return fs_get_name_impl(id & 0xFFF);
+}
+int fs_get_parent(int id)
+{
+    if (!gid_ok(id)) return -1;
+    int c = id >> 12;
+    if ((id & 0xFFF) == 0 && c > 0) return enc(ctxs[c].mp_ctx, ctxs[c].mp_local);
+    act(c); return enc(c, fs_get_parent_impl(id & 0xFFF));
+}
+int fs_get_child_count(int id) { if (!gid_ok(id)) return 0; act(id >> 12); return fs_get_child_count_impl(id & 0xFFF); }
+int fs_get_child(int id, int index) { if (!gid_ok(id)) return -1; act(id >> 12); return enc(id >> 12, fs_get_child_impl(id & 0xFFF, index)); }
+uint32_t fs_get_mode(int id) { if (!gid_ok(id)) return 0; act(id >> 12); return fs_get_mode_impl(id & 0xFFF); }
+uint64_t fs_get_mtime(int id) { if (!gid_ok(id)) return 0; act(id >> 12); return fs_get_mtime_impl(id & 0xFFF); }
+uint32_t fs_get_uid(int id) { if (!gid_ok(id)) return 0; act(id >> 12); return fs_get_uid_impl(id & 0xFFF); }
+uint32_t fs_get_gid(int id) { if (!gid_ok(id)) return 0; act(id >> 12); return fs_get_gid_impl(id & 0xFFF); }
+int fs_set_mode(int id, uint32_t mode) { if (!gid_ok(id)) return -1; act(id >> 12); return fs_set_mode_impl(id & 0xFFF, mode); }
+int fs_set_owner(int id, uint32_t uid, uint32_t gid) { if (!gid_ok(id)) return -1; act(id >> 12); return fs_set_owner_impl(id & 0xFFF, uid, gid); }
+int fs_set_owner_path(const char* path, int cwd, uint32_t uid, uint32_t gid) { Route r; route(path, cwd, &r, 1); return fs_set_owner_path_impl(r.rest, r.cwd, uid, gid); }
+int fs_stat_path(const char* path, int cwd, FsStat* out) { Route r; route(path, cwd, &r, 1); return fs_stat_path_impl(r.rest, r.cwd, out); }
+int fs_truncate(const char* path, int cwd, uint64_t size) { Route r; route(path, cwd, &r, 0); return fs_truncate_impl(r.rest, r.cwd, size); }
+uint64_t fs_total_sectors() { act(0); return fs_total_sectors_impl(); }
+uint64_t fs_used_sectors() { act(0); return fs_used_sectors_impl(); }
+int fs_set_mode_path(const char* path, int cwd, uint32_t mode) { Route r; route(path, cwd, &r, 1); return fs_set_mode_path_impl(r.rest, r.cwd, mode); }
+int fs_persistent() { return ctxs[0].mounted; }
+void fs_init() { fs_init_impl(); act(0); }
+
+int fs_link_hard(const char* target, const char* linkpath, int cwd)
+{
+    Route a, b; route(target, cwd, &a, 1); route(linkpath, cwd, &b, 0);
+    if (a.ctx != b.ctx) return -18;
+    if (!a.rest || !b.rest) return -22;
+    char fa[200], fb[200], da[200], db[200];
+    ctx_rel_path(a.ctx, a.cwd, da, sizeof(da)); ctx_rel_path(b.ctx, b.cwd, db, sizeof(db));
+    int p = 0; for (const char* q = da; *q && p < 150; ++q) fa[p++] = *q;
+    if (p > 1 && a.rest[0]) fa[p++] = '/';
+    for (const char* q = a.rest; *q && p < 198; ++q) fa[p++] = *q;
+    fa[p] = 0;
+    p = 0; for (const char* q = db; *q && p < 150; ++q) fb[p++] = *q;
+    if (p > 1 && b.rest[0]) fb[p++] = '/';
+    for (const char* q = b.rest; *q && p < 198; ++q) fb[p++] = *q;
+    fb[p] = 0;
+    act(a.ctx);
+    int v = fs_link_hard_impl(fa, fb, 0);
+    return enc(a.ctx, v);
+}
+int fs_link_count(int id) { if (!gid_ok(id)) return 0; act(id >> 12); return fs_link_count_impl(id & 0xFFF); }
+int fs_fsck(const char* path, int cwd, int repair, FsckInfo* out)
+{
+    int c = 0;
+    if (path && path[0]) { Route r; route(path, cwd, &r, 1); if (r.cwd != 0 || (r.rest && r.rest[0])) { act(0); return -22; } c = r.ctx; }
+    act(c); int rc = fs_fsck_impl(repair, out); act(0); return rc;
+}
+int fs_quota_set(uint32_t uid, uint64_t bytes) { act(0); return fs_quota_set_impl(uid, bytes); }
+int fs_quota_get(uint32_t uid, uint64_t* limit, uint64_t* used) { act(0); return fs_quota_get_impl(uid, limit, used); }
+
+/* ---- mount management ---- */
+static void gid_path(int gid, char* out, int cap)
+{
+    char parts[12][FS_NAME_SIZE]; int n = 0;
+    while (gid >= 0 && gid != 0 && n < 12) { str_copy(parts[n++], fs_get_name(gid), FS_NAME_SIZE); gid = fs_get_parent(gid); }
+    int p = 0; out[p++] = '/';
+    for (int i = n - 1; i >= 0 && p < cap - 2; --i) { for (const char* q = parts[i]; *q && p < cap - 2; ++q) out[p++] = *q; if (i > 0) out[p++] = '/'; }
+    out[p] = 0;
+}
+
+static int dev_in_use(int dev) { for (int c = 0; c < FS_MAX_CTX; ++c) if (ctxs[c].inuse && ctxs[c].dev == dev) return 1; return 0; }
+
+int fs_mount_count() { int n = 0; for (int c = 0; c < FS_MAX_CTX; ++c) if (ctxs[c].inuse) ++n; return n; }
+
+int fs_mount_info(int index, FsMountInfo* out)
+{
+    if (!out) return -22;
+    int n = 0;
+    for (int c = 0; c < FS_MAX_CTX; ++c)
+    {
+        if (!ctxs[c].inuse) continue;
+        if (n++ != index) continue;
+        out->dev = ctxs[c].dev; out->readonly = ctxs[c].fs_ro; out->journal = ctxs[c].jnl_enabled; out->version = (int)ctxs[c].g_version;
+        out->total_sectors = ctxs[c].disk_sectors;
+        act(c); out->used_sectors = fs_used_sectors_impl(); act(0);
+        if (c == 0) { out->dir[0] = '/'; out->dir[1] = 0; }
+        else gid_path(enc(ctxs[c].mp_ctx, ctxs[c].mp_local), out->dir, sizeof(out->dir));
+        return 0;
+    }
+    return -1;
+}
+
+int fs_mount_device(int dev, const char* path, int cwd, int readonly, int format_fresh)
+{
+    if (dev < 0 || !path) return -22;
+    if (dev_in_use(dev)) return -16;
+    if (!storage_dev_sectors) return -19;
+    uint64_t cap = storage_dev_sectors(dev);
+    if (cap == 0) return -19;
+    Route r; route(path, cwd, &r, 1);
+    int pc = r.ctx, node;
+    act(pc);
+    if (!r.rest || !r.rest[0]) node = r.cwd;
+    else node = find_child(r.cwd, r.rest);
+    if (node < 0 || !cur->nodes[node].used) return -2;
+    if (cur->nodes[node].type != FS_DIR) return -20;
+    if (cur->nodes[node].mount_ctx > 0 || (node == 0 && pc > 0)) return -16;
+    int slot = -1;
+    for (int c = 1; c < FS_MAX_CTX; ++c) if (!ctxs[c].inuse) { slot = c; break; }
+    if (slot < 0) return -24;
+    clear_bytes(&ctxs[slot], sizeof(ctxs[slot]));
+    ctxs[slot].inuse = 1; ctxs[slot].dev = dev; ctxs[slot].fs_ro = readonly ? 1 : 0;
+    ctxs[slot].mp_ctx = pc; ctxs[slot].mp_local = node;
+    ctxs[slot].quiet = (dev == 1 || dev == 5);
+    ctxs[slot].no_journal = (dev == 1 || dev == 5);
+    ctxs[slot].fmt_sectors = cap > FS_DEFAULT_DISK_SECTORS ? FS_DEFAULT_DISK_SECTORS : cap;
+    act(slot);
+    set_layout(FS_VERSION);
+    int rc;
+    if (format_fresh)
+    {
+        int saved_ro = cur->fs_ro; cur->fs_ro = 0;
+        rc = format_fs();
+        if (rc == 0 && ctxs[slot].quiet) { cur->nodes[0].mode = 0777U; (void)save_inode(0); }
+        cur->fs_ro = saved_ro;
+    }
+    else rc = mount_current(0);
+    if (rc != 0 || !cur->mounted)
+    {
+        clear_bytes(&ctxs[slot], sizeof(ctxs[slot]));
+        act(0);
+        return rc != 0 ? rc : -10;
+    }
+    act(pc);
+    cur->nodes[node].mount_ctx = slot;
+    act(0);
+    return 0;
+}
+
+int fs_mkfs_device(int dev)
+{
+    if (dev <= 0 || !storage_dev_sectors) return -22;
+    if (dev_in_use(dev)) return -16;
+    uint64_t cap = storage_dev_sectors(dev);
+    if (cap == 0) return -19;
+    int slot = -1;
+    for (int c = 1; c < FS_MAX_CTX; ++c) if (!ctxs[c].inuse) { slot = c; break; }
+    if (slot < 0) return -24;
+    clear_bytes(&ctxs[slot], sizeof(ctxs[slot]));
+    ctxs[slot].inuse = 1; ctxs[slot].dev = dev; ctxs[slot].quiet = 1;
+    ctxs[slot].no_journal = (dev == 1 || dev == 5);
+    ctxs[slot].fmt_sectors = cap > FS_DEFAULT_DISK_SECTORS ? FS_DEFAULT_DISK_SECTORS : cap;
+    ctxs[slot].mp_ctx = -1; ctxs[slot].mp_local = -1;
+    act(slot);
+    set_layout(FS_VERSION);
+    int rc = format_fs();
+    if (rc == 0) (void)storage_flush();
+    clear_bytes(&ctxs[slot], sizeof(ctxs[slot]));
+    act(0);
+    return rc;
+}
+
+/* unmount the filesystem cur->mounted at `path` (the path must be the mount's root directory) */
+int fs_umount_path(const char* path, int cwd, int busy_gid)
+{
+    Route r; route(path, cwd, &r, 1);
+    int c = r.ctx;
+    if (c == 0 || r.cwd != 0 || (r.rest && r.rest[0])) { act(0); return -22; }
+    if (busy_gid >= 0 && (busy_gid >> 12) == c) { act(0); return -16; }
+    for (int k = 1; k < FS_MAX_CTX; ++k) if (ctxs[k].inuse && ctxs[k].mp_ctx == c) { act(0); return -16; }
+    act(c); (void)fs_sync_impl();
+    int pc = ctxs[c].mp_ctx, pl = ctxs[c].mp_local;
+    act(pc); cur->nodes[pl].mount_ctx = 0;
+    clear_bytes(&ctxs[c], sizeof(ctxs[c]));
+    act(0);
+    return 0;
+}

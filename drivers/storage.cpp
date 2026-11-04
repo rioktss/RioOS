@@ -76,3 +76,52 @@ void storage_status()
         default: virtio_blk_status(); break;
     }
 }
+
+/* ---- secondary devices for the multi-mount VFS ----
+   1 = RAM disk 0, 5 = RAM disk 1 (tmpfs), 3 = NVMe, 4 = AHCI/SATA (the last two only when they are not the root disk). */
+#define RAMDISK_SECTORS 4096
+static uint8_t ramdisk[2][RAMDISK_SECTORS * 512] __attribute__((aligned(16)));
+static int ram_index(int dev) { return dev == 1 ? 0 : dev == 5 ? 1 : -1; }
+
+uint64_t storage_dev_sectors(int dev)
+{
+    if (ram_index(dev) >= 0) return RAMDISK_SECTORS;
+    if (dev == 3) return (backend != BK_NVME && nvme_ready()) ? nvme_capacity() : 0;
+    if (dev == 4) return (backend != BK_AHCI && ahci_ready()) ? ahci_capacity() : 0;
+    return 0;
+}
+
+int storage_dev_read(int dev, uint64_t sector, void* buffer)
+{
+    int r = ram_index(dev);
+    if (r >= 0)
+    {
+        if (sector >= RAMDISK_SECTORS) return -1;
+        const uint8_t* src = &ramdisk[r][sector * 512]; uint8_t* d = (uint8_t*)buffer;
+        for (int i = 0; i < 512; ++i) d[i] = src[i];
+        return 0;
+    }
+    if (!storage_dev_sectors(dev)) return -1;
+    return dev == 3 ? nvme_read(sector, buffer) : ahci_read(sector, buffer);
+}
+
+int storage_dev_write(int dev, uint64_t sector, const void* buffer)
+{
+    int r = ram_index(dev);
+    if (r >= 0)
+    {
+        if (sector >= RAMDISK_SECTORS) return -1;
+        uint8_t* dst = &ramdisk[r][sector * 512]; const uint8_t* s = (const uint8_t*)buffer;
+        for (int i = 0; i < 512; ++i) dst[i] = s[i];
+        return 0;
+    }
+    if (!storage_dev_sectors(dev)) return -1;
+    return dev == 3 ? nvme_write(sector, buffer) : ahci_write(sector, buffer);
+}
+
+int storage_dev_flush(int dev)
+{
+    if (ram_index(dev) >= 0) return 0;
+    if (!storage_dev_sectors(dev)) return -1;
+    return dev == 3 ? nvme_flush() : ahci_flush();
+}

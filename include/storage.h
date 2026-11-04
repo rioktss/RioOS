@@ -11,4 +11,10 @@ int storage_flush();
 void storage_status();
 int storage_backend();   /* 0 none, 1 virtio-blk, 2 NVMe, 3 AHCI */
 
+/* secondary devices: 1/5 = RAM disks, 3 = NVMe, 4 = AHCI (non-root); capacity 0 = absent */
+uint64_t storage_dev_sectors(int dev);
+int storage_dev_read(int dev, uint64_t sector, void* buffer);
+int storage_dev_write(int dev, uint64_t sector, const void* buffer);
+int storage_dev_flush(int dev);
+
 #endif

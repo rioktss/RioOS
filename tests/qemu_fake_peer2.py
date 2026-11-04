@@ -44,6 +44,12 @@ def dhcp(req):
     global dhcp_done
     if rt==5: dhcp_done=True
 dhcp_done=False
+def ntp(f):
+    ip=f[14:34]; u=f[34:]; sp=struct.unpack('!H',u[:2])[0]
+    r=bytearray(48); r[0]=0x24; r[1]=2
+    struct.pack_into('!I',r,40,1893456000+2208988800)
+    pl=struct.pack('!HHHH',123,sp,8+48,0)+bytes(r)
+    send(eth(f[6:12],0x800,ip4(PIP,ip[12:16],17,pl))); log('ntp: reply')
 # tcp server: 8081 = HTTP (wget), 2323 = banner+echo (nc/telnet); other ports answer RST
 C={}
 def ts(kp,seq,ack,fl,dst_port,data=b''):
@@ -71,9 +77,20 @@ def tcp_in(f):
         elif dp==8081:
             c['req']+=data
             ts(sp,c['nxt'],c['ack'],0x10,dp)
-            if b'\r\n\r\n' in c['req']:
-                body=b'wget-body-ok\n'
-                resp=b'HTTP/1.0 200 OK\r\nContent-Length: %d\r\n\r\n'%len(body)+body
+            hd,sep,bd=c['req'].partition(b'\r\n\r\n')
+            cl=0
+            for ln in hd.split(b'\r\n')[1:]:
+                if ln.lower().startswith(b'content-length:'): cl=int(ln.split(b':')[1])
+            if sep and len(bd)>=cl:
+                rl=hd.split(b'\r\n')[0].split(b' ')
+                meth,path=rl[0],rl[1]
+                if path==b'/redir': st=b'302 Found'; extra=b'Location: /final\r\n'; body=b'moved\n'
+                elif path==b'/final': st=b'200 OK'; extra=b''; body=b'final-ok\n'
+                elif path==b'/missing': st=b'404 Not Found'; extra=b''; body=b'nope\n'
+                elif meth==b'POST': st=b'200 OK'; extra=b''; body=b'POST:'+bd+b'\n'
+                else: st=b'200 OK'; extra=b''; body=b'wget-body-ok\n'
+                if b'X-Test: 42' in hd: body=b'hdr-seen\n'
+                resp=b'HTTP/1.0 '+st+b'\r\n'+extra+b'Content-Length: %d\r\n\r\n'%len(body)+(b'' if meth==b'HEAD' else body)
                 ts(sp,c['nxt'],c['ack'],0x18,dp,resp); c['nxt']+=len(resp)
                 ts(sp,c['nxt'],c['ack'],0x11,dp); c['nxt']+=1; c['fin']=True
                 log('tcp: http served',repr(c['req'][:20]))
@@ -97,6 +114,7 @@ def v6pkt(dstmac,src,dst,msg,hop=255):
     return eth(dstmac,0x86dd,h+m)
 PLL=bytes([0xfe,0x80,0,0,0,0,0,0,0x00,0,0,0xff,0xfe,0,0,1])
 def v6_in(f):
+    if f[14+6] in (6,17): v6_l4(f); return
     h=f[14:]; src=h[8:24]; dst=h[24:40]; m=h[40:]
     if m[0]==135 and m[8:24]==PLL:
         na=bytes([136,0,0,0,0x60,0,0,0])+PLL+bytes([2,1])+PM
@@ -105,6 +123,57 @@ def v6_in(f):
         send(v6pkt(f[6:12],PLL,src,bytes([129,0,0,0])+m[4:],64)); log('v6: echo request -> reply')
     elif m[0]==136: log('v6: NA from kernel',src.hex()); 
     elif m[0]==129: log('v6: echo reply from kernel')
+
+# ---- IPv6 UDP echo (5353) and TCP server (2323: banner + echo) ----
+def csum6(src,dst,nh,seg):
+    ps=src+dst+struct.pack('!IBBBB',len(seg),0,0,0,nh); return csum(ps+seg)
+def v6raw(dstmac,src,dst,nh,seg):
+    h=struct.pack('!IHBB',0x60000000,len(seg),nh,64)+src+dst
+    return eth(dstmac,0x86dd,h+seg)
+C6={}
+def t6(kp,dp,src,dst,seq,ack,fl,data=b''):
+    h=struct.pack('!HHIIBBHHH',dp,kp,seq,ack,0x50,fl,4096,0,0)+data
+    h=h[:16]+struct.pack('!H',csum6(src,dst,6,h[:16]+b'\0\0'+h[18:]))+h[18:]
+    send(v6raw(KM,src,dst,6,h))
+CL={'st':0,'sp':45000}
+def v6_l4(f):
+    h=f[14:]; nh=h[6]; src=h[8:24]; dst=h[24:40]; m=h[40:40+struct.unpack('!H',h[4:6])[0]]
+    if dst!=PLL: return
+    if nh==6 and struct.unpack('!H',m[2:4])[0]==CL['sp']:
+        sp,dp,seq,ack,off,fl=struct.unpack('!HHIIBB',m[:14])
+        if CL['st']==1 and fl&0x12==0x12:
+            msg=b'hello-v6-client\n'
+            t6(sp,dp,PLL,src,9001,seq+1,0x19,msg); CL['st']=2; log('v6tcp: client sent data+FIN')
+        elif CL['st']==2 and fl&1:
+            t6(sp,dp,PLL,src,9001+len(b'hello-v6-client\n')+1,seq+1+0,0x10); CL['st']=3; log('v6tcp: client done')
+        return
+    if nh==17:
+        sp,dp,ln,ck=struct.unpack('!HHHH',m[:8])
+        if dp==5353:
+            pl=b'UDP6:'+m[8:]
+            u=struct.pack('!HHHH',5353,sp,8+len(pl),0)+pl
+            u=u[:6]+struct.pack('!H',csum6(PLL,src,17,u[:6]+b'\0\0'+u[8:]) or 0xffff)+u[8:]
+            send(v6raw(KM,PLL,src,17,u)); log('v6udp: echo',repr(m[8:]))
+    elif nh==6:
+        sp,dp,seq,ack,off,fl=struct.unpack('!HHIIBB',m[:14]); data=m[(off>>4)*4:]
+        k=(sp,dp)
+        if fl&2 and not fl&0x10:
+            if dp!=2323: t6(sp,dp,PLL,src,0,seq+1,0x14); return
+            C6[k]={'nxt':7001,'ack':seq+1,'banner':False,'fin':False}
+            t6(sp,dp,PLL,src,7000,seq+1,0x12); log('v6tcp: SYN-ACK'); return
+        c=C6.get(k)
+        if not c: return
+        if data:
+            c['ack']=seq+len(data); out=b'ECHO6:'+data
+            t6(sp,dp,PLL,src,c['nxt'],c['ack'],0x18,out); c['nxt']+=len(out); log('v6tcp: echo',repr(data))
+        elif fl&0x10 and not fl&1 and not c['banner']:
+            c['banner']=True; bn=b'BANNER6 ready\r\n'
+            t6(sp,dp,PLL,src,c['nxt'],c['ack'],0x18,bn); c['nxt']+=len(bn); log('v6tcp: banner')
+        if fl&1:
+            c['ack']=seq+len(data)+1
+            t6(sp,dp,PLL,src,c['nxt'],c['ack'],0x11 if not c['fin'] else 0x10)
+            if not c['fin']: c['nxt']+=1; c['fin']=True
+            log('v6tcp: closed')
 KLL=None
 def kernel_ll(mac):
     return bytes([0xfe,0x80,0,0,0,0,0,0,mac[0]^2,mac[1],mac[2],0xff,0xfe,mac[3],mac[4],mac[5]])
@@ -141,6 +210,7 @@ while time.time()-t0<float(sys.argv[1]):
         elif ty==0x800:
             KM=f[6:12]
             if f[23]==17 and f[14+20+2:14+20+4]==b'\0\x43': dhcp(f)
+            elif f[23]==17 and f[14+20+2:14+20+4]==b'\0\x7b': ntp(f)
             elif f[23]==6: tcp_in(f)
             elif f[23]==1: 
                 ic=f[34:]; 
@@ -151,6 +221,8 @@ while time.time()-t0<float(sys.argv[1]):
             KM=f[6:12]; KLL=kernel_ll(f[6:12]) if True else None
             v6_in(f)
     now=time.time()
+    if KLL and KM and CL['st'] in (0,1) and now-CL.get('last',0)>2.5:
+        CL['last']=now; CL['st']=1; t6(7777,CL['sp'],PLL,KLL,9000,0,0x02); log('v6tcp: client SYN sent')
     if dhcp_done and KM and now-vlast>3.0:
         vlast=now; KLL=kernel_ll(KM); v6_probe(); log('v6: probe sent to',KLL.hex())
 log('end')

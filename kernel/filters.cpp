@@ -1,4 +1,5 @@
 #include "filters.h"
+#include "textutils.h"
 #include "commands.h"
 #include "fs.h"
 #include "vfs.h"
@@ -281,6 +282,15 @@ static int apply(char** w, int n, const char* in, uint32_t inlen, char* out, uin
     }
     else if (str_equal(name, "tr"))
     {
+        if (n == 3 && str_equal(w[1], "-d"))
+        {
+            for (uint32_t i = 0; i < inlen; ++i)
+            {
+                int del = 0; for (int k = 0; w[2][k]; ++k) if (in[i] == w[2][k]) { del = 1; break; }
+                if (!del && o < FBUF - 1U) out[o++] = in[i];
+            }
+            *outlen = o; return 0;
+        }
         if (n != 3 || str_len(w[1]) != str_len(w[2]) || str_len(w[1]) == 0) return -2;
         for (uint32_t i = 0; i < inlen; ++i)
         {
@@ -295,6 +305,7 @@ static int apply(char** w, int n, const char* in, uint32_t inlen, char* out, uin
         if (fs_write_data(w[1], vfs_cwd(), (const uint8_t*)in, inlen) < 0) { uart_puts("tee: cannot write file\r\n"); }
         for (uint32_t i = 0; i < inlen; ++i) out[o++] = in[i];
     }
+    else if (textutils_is_filter(name)) return textutils_apply(w, n, in, inlen, out, outlen, FBUF);
     else return -1;
     *outlen = o;
     return 0;
@@ -304,7 +315,7 @@ int filters_is_filter(const char* name)
 {
     static const char* f[] = {"grep", "wc", "head", "tail", "sort", "uniq", "cut", "tr", "tee"};
     for (unsigned i = 0; i < sizeof(f) / sizeof(f[0]); ++i) if (str_equal(name, f[i])) return 1;
-    return 0;
+    return textutils_is_filter(name);
 }
 
 static void print_buf(const char* b, uint32_t n)
@@ -315,7 +326,7 @@ static void print_buf(const char* b, uint32_t n)
 /* head/tail/sort/uniq/cut/tr/tee/grep/wc with a trailing FILE operand. */
 int filters_run_file_command(const char* name, const char* args)
 {
-    if (!filters_is_filter(name) || str_equal(name, "grep") || str_equal(name, "wc") || str_equal(name, "tee")) return 0;   /* grep/wc/tee keep their dedicated implementations */
+    if (!filters_is_filter(name) || str_equal(name, "xargs") || str_equal(name, "more") || str_equal(name, "less") || str_equal(name, "grep") || str_equal(name, "wc") || str_equal(name, "tee")) return 0;   /* grep/wc/tee keep their dedicated implementations */
     char* in = (char*)kmalloc(FBUF); char* out = (char*)kmalloc(FBUF); char* line = (char*)kmalloc(512);
     if (!in || !out || !line) { if (in) kfree(in); if (out) kfree(out); if (line) kfree(line); return 1; }
     str_copy(line, name, 64);
@@ -326,6 +337,27 @@ int filters_run_file_command(const char* name, const char* args)
     if (n < 2) { uart_puts(name); uart_puts(": missing file operand\r\n"); kfree(in); kfree(out); kfree(line); return 1; }
     const char* file = w[n - 1];
     uint64_t sz = 0;
+    if (str_equal(name, "awk") || str_equal(name, "sed"))
+    {
+        /* program-only form (e.g. awk 'BEGIN{...}'): no file operand, empty input */
+        int nonopt = 0;
+        for (int k = 1; k < n; ++k)
+        {
+            if (str_equal(w[k], "-n")) continue;
+            if (w[k][0] == '-' && (w[k][1] == 'F' || w[k][1] == 'e')) { if (!w[k][2]) ++k; continue; }
+            ++nonopt;
+        }
+        int has_e = 0; for (int k = 1; k < n; ++k) if (str_equal(w[k], "-e")) has_e = 1;
+        int need = (str_equal(name, "sed") && has_e) ? 1 : 2;
+        if (nonopt < need)
+        {
+            uint32_t ol0 = 0; in[0] = 0;
+            int rc0 = apply(w, n, in, 0, out, &ol0);
+            if (rc0 == -2) { uart_puts(name); uart_puts(": invalid usage\r\n"); } else if (rc0 == 0) print_buf(out, ol0);
+            kfree(in); kfree(out); kfree(line);
+            return 1;
+        }
+    }
     if (fs_read_file(file, vfs_cwd(), (uint8_t*)in, FBUF - 1U, &sz) != 0) { uart_puts(name); uart_puts(": cannot read file\r\n"); kfree(in); kfree(out); kfree(line); return 1; }
     uint32_t ol = 0;
     int rc = apply(w, n - 1, in, (uint32_t)sz, out, &ol);

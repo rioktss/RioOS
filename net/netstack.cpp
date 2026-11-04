@@ -124,6 +124,8 @@ struct TcpHeader
 
 struct UdpDatagram
 {
+    uint8_t v6;
+    uint8_t src6[16];
     uint32_t source_ip;
     uint16_t source_port;
     uint16_t length;
@@ -150,6 +152,8 @@ struct TcpSocketState
     uint16_t local_port;
     uint16_t remote_port;
     uint32_t remote_ip;
+    uint8_t v6;                         /* 1: peer is IPv6 (remote_ip6 valid) */
+    uint8_t remote_ip6[16];
     uint32_t snd_una;
     uint32_t snd_nxt;
     uint32_t rcv_nxt;
@@ -181,9 +185,89 @@ static TcpSocketState tcp_sockets[TCP_SOCKET_COUNT];
 static uint16_t dns_query_id = 0x5249U;
 static uint32_t dns_server_ip = DNS_DEFAULT_SERVER;
 
+
+/* ---- packet filter (IPv4): ordered rules, first match wins, per-direction default policy ----
+   Inbound rules apply to new connections only (TCP SYN, UDP/ICMP not belonging to a flow we started);
+   outbound rules apply to every TCP segment, UDP datagram and ping we send. DHCP and DNS are exempt. */
+#define FW_MAX_RULES 16
+static NetFwRule fw_rules[FW_MAX_RULES];
+static int fw_default_in = 1, fw_default_out = 1;
+static uint32_t fw_drop_in = 0, fw_drop_out = 0;
+struct FwFlow { uint32_t ip; uint16_t rport, lport; uint8_t proto; uint8_t used; };
+static FwFlow fw_flows[16]; static int fw_flow_next = 0;
+
+static void fw_note_flow(uint8_t proto, uint32_t ip, uint16_t rport, uint16_t lport)
+{
+    for (int i = 0; i < 16; ++i) if (fw_flows[i].used && fw_flows[i].proto == proto && fw_flows[i].ip == ip && fw_flows[i].rport == rport && fw_flows[i].lport == lport) return;
+    FwFlow* f = &fw_flows[fw_flow_next]; fw_flow_next = (fw_flow_next + 1) & 15;
+    f->used = 1; f->proto = proto; f->ip = ip; f->rport = rport; f->lport = lport;
+}
+static int fw_is_flow(uint8_t proto, uint32_t ip, uint16_t rport, uint16_t lport)
+{
+    for (int i = 0; i < 16; ++i) if (fw_flows[i].used && fw_flows[i].proto == proto && fw_flows[i].ip == ip && fw_flows[i].rport == rport && fw_flows[i].lport == lport) return 1;
+    return 0;
+}
+/* dir 0 = inbound (port = our local port), 1 = outbound (port = remote port) */
+static int fw_decide(int dir, uint8_t proto, uint32_t remote_ip, uint16_t port)
+{
+    for (int i = 0; i < FW_MAX_RULES; ++i)
+    {
+        const NetFwRule* r = &fw_rules[i];
+        if (!r->used) continue;
+        if (r->dir != 2 && r->dir != dir) continue;
+        if (r->proto && r->proto != proto) continue;
+        if (r->port && r->port != port) continue;
+        uint32_t mask = r->prefix == 0 ? 0 : (r->prefix >= 32 ? 0xFFFFFFFFU : (0xFFFFFFFFU << (32 - r->prefix)));
+        if ((remote_ip & mask) != (r->ip & mask)) continue;
+        return r->allow;
+    }
+    return dir == 0 ? fw_default_in : fw_default_out;
+}
+static int fw_out_ok(uint8_t proto, uint32_t ip, uint16_t port, uint16_t lport)
+{
+    if (!fw_decide(1, proto, ip, port)) { ++fw_drop_out; return 0; }
+    if (proto == 17) fw_note_flow(proto, ip, port, lport);
+    return 1;
+}
+int net_fw_add(const NetFwRule* rule, int position)
+{
+    if (!rule) return -22;
+    int slot = -1;
+    for (int i = 0; i < FW_MAX_RULES; ++i) if (!fw_rules[i].used) { slot = i; break; }
+    if (slot < 0) return -28;
+    int count = 0; for (int i = 0; i < FW_MAX_RULES; ++i) if (fw_rules[i].used) ++count;
+    /* keep rules packed: insert at position (0 = front, -1 = append) */
+    int at = (position < 0 || position > count) ? count : position;
+    for (int i = count; i > at; --i) fw_rules[i] = fw_rules[i - 1];
+    fw_rules[at] = *rule; fw_rules[at].used = 1;
+    return at;
+}
+int net_fw_del(int index)
+{
+    int count = 0; for (int i = 0; i < FW_MAX_RULES; ++i) if (fw_rules[i].used) ++count;
+    if (index < 0 || index >= count) return -2;
+    for (int i = index; i + 1 < FW_MAX_RULES; ++i) fw_rules[i] = fw_rules[i + 1];
+    fw_rules[FW_MAX_RULES - 1].used = 0;
+    return 0;
+}
+void net_fw_flush() { for (int i = 0; i < FW_MAX_RULES; ++i) fw_rules[i].used = 0; }
+int net_fw_get(int index, NetFwRule* out)
+{
+    int n = 0;
+    for (int i = 0; i < FW_MAX_RULES; ++i) if (fw_rules[i].used) { if (n++ == index) { *out = fw_rules[i]; return 0; } }
+    return -2;
+}
+void net_fw_set_default(int dir, int allow) { if (dir == 0) fw_default_in = allow ? 1 : 0; else fw_default_out = allow ? 1 : 0; }
+void net_fw_get_state(int* def_in, int* def_out, uint32_t* drop_in, uint32_t* drop_out)
+{ *def_in = fw_default_in; *def_out = fw_default_out; *drop_in = fw_drop_in; *drop_out = fw_drop_out; }
 static int arp_resolve(uint32_t ip, uint8_t mac[6], uint32_t timeout_ms);
 static void v6_input(uint32_t len);
-static void tcp_input(uint32_t source_ip, uint32_t dest_ip,
+static void v6_local(uint8_t out[16]);
+static uint16_t v6_checksum(const uint8_t* src, const uint8_t* dst, uint8_t next, const uint8_t* msg, uint32_t len);
+static int v6_send_nh(const uint8_t* dst_mac, const uint8_t* src, const uint8_t* dst, uint8_t hop, uint8_t nh, const uint8_t* msg, uint32_t len);
+static int v6_resolve(const uint8_t* target, uint8_t* mac, uint32_t timeout_ms);
+static int v6_eq(const uint8_t* a, const uint8_t* b);
+static void tcp_input(const uint8_t* src6, uint32_t source_ip, uint32_t dest_ip,
                       const uint8_t* bytes, uint32_t length);
 static int tcp_send_segment(TcpSocketState* socket, uint8_t flags,
                             uint32_t sequence, uint32_t acknowledgement,
@@ -392,6 +476,7 @@ static void udp_input(uint32_t source_ip, uint32_t dest_ip,
 
         uint32_t qindex = (socket->queue_head + socket->queue_count) % UDP_QUEUE_DEPTH;
         UdpDatagram* packet = &socket->queue[qindex];
+        packet->v6 = 0;
         packet->source_ip = source_ip;
         packet->source_port = source_port;
         packet->length = (uint16_t)(udp_length - UDP_HEADER_SIZE);
@@ -673,6 +758,20 @@ int net_poll_once()
             uint8_t known[6];
             if (arp_lookup(source_ip, known) != 0) arp_store(source_ip, e->src);   /* learn on-link peers (passive opens) */
         }
+        {
+            const uint8_t* l4 = (const uint8_t*)ip + ihl; uint32_t l4len = total - ihl;
+            if (ip->proto == IP_PROTO_TCP && l4len >= TCP_HEADER_SIZE)
+            {
+                uint16_t dport = read_be16(l4 + 2U);
+                if ((l4[13] & 0x12U) == 0x02U && !fw_decide(0, 6, source_ip, dport)) { ++fw_drop_in; return 1; }   /* new inbound connection */
+            }
+            else if (ip->proto == IP_PROTO_UDP && l4len >= UDP_HEADER_SIZE)
+            {
+                uint16_t sport = read_be16(l4), dport = read_be16(l4 + 2U);
+                if (!fw_is_flow(17, source_ip, sport, dport) && !fw_decide(0, 17, source_ip, dport)) { ++fw_drop_in; return 1; }
+            }
+            else if (ip->proto == IP_PROTO_ICMP && l4len >= 1 && l4[0] == ICMP_ECHO_REQUEST && !fw_decide(0, 1, source_ip, 0)) { ++fw_drop_in; return 1; }
+        }
         if (ip->proto == IP_PROTO_UDP)
         {
             if (total < (uint16_t)(ihl + UDP_HEADER_SIZE)) return -5;
@@ -682,7 +781,7 @@ int net_poll_once()
         if (ip->proto == IP_PROTO_TCP)
         {
             if (total < (uint16_t)(ihl + TCP_HEADER_SIZE)) return -5;
-            tcp_input(source_ip, dest_ip, (const uint8_t*)ip + ihl, total - ihl);
+            tcp_input(0, source_ip, dest_ip, (const uint8_t*)ip + ihl, total - ihl);
             return 1;
         }
         if (ip->proto != IP_PROTO_ICMP) return 1;
@@ -762,10 +861,30 @@ static int tcp_send_segment(TcpSocketState* socket, uint8_t flags,
                             uint32_t sequence, uint32_t acknowledgement,
                             const uint8_t* payload, uint32_t payload_length)
 {
-    if (!socket || !socket->used || socket->remote_ip == 0 || socket->remote_port == 0)
+    if (!socket || !socket->used || (socket->remote_ip == 0 && !socket->v6) || socket->remote_port == 0)
         return -22;
     if (payload_length > TCP_SEGMENT_MAX || (payload_length && !payload)) return -90;
 
+    if (socket->v6)
+    {
+        uint8_t mac6[6];
+        if (v6_resolve(socket->remote_ip6, mac6, 1000U) < 0) return -110;
+        uint8_t me[16]; v6_local(me);
+        uint8_t seg[TCP_HEADER_SIZE + TCP_SEGMENT_MAX];
+        uint32_t seg_len = TCP_HEADER_SIZE + payload_length;
+        for (uint32_t i = 0; i < TCP_HEADER_SIZE; ++i) seg[i] = 0;
+        write_be16(seg, socket->local_port);
+        write_be16(seg + 2U, socket->remote_port);
+        write_be32(seg + 4U, sequence);
+        write_be32(seg + 8U, acknowledgement);
+        seg[12] = 0x50U; seg[13] = flags;
+        write_be16(seg + 14U, tcp_receive_window(socket));
+        for (uint32_t i = 0; i < payload_length; ++i) seg[TCP_HEADER_SIZE + i] = payload[i];
+        write_be16(seg + 16U, v6_checksum(me, socket->remote_ip6, 6, seg, seg_len));
+        return v6_send_nh(mac6, me, socket->remote_ip6, 64, 6, seg, seg_len);
+    }
+
+    if (!fw_out_ok(6, socket->remote_ip, socket->remote_port, socket->local_port)) return -1;
     uint32_t next_hop = ((socket->remote_ip & NET_MASK) == (NET_IP & NET_MASK))
         ? socket->remote_ip : NET_GATEWAY;
     uint8_t target_mac[6];
@@ -811,10 +930,10 @@ static int tcp_send_segment(TcpSocketState* socket, uint8_t flags,
     return virtio_net_send(tx_frame, frame_length) == 0 ? 0 : -5;
 }
 
-static void tcp_input(uint32_t source_ip, uint32_t dest_ip,
+static void tcp_input(const uint8_t* src6, uint32_t source_ip, uint32_t dest_ip,
                       const uint8_t* bytes, uint32_t length)
 {
-    if (!bytes || length < TCP_HEADER_SIZE || dest_ip != NET_IP) return;
+    if (!bytes || length < TCP_HEADER_SIZE || (!src6 && dest_ip != NET_IP)) return;
     uint16_t source_port = read_be16(bytes);
     uint16_t dest_port = read_be16(bytes + 2U);
     uint32_t sequence = read_be32(bytes + 4U);
@@ -822,7 +941,15 @@ static void tcp_input(uint32_t source_ip, uint32_t dest_ip,
     uint32_t header_length = (uint32_t)(bytes[12] >> 4) * 4U;
     uint8_t flags = bytes[13];
     if (source_port == 0 || dest_port == 0 || header_length < TCP_HEADER_SIZE ||
-        header_length > length || tcp_checksum_ipv4(source_ip, dest_ip, bytes, length) != 0)
+        header_length > length)
+        return;
+    if (src6)
+    {
+        uint8_t me6[16]; v6_local(me6);
+        if (v6_checksum(src6, me6, 6, bytes, length) != 0xFFFFU) return;
+        source_ip = ((uint32_t)src6[12] << 24) | ((uint32_t)src6[13] << 16) | ((uint32_t)src6[14] << 8) | src6[15];   /* hash seed only */
+    }
+    else if (tcp_checksum_ipv4(source_ip, dest_ip, bytes, length) != 0)
         return;
 
     TcpSocketState* socket = 0;
@@ -830,8 +957,9 @@ static void tcp_input(uint32_t source_ip, uint32_t dest_ip,
     {
         TcpSocketState* candidate = &tcp_sockets[i];
         if (candidate->used && candidate->local_port == dest_port &&
-            candidate->remote_ip == source_ip && candidate->remote_port == source_port &&
-            candidate->state != TCP_STATE_CLOSED)
+            candidate->remote_port == source_port && candidate->state != TCP_STATE_CLOSED &&
+            (src6 ? (candidate->v6 && v6_eq(candidate->remote_ip6, src6))
+                  : (!candidate->v6 && candidate->remote_ip == source_ip)))
         {
             socket = candidate;
             break;
@@ -852,7 +980,7 @@ static void tcp_input(uint32_t source_ip, uint32_t dest_ip,
         if (pending >= TCP_ACCEPT_QUEUE) return;
         uint32_t next_hop = ((source_ip & NET_MASK) == (NET_IP & NET_MASK)) ? source_ip : NET_GATEWAY;
         uint8_t hop_mac[6];
-        if (arp_lookup(next_hop, hop_mac) != 0) { (void)send_arp(next_hop); return; }   /* client retransmits SYN */
+        if (!src6 && arp_lookup(next_hop, hop_mac) != 0) { (void)send_arp(next_hop); return; }   /* client retransmits SYN */
         for (uint32_t i = 0; i < TCP_SOCKET_COUNT; ++i)
         {
             TcpSocketState* child = &tcp_sockets[i];
@@ -863,7 +991,9 @@ static void tcp_input(uint32_t source_ip, uint32_t dest_ip,
             child->peer_closed = 0;
             child->local_port = dest_port;
             child->remote_port = source_port;
-            child->remote_ip = source_ip;
+            child->remote_ip = src6 ? 0U : source_ip;
+            child->v6 = src6 ? 1 : 0;
+            if (src6) for (int k = 0; k < 16; ++k) child->remote_ip6[k] = src6[k];
             uint32_t iss = (uint32_t)timer_millis() ^ source_ip ^ ((uint32_t)source_port << 16) ^ 0x52494F53U;
             if (iss == 0) iss = 1;
             child->snd_una = iss;
@@ -981,6 +1111,7 @@ int net_tcp_socket(int owner_pid)
         socket->local_port = 0;
         socket->remote_port = 0;
         socket->remote_ip = 0;
+        socket->v6 = 0;
         socket->snd_una = socket->snd_nxt = socket->rcv_nxt = 0;
         socket->rx_head = socket->rx_count = 0;
         socket->parent = 0; socket->accept_count = 0;
@@ -1326,6 +1457,7 @@ int net_udp_sendto(int owner_pid, int socket_handle, uint32_t target_ip,
         if (rc != 0) return rc;
     }
 
+    if (!fw_out_ok(17, target_ip, target_port, socket->local_port)) return -1;
     uint32_t next_hop = ((target_ip & NET_MASK) == (NET_IP & NET_MASK))
         ? target_ip : NET_GATEWAY;
     uint8_t target_mac[6];
@@ -1651,6 +1783,7 @@ int net_dns_resolve(const char* hostname, uint32_t* out_ip, uint32_t timeout_ms)
 
 int net_ping(uint32_t target_ip, uint32_t timeout_ms)
 {
+    if (!fw_decide(1, 1, target_ip, 0)) { ++fw_drop_out; return -1; }
     if (!ready_state) return -19;
 
     uint32_t next_hop = ((target_ip & NET_MASK) == (NET_IP & NET_MASK))
@@ -1928,7 +2061,7 @@ static int v6_neigh_lookup(const uint8_t* ip, uint8_t* mac)
     return -1;
 }
 
-static int v6_send(const uint8_t* dst_mac, const uint8_t* src, const uint8_t* dst, uint8_t hop, const uint8_t* msg, uint32_t len)
+static int v6_send_nh(const uint8_t* dst_mac, const uint8_t* src, const uint8_t* dst, uint8_t hop, uint8_t nh, const uint8_t* msg, uint32_t len)
 {
     if (NET_ETH_HDR + IPV6_HDR + len > sizeof(tx_frame)) return -90;
     EthernetHeader* e = (EthernetHeader*)tx_frame;
@@ -1936,10 +2069,15 @@ static int v6_send(const uint8_t* dst_mac, const uint8_t* src, const uint8_t* ds
     uint8_t* h = tx_frame + NET_ETH_HDR;
     h[0] = 0x60; h[1] = h[2] = h[3] = 0;
     write_be16(h + 4, (uint16_t)len);
-    h[6] = 58; h[7] = hop;
+    h[6] = nh; h[7] = hop;
     for (int i = 0; i < 16; ++i) { h[8 + i] = src[i]; h[24 + i] = dst[i]; }
     for (uint32_t i = 0; i < len; ++i) h[IPV6_HDR + i] = msg[i];
     return virtio_net_send(tx_frame, NET_ETH_HDR + IPV6_HDR + len) == 0 ? 0 : -5;
+}
+
+static int v6_send(const uint8_t* dst_mac, const uint8_t* src, const uint8_t* dst, uint8_t hop, const uint8_t* msg, uint32_t len)
+{
+    return v6_send_nh(dst_mac, src, dst, hop, 58, msg, len);
 }
 
 static int v6_send_na(const uint8_t* dst_mac, const uint8_t* dst_ip, const uint8_t* target, int solicited)
@@ -1956,6 +2094,8 @@ static int v6_send_na(const uint8_t* dst_mac, const uint8_t* dst_ip, const uint8
     return v6_send(dst_mac, me, dst_ip, 255, m, 32);
 }
 
+static void udp6_input(const uint8_t* src, const uint8_t* msg, uint32_t len);
+
 static void v6_input(uint32_t len)
 {
     /* Copy out of rx_frame: replies are built in tx_frame and ARP/ND may poll again. */
@@ -1963,7 +2103,7 @@ static void v6_input(uint32_t len)
     for (uint32_t i = 0; i < len; ++i) v6_buf[i] = rx_frame[i];
     const EthernetHeader* e = (const EthernetHeader*)v6_buf;
     const uint8_t* h = v6_buf + NET_ETH_HDR;
-    if ((h[0] >> 4) != 6 || h[6] != 58) return;
+    if ((h[0] >> 4) != 6 || (h[6] != 58 && h[6] != 6 && h[6] != 17)) return;
     uint32_t plen = read_be16(h + 4);
     if (plen < 8 || plen + IPV6_HDR + NET_ETH_HDR > len) return;
     const uint8_t* src = h + 8; const uint8_t* dst = h + 24;
@@ -1974,6 +2114,14 @@ static void v6_input(uint32_t len)
                          dst[13] == me[13] && dst[14] == me[14] && dst[15] == me[15];
     int all_nodes = dst[0] == 0xFF && dst[1] == 0x02 && dst[15] == 0x01;
     if (!to_me && !solicited_node && !all_nodes) return;
+    if (h[6] == 6 || h[6] == 17)
+    {
+        if (!to_me) return;
+        v6_neigh_store(src, e->src);                      /* learn the sender's MAC from its frame */
+        if (h[6] == 6) tcp_input(src, 0, 0, msg, plen);
+        else udp6_input(src, msg, plen);
+        return;
+    }
     if (v6_checksum(src, dst, 58, msg, plen) != 0xFFFFU && checksum16(msg, 0) == 1) return;
     /* verify checksum: sum including the transmitted checksum field must fold to zero */
     {
@@ -2130,6 +2278,141 @@ int net_ping6(const uint8_t target[16], uint32_t timeout_ms)
     return -110;
 }
 
+
+/* Resolve an IPv6 neighbour (NDP, up to 4 solicitations). */
+static int v6_resolve(const uint8_t* target, uint8_t* mac, uint32_t timeout_ms)
+{
+    if (v6_neigh_lookup(target, mac) == 0) return 0;
+    uint8_t me[16]; v6_local(me);
+    uint8_t ns[32], sn[16] = {0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xFF, 0, 0, 0};
+    sn[13] = target[13]; sn[14] = target[14]; sn[15] = target[15];
+    for (int i = 0; i < 32; ++i) ns[i] = 0;
+    ns[0] = ICMP6_NS;
+    for (int i = 0; i < 16; ++i) ns[8 + i] = target[i];
+    ns[24] = 1; ns[25] = 1; copy6(ns + 26, local_mac);
+    write_be16(ns + 2, v6_checksum(me, sn, 58, ns, 32));
+    uint8_t mmac[6] = {0x33, 0x33, 0xFF, sn[13], sn[14], sn[15]};
+    uint64_t start = timer_millis(), last = 0; int tries = 0;
+    while (v6_neigh_lookup(target, mac) != 0)
+    {
+        uint64_t now = timer_millis();
+        if (now - start >= timeout_ms) return -113;
+        if (tries == 0 || now - last >= 500) { if (tries++ >= 4) return -113; (void)v6_send(mmac, me, sn, 255, ns, 32); last = now; }
+        (void)net_poll_once();
+    }
+    return 0;
+}
+
+/* ---- UDP over IPv6 ---- */
+static void udp6_input(const uint8_t* src, const uint8_t* msg, uint32_t len)
+{
+    if (len < UDP_HEADER_SIZE) return;
+    uint16_t sp = read_be16(msg), dp = read_be16(msg + 2), ul = read_be16(msg + 4);
+    if (sp == 0 || dp == 0 || ul != len || ul > UDP_HEADER_SIZE + NET_UDP_MAX_PAYLOAD) return;
+    uint8_t me[16]; v6_local(me);
+    if (v6_checksum(src, me, 17, msg, len) != 0xFFFFU) return;
+    for (uint32_t i = 0; i < UDP_SOCKET_COUNT; ++i)
+    {
+        UdpSocketState* so = &udp_sockets[i];
+        if (!so->used || so->local_port != dp) continue;
+        if (so->queue_count >= UDP_QUEUE_DEPTH) { if (so->dropped != 0xFFFFFFFFU) ++so->dropped; return; }
+        UdpDatagram* pk = &so->queue[(so->queue_head + so->queue_count) % UDP_QUEUE_DEPTH];
+        pk->v6 = 1; for (int k = 0; k < 16; ++k) pk->src6[k] = src[k];
+        pk->source_ip = 0; pk->source_port = sp; pk->length = (uint16_t)(ul - UDP_HEADER_SIZE);
+        for (uint32_t n = 0; n < pk->length; ++n) pk->payload[n] = msg[UDP_HEADER_SIZE + n];
+        ++so->queue_count;
+        return;
+    }
+}
+
+int net_udp6_sendto(int owner_pid, int socket_handle, const uint8_t target[16], uint16_t target_port, const void* data, uint32_t length)
+{
+    UdpSocketState* so = udp_get_socket(owner_pid, socket_handle);
+    if (!so) return -9;
+    if (!ready_state) return -19;
+    if (target_port == 0 || length > NET_UDP_MAX_PAYLOAD || (length && !data) || target[0] == 0xFF) return -22;
+    if (so->local_port == 0) { int rc = net_udp_bind(owner_pid, socket_handle, 0); if (rc != 0) return rc; }
+    uint8_t mac[6];
+    if (v6_resolve(target, mac, 2000U) != 0) return -113;
+    uint8_t me[16]; v6_local(me);
+    uint8_t dg[UDP_HEADER_SIZE + NET_UDP_MAX_PAYLOAD];
+    uint32_t ul = UDP_HEADER_SIZE + length;
+    write_be16(dg, so->local_port); write_be16(dg + 2, target_port); write_be16(dg + 4, (uint16_t)ul); write_be16(dg + 6, 0);
+    for (uint32_t i = 0; i < length; ++i) dg[UDP_HEADER_SIZE + i] = ((const uint8_t*)data)[i];
+    write_be16(dg + 6, v6_checksum(me, target, 17, dg, ul));
+    return v6_send_nh(mac, me, target, 64, 17, dg, ul) == 0 ? (int)length : -5;
+}
+
+int net_udp6_recvfrom(int owner_pid, int socket_handle, uint8_t source[16], uint16_t* source_port, void* data, uint32_t capacity, uint32_t timeout_ms)
+{
+    UdpSocketState* so = udp_get_socket(owner_pid, socket_handle);
+    if (!so) return -9;
+    if (!ready_state) return -19;
+    if (capacity == 0 || capacity > NET_UDP_MAX_PAYLOAD || !data || timeout_ms > NET_UDP_MAX_TIMEOUT_MS) return -22;
+    uint64_t start = timer_millis();
+    do { if (so->queue_count) break; (void)net_poll_once(); } while (timer_millis() - start < timeout_ms);
+    if (!so->queue_count) return -110;
+    UdpDatagram* pk = &so->queue[so->queue_head];
+    if (pk->length > capacity) { so->queue_head = (uint16_t)((so->queue_head + 1U) % UDP_QUEUE_DEPTH); --so->queue_count; return -90; }
+    for (uint32_t i = 0; i < pk->length; ++i) ((uint8_t*)data)[i] = pk->payload[i];
+    if (source) for (int k = 0; k < 16; ++k) source[k] = pk->v6 ? pk->src6[k] : 0;
+    if (source_port) *source_port = pk->source_port;
+    int r = (int)pk->length;
+    so->queue_head = (uint16_t)((so->queue_head + 1U) % UDP_QUEUE_DEPTH); --so->queue_count;
+    return r;
+}
+
+/* ---- TCP over IPv6 ---- */
+int net_tcp6_connect(int owner_pid, int socket_handle, const uint8_t target[16], uint16_t target_port, uint32_t timeout_ms)
+{
+    TcpSocketState* socket = tcp_get_socket(owner_pid, socket_handle);
+    if (!socket) return -9;
+    if (!ready_state) return -19;
+    if (socket->state != TCP_STATE_CLOSED || target_port == 0 || target[0] == 0xFF || timeout_ms == 0 || timeout_ms > NET_TCP_MAX_TIMEOUT_MS) return -22;
+    uint32_t attempts = (uint32_t)UDP_EPHEMERAL_LAST - UDP_EPHEMERAL_FIRST + 1U;
+    socket->local_port = 0;
+    while (attempts--)
+    {
+        uint16_t port = tcp_next_ephemeral;
+        tcp_next_ephemeral = port == UDP_EPHEMERAL_LAST ? (uint16_t)UDP_EPHEMERAL_FIRST : (uint16_t)(port + 1U);
+        if (!tcp_port_in_use(port, socket)) { socket->local_port = port; break; }
+    }
+    if (socket->local_port == 0) return -98;
+    socket->v6 = 1; socket->remote_ip = 0;
+    for (int k = 0; k < 16; ++k) socket->remote_ip6[k] = target[k];
+    socket->remote_port = target_port;
+    uint32_t iss = (uint32_t)timer_millis() ^ ((uint32_t)target[15] << 8) ^ ((uint32_t)socket->local_port << 16) ^ target_port;
+    if (iss == 0) iss = 1;
+    socket->snd_una = iss; socket->snd_nxt = iss + 1U; socket->rcv_nxt = 0;
+    socket->state = TCP_STATE_SYN_SENT;
+    int rc = tcp_send_segment(socket, TCP_FLAG_SYN, iss, 0, 0, 0);
+    uint64_t start = timer_millis(), last = start; uint32_t retries = 0;
+    while (rc == 0 && timer_millis() - start < timeout_ms)
+    {
+        (void)net_poll_once();
+        if (socket->state == TCP_STATE_ESTABLISHED) return 0;
+        if (socket->state == TCP_STATE_RESET) { socket->state = TCP_STATE_CLOSED; socket->local_port = 0; socket->v6 = 0; return -111; }
+        uint64_t now = timer_millis();
+        if (now - last >= TCP_RETRY_MS)
+        {
+            if (retries++ >= TCP_MAX_RETRIES) break;
+            rc = tcp_send_segment(socket, TCP_FLAG_SYN, iss, 0, 0, 0);
+            last = now;
+        }
+    }
+    socket->state = TCP_STATE_CLOSED; socket->local_port = 0; socket->remote_port = 0; socket->v6 = 0;
+    return rc != 0 ? rc : -110;
+}
+
+/* 1 and fills out[16] when the connection is IPv6, 0 for IPv4 */
+int net_tcp_peer6(int owner_pid, int socket_handle, uint8_t out[16])
+{
+    TcpSocketState* socket = tcp_get_socket(owner_pid, socket_handle);
+    if (!socket || !socket->v6) return 0;
+    for (int k = 0; k < 16; ++k) out[k] = socket->remote_ip6[k];
+    return 1;
+}
+
 void net_ip6_stats(uint32_t* ns, uint32_t* na_tx, uint32_t* echo)
 {
     if (ns) *ns = v6_rx_ns; if (na_tx) *na_tx = v6_tx_na; if (echo) *echo = v6_rx_echo_req;
@@ -2159,6 +2442,7 @@ void net_init()
         tcp_sockets[i].local_port = 0;
         tcp_sockets[i].remote_port = 0;
         tcp_sockets[i].remote_ip = 0;
+        tcp_sockets[i].v6 = 0;
         tcp_sockets[i].snd_una = 0;
         tcp_sockets[i].snd_nxt = 0;
         tcp_sockets[i].rcv_nxt = 0;

@@ -82,3 +82,5 @@ Round 2: host test `tls_host_test` (RFC 7748 X25519 vectors, NIST AES-GCM cases 
 - session 5: redirects, wildcards, `$()`, functions, `/tmp` volatility, `free`, >64 inodes
 - session 6: xHCI + usb-kbd + usb-mouse via the QEMU monitor (`sendkey`, `mouse_move`)
 - session 7: `tests/qemu_fake_peer2.py` TCP server (HTTP, echo, RST) and relay to `tests/tls_test_server.py` (real OpenSSL TLS 1.3): `dhcp renew`, `wget`, `nc`, `httpsget`, `wget https://`
+- session 8 (round 3): multi-mount VFS with a second NVMe and AHCI disk, tmpfs, `mkfs`, `mount/umount/df`, cross-mount `mv`/`cp`, busy checks, persistence across reboot
+- session 7 extended: IPv6 `udp6 send`, `nc` and `nc -z` over v6, `nc -l` accepting a v6 client

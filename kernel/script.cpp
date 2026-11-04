@@ -52,8 +52,19 @@ int script_expand(const char* line, char* out, int cap)
             while (line[j] && line[j] != '\'') ++j;
             if (line[j] == '\'')
             {
-                /* single quotes: literal text, no expansion; quotes removed */
+                /* single quotes: literal text, no expansion. Quotes are removed, except for awk/sed/xargs where
+                   the quoted program must stay one word (the filter tokenizer strips them later). */
+                int keep = 0;
+                {
+                    int st = i; while (st > 0 && line[st - 1] != '|' && line[st - 1] != ';' && line[st - 1] != '&') --st;
+                    while (line[st] == ' ' || line[st] == '\t') ++st;
+                    char nm[8]; int nn = 0; while (line[st] && line[st] != ' ' && line[st] != '\t' && nn < 7) nm[nn++] = line[st++];
+                    nm[nn] = 0;
+                    keep = str_equal(nm, "awk") || str_equal(nm, "sed") || str_equal(nm, "xargs") || str_equal(nm, "printf") || str_equal(nm, "alias") || str_equal(nm, "expr") || str_equal(nm, "curl") || str_equal(nm, "fat") || str_equal(nm, "fw");
+                }
+                if (keep && ep < cap - 1) out[ep++] = '\'';
                 for (int k = i + 1; k < j && ep < cap - 1; ++k) out[ep++] = line[k];
+                if (keep && ep < cap - 1) out[ep++] = '\'';
                 i = j + 1;
                 continue;
             }

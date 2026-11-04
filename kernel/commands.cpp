@@ -1,6 +1,8 @@
 #include "commands.h"
 #include "jobs.h"
 #include "filters.h"
+#include "shellext.h"
+#include "fat32.h"
 #include "pci.h"
 #include "usb.h"
 #include "tls.h"
@@ -373,32 +375,77 @@ static int str_contains(const char* hay, const char* needle)
     return 0;
 }
 
+static int dev_by_name(const char* n)
+{
+    if (str_equal(n, "ram0") || str_equal(n, "/dev/ram0")) return 1;
+    if (str_equal(n, "ram1") || str_equal(n, "/dev/ram1")) return 5;
+    if (str_equal(n, "nvme1") || str_equal(n, "nvme0n1") || str_equal(n, "/dev/nvme0n1") || str_equal(n, "/dev/nvme1")) return 3;
+    if (str_equal(n, "sda") || str_equal(n, "sata0") || str_equal(n, "/dev/sda")) return 4;
+    return -1;
+}
+static const char* dev_name(int d)
+{
+    return d == 0 ? "root" : d == 1 ? "ram0" : d == 5 ? "ram1" : d == 3 ? "nvme0n1" : d == 4 ? "sda" : "?";
+}
+static void mount_err(const char* who, int rc)
+{
+    uart_puts(who); uart_puts(": ");
+    if (rc == -2) uart_puts("mount point not found");
+    else if (rc == -20) uart_puts("mount point is not a directory");
+    else if (rc == -16) uart_puts("device or mount point busy / already mounted");
+    else if (rc == -19) uart_puts("no such device");
+    else if (rc == -24) uart_puts("too many mounts");
+    else if (rc == -22) uart_puts("invalid argument");
+    else uart_puts("no valid filesystem on device (use 'mkfs <dev>' first)");
+    uart_puts("\r\n");
+}
+
 static void command_mount(const char* argument)
 {
     if (argument && argument[0])
     {
         if (!security_is_root()) { uart_puts("mount: permission denied (root required)\r\n"); return; }
-        char buf[96]; str_copy(buf, argument, sizeof(buf));
-        char* w[6]; int n = split_words(buf, w, 6);
-        int ro = -1;
+        char buf[128]; str_copy(buf, argument, sizeof(buf));
+        char* w[8]; int n = split_words(buf, w, 8);
+        int ro = -1, tmpfs = 0; char* pos[3]; int np = 0;
         for (int i = 0; i < n; ++i)
         {
             if (str_equal(w[i], "-r")) ro = 1;
             else if (str_equal(w[i], "-w")) ro = 0;
+            else if (str_equal(w[i], "-t") && i + 1 < n) { ++i; if (str_equal(w[i], "tmpfs")) tmpfs = 1; else if (!str_equal(w[i], "myfs")) { uart_puts("mount: unknown filesystem type (myfs, tmpfs)\r\n"); return; } }
             else if (str_equal(w[i], "-o") && i + 1 < n)
             {
                 ++i;
                 if (str_contains(w[i], "ro")) ro = 1;
                 if (str_contains(w[i], "rw")) ro = 0;
             }
+            else if (np < 3) pos[np++] = w[i];
         }
-        if (ro < 0) { uart_puts("usage: mount [-o remount,ro|remount,rw] [/]\r\n"); return; }
-        if (ro == 0 || ro == 1)
+        int cwd = vfs_cwd();
+        if (tmpfs)
         {
-            (void)fs_sync();
-            fs_set_readonly(ro);
-            uart_puts(ro ? "/ remounted read-only.\r\n" : "/ remounted read-write.\r\n");
+            if (np != 2) { uart_puts("usage: mount -t tmpfs none <dir>\r\n"); return; }
+            int dev = -1;
+            for (int k = 0; k < 2 && dev < 0; ++k) { int d = k ? 5 : 1; FsMountInfo mi; int used = 0; for (int j = 0; fs_mount_info(j, &mi) == 0; ++j) if (mi.dev == d) used = 1; if (!used) dev = d; }
+            if (dev < 0) { uart_puts("mount: no free RAM disk for tmpfs\r\n"); return; }
+            int rc = fs_mount_device(dev, pos[1], cwd, ro == 1, 1);
+            if (rc != 0) { mount_err("mount", rc); return; }
+            uart_puts("tmpfs mounted on "); uart_puts(pos[1]); uart_puts(" ("); uart_puts(dev_name(dev)); uart_puts(", volatile)\r\n");
+            return;
         }
+        if (np == 2)
+        {
+            int dev = dev_by_name(pos[0]);
+            if (dev < 0) { uart_puts("mount: unknown device (ram0 ram1 nvme0n1 sda)\r\n"); return; }
+            int rc = fs_mount_device(dev, pos[1], cwd, ro == 1, 0);
+            if (rc != 0) { mount_err("mount", rc); return; }
+            uart_puts(dev_name(dev)); uart_puts(" mounted on "); uart_puts(pos[1]); uart_puts(ro == 1 ? " (ro)\r\n" : "\r\n");
+            return;
+        }
+        if (ro < 0 || np > 1 || (np == 1 && !str_equal(pos[0], "/"))) { uart_puts("usage: mount | mount [-r] <dev> <dir> | mount -t tmpfs none <dir> | mount -o remount,ro|rw /\r\n"); return; }
+        (void)fs_sync();
+        fs_set_readonly(ro);
+        uart_puts(ro ? "/ remounted read-only.\r\n" : "/ remounted read-write.\r\n");
         return;
     }
     FsJournalInfo ji;
@@ -419,6 +466,15 @@ static void command_mount(const char* argument)
     }
     else uart_puts("off");
     uart_puts("\r\n");
+    int cnt = fs_mount_count();
+    for (int i = 1; i < cnt; ++i)
+    {
+        FsMountInfo mi;
+        if (fs_mount_info(i, &mi) != 0) continue;
+        uart_puts(dev_name(mi.dev)); uart_puts(" on "); uart_puts(mi.dir);
+        uart_puts((mi.dev == 1 || mi.dev == 5) ? " type tmpfs (" : " type myfs (");
+        uart_puts(mi.readonly ? "ro" : "rw"); uart_puts(")\r\n");
+    }
 }
 
 static void command_umount(const char* argument)
@@ -426,7 +482,109 @@ static void command_umount(const char* argument)
     if (!security_is_root()) { uart_puts("umount: permission denied (root required)\r\n"); return; }
     if (!argument || !argument[0]) { uart_puts("usage: umount <mountpoint>\r\n"); return; }
     if (str_equal(argument, "/")) { uart_puts("umount: /: target is busy (root filesystem; use 'mount -o remount,ro /')\r\n"); return; }
+    int rc = fs_umount_path(argument, vfs_cwd(), vfs_cwd());
+    if (rc == 0) { uart_puts("umount: "); uart_puts(argument); uart_puts(" unmounted\r\n"); return; }
+    if (rc == -16) { uart_puts("umount: "); uart_puts(argument); uart_puts(": target is busy\r\n"); return; }
     uart_puts("umount: "); uart_puts(argument); uart_puts(": not mounted\r\n");
+}
+
+static void command_mkfs(const char* argument)
+{
+    if (!security_is_root()) { uart_puts("mkfs: permission denied (root required)\r\n"); return; }
+    char buf[64]; str_copy(buf, argument ? argument : "", sizeof(buf));
+    char* w[3]; int n = split_words(buf, w, 3);
+    if (n != 1) { uart_puts("usage: mkfs <dev>   (ram0 ram1 nvme0n1 sda)\r\n"); return; }
+    int dev = dev_by_name(w[0]);
+    if (dev < 0) { uart_puts("mkfs: unknown device\r\n"); return; }
+    int rc = fs_mkfs_device(dev);
+    if (rc == -16) { uart_puts("mkfs: device is mounted\r\n"); return; }
+    if (rc == -19) { uart_puts("mkfs: no such device\r\n"); return; }
+    if (rc != 0) { uart_puts("mkfs: format failed\r\n"); return; }
+    uart_puts("mkfs: "); uart_puts(dev_name(dev)); uart_puts(" formatted (myfs)\r\n");
+}
+
+static void fat_list_print(const char* name, uint32_t size, int is_dir, void* ctx)
+{
+    (void)ctx;
+    if (is_dir) { uart_puts("[DIR]  "); uart_puts(name); uart_puts("\r\n"); }
+    else { uart_puts("[FILE] "); uart_puts(name); uart_puts("  ("); print_u64(size); uart_puts(" bytes)\r\n"); }
+}
+static void fat_err(const char* what, int rc)
+{
+    uart_puts("fat: "); uart_puts(what); uart_puts(": ");
+    if (rc == -1) uart_puts("not a FAT32 volume (use 'fat <dev> mkfs' to format)");
+    else if (rc == -2) uart_puts("not found");
+    else if (rc == -20) uart_puts("not a directory");
+    else if (rc == -21) uart_puts("is a directory");
+    else if (rc == -22) uart_puts("invalid name (new names must be 8.3: NAME.EXT, letters/digits)");
+    else if (rc == -17) uart_puts("already exists");
+    else if (rc == -28) uart_puts("volume full");
+    else if (rc == -27) uart_puts("file too large for transfer (1 MiB limit)");
+    else if (rc == -39) uart_puts("directory not empty");
+    else if (rc == -19) uart_puts("no such device");
+    else uart_puts("I/O error");
+    uart_puts("\r\n");
+}
+static int fat_dev_mounted(int dev)
+{
+    FsMountInfo mi;
+    for (int i = 0; fs_mount_info(i, &mi) == 0; ++i) if (i > 0 && mi.dev == dev) return 1;
+    return 0;
+}
+static int cw_tokens(char* s, char** w, int cap);
+static void command_fat(const char* argument)
+{
+    if (!security_is_root()) { uart_puts("fat: permission denied (root required: raw device access)\r\n"); return; }
+    char buf[200]; str_copy(buf, argument ? argument : "", sizeof(buf));
+    char* w[6]; int n = cw_tokens(buf, w, 6);
+    if (n < 2) { uart_puts("usage: fat <dev> mkfs [label] | info | ls [path] | cat <path> | get <fatpath> <file> | put <file> <fatpath> | mkdir <path> | rm <path>\r\n       dev: ram0 ram1 nvme0n1 sda (not while mounted)\r\n"); return; }
+    int dev = dev_by_name(w[0]);
+    if (dev < 0) { uart_puts("fat: unknown device (ram0 ram1 nvme0n1 sda)\r\n"); return; }
+    if (fat_dev_mounted(dev)) { uart_puts("fat: device is mounted as myfs; umount it first\r\n"); return; }
+    const char* sub = w[1];
+    if (str_equal(sub, "mkfs"))
+    {
+        int rc = fat_mkfs(dev, n > 2 ? w[2] : "RIOOS");
+        if (rc != 0) { fat_err("mkfs", rc); return; }
+        uart_puts("fat: "); uart_puts(dev_name(dev)); uart_puts(" formatted (FAT32)\r\n"); return;
+    }
+    if (str_equal(sub, "info"))
+    {
+        FatInfo fi; int rc = fat_info(dev, &fi);
+        if (rc != 0) { fat_err("info", rc); return; }
+        uart_puts("FAT32 volume '"); uart_puts(fi.label); uart_puts("'\r\n  sectors: "); print_u64(fi.total_sectors);
+        uart_puts("  cluster: "); print_u64(fi.sectors_per_cluster * 512ULL); uart_puts(" bytes\r\n  clusters: "); print_u64(fi.clusters);
+        uart_puts("  free: "); print_u64(fi.free_clusters); uart_puts("\r\n"); return;
+    }
+    if (str_equal(sub, "ls")) { int rc = fat_list(dev, n > 2 ? w[2] : "/", fat_list_print, 0); if (rc != 0) fat_err("ls", rc); return; }
+    if (str_equal(sub, "mkdir") && n == 3) { int rc = fat_mkdir(dev, w[2]); if (rc != 0) fat_err("mkdir", rc); else uart_puts("fat: directory created\r\n"); return; }
+    if (str_equal(sub, "rm") && n == 3) { int rc = fat_remove(dev, w[2]); if (rc != 0) fat_err("rm", rc); else uart_puts("fat: removed\r\n"); return; }
+    if ((str_equal(sub, "cat") && n == 3) || (str_equal(sub, "get") && n == 4))
+    {
+        uint8_t* b = (uint8_t*)kmalloc(1048576 + 16);
+        if (!b) { uart_puts("fat: out of memory\r\n"); return; }
+        uint32_t size = 0; int rc = fat_read(dev, w[2], b, 1048576, &size);
+        if (rc != 0) { fat_err(w[1], rc); kfree(b); return; }
+        if (sub[0] == 'c') { for (uint32_t i = 0; i < size; ++i) { if (b[i] == '\n') uart_putc('\r'); uart_putc((char)b[i]); } uart_puts("\r\n"); }
+        else
+        {
+            int wr = fs_write_data(w[3], vfs_cwd(), b, size);
+            if (wr < 0) uart_puts("fat: cannot write destination file\r\n");
+            else { uart_puts("fat: copied "); print_u64(size); uart_puts(" bytes to "); uart_puts(w[3]); uart_puts("\r\n"); }
+        }
+        kfree(b); return;
+    }
+    if (str_equal(sub, "put") && n == 4)
+    {
+        uint8_t* b = (uint8_t*)kmalloc(1048576 + 16);
+        if (!b) { uart_puts("fat: out of memory\r\n"); return; }
+        uint64_t size = 0;
+        if (fs_read_file(w[2], vfs_cwd(), b, 1048576, &size) != 0) { uart_puts("fat: cannot read source file (missing or over 1 MiB)\r\n"); kfree(b); return; }
+        int rc = fat_write(dev, w[3], b, (uint32_t)size);
+        if (rc != 0) fat_err("put", rc); else { uart_puts("fat: wrote "); print_u64(size); uart_puts(" bytes to "); uart_puts(w[3]); uart_puts("\r\n"); }
+        kfree(b); return;
+    }
+    uart_puts("fat: unknown subcommand or wrong arguments (run 'fat' for usage)\r\n");
 }
 
 static void command_lspci() { pci_list(); }
@@ -643,17 +801,84 @@ static void command_sync()
     uart_puts(fs_sync() == 0 ? "synced.\r\n" : "sync: I/O error\r\n");
 }
 
+static int parse_u64_arg(const char* s, uint64_t* out);
 static void command_ln(const char* argument)
 {
     char buf[200]; str_copy(buf, argument ? argument : "", sizeof(buf));
     char* w[4]; int n = split_words(buf, w, 4);
-    if (n != 3 || !str_equal(w[0], "-s")) { uart_puts("usage: ln -s <target> <linkname>\r\n"); return; }
-    int rc = fs_symlink(w[1], w[2], vfs_cwd());
-    if (rc >= 0) uart_puts("Symlink created.\r\n");
-    else if (rc == -30) uart_puts("ln: read-only filesystem\r\n");
-    else if (rc == -17) uart_puts("ln: destination exists\r\n");
-    else if (rc == -13) uart_puts("ln: permission denied\r\n");
-    else uart_puts("ln: failed\r\n");
+    if (n == 3 && str_equal(w[0], "-s"))
+    {
+        int rc = fs_symlink(w[1], w[2], vfs_cwd());
+        if (rc >= 0) uart_puts("Symlink created.\r\n");
+        else if (rc == -30) uart_puts("ln: read-only filesystem\r\n");
+        else if (rc == -17) uart_puts("ln: destination exists\r\n");
+        else if (rc == -13) uart_puts("ln: permission denied\r\n");
+        else uart_puts("ln: failed\r\n");
+        return;
+    }
+    if (n == 2)
+    {
+        int rc = fs_link_hard(w[0], w[1], vfs_cwd());
+        if (rc >= 0) { uart_puts("Hard link created ("); print_u64((uint64_t)fs_link_count(rc)); uart_puts(" links).\r\n"); }
+        else if (rc == -30) uart_puts("ln: read-only filesystem\r\n");
+        else if (rc == -17) uart_puts("ln: destination exists\r\n");
+        else if (rc == -13) uart_puts("ln: permission denied\r\n");
+        else if (rc == -2) uart_puts("ln: target not found\r\n");
+        else if (rc == -21) uart_puts("ln: hard links to directories/symlinks are not allowed\r\n");
+        else if (rc == -22) uart_puts("ln: cannot hard-link an empty file (write data first)\r\n");
+        else if (rc == -18) uart_puts("ln: cannot link across filesystems\r\n");
+        else uart_puts("ln: failed\r\n");
+        return;
+    }
+    uart_puts("usage: ln <target> <linkname>   (hard link)\r\n       ln -s <target> <linkname>   (symbolic link)\r\n");
+}
+
+static void command_fsck(const char* argument)
+{
+    char buf[100]; str_copy(buf, argument ? argument : "", sizeof(buf));
+    char* w[4]; int n = split_words(buf, w, 4);
+    int repair = 0; const char* path = 0;
+    for (int i = 0; i < n; ++i) { if (str_equal(w[i], "-r")) repair = 1; else if (!path) path = w[i]; else { uart_puts("usage: fsck [-r] [mountpoint]\r\n"); return; } }
+    if (repair && !security_is_root()) { uart_puts("fsck: -r requires root\r\n"); return; }
+    FsckInfo f;
+    int rc = fs_fsck(path, vfs_cwd(), repair, &f);
+    if (rc == -22) { uart_puts("fsck: not a mount point\r\n"); return; }
+    if (rc != 0) { uart_puts("fsck: failed\r\n"); return; }
+    uart_puts("fsck "); uart_puts(path ? path : "/"); uart_puts("\r\n");
+    uart_puts("  inodes in use : "); print_u64((uint64_t)f.inodes); uart_puts(" ("); print_u64((uint64_t)f.dirs); uart_puts(" dirs, ");
+    print_u64((uint64_t)f.files); uart_puts(" files, "); print_u64((uint64_t)f.symlinks); uart_puts(" symlinks, ");
+    print_u64((uint64_t)f.hardlinks); uart_puts(" hard-linked)\r\n");
+    uart_puts("  sectors in use: "); print_u64(f.sectors_used); uart_puts("\r\n");
+    uart_puts("  structure     : "); uart_puts(f.structure_ok ? "ok" : "ERRORS (inode table inconsistent)"); uart_puts("\r\n");
+    uart_puts("  bitmap        : "); if (f.bitmap_ok) uart_puts("ok");
+    else { print_u64(f.leaked); uart_puts(" leaked, "); print_u64(f.missing); uart_puts(" missing"); uart_puts(f.repaired ? " -> repaired" : " (run fsck -r to repair)"); }
+    uart_puts("\r\n");
+    uart_puts(f.structure_ok && (f.bitmap_ok || f.repaired) ? "fsck: clean\r\n" : "fsck: problems found\r\n");
+}
+
+static void command_quota(const char* argument)
+{
+    char buf[100]; str_copy(buf, argument ? argument : "", sizeof(buf));
+    char* w[4]; int n = split_words(buf, w, 4);
+    uint64_t uid = 0, kb = 0;
+    if (n >= 1 && str_equal(w[0], "set"))
+    {
+        if (!security_is_root()) { uart_puts("quota: permission denied (root required)\r\n"); return; }
+        if (n != 3 || !parse_u64_arg(w[1], &uid) || !parse_u64_arg(w[2], &kb)) { uart_puts("usage: quota set <uid> <KiB>   (0 removes the limit)\r\n"); return; }
+        int rc = fs_quota_set((uint32_t)uid, kb * 1024ULL);
+        uart_puts(rc == 0 ? "quota set.\r\n" : "quota: failed (read-only or table full)\r\n");
+        return;
+    }
+    uart_puts("uid    limit(KiB)  used(KiB)\r\n");
+    uint64_t ids[3] = { 0, 1000, 0 }; int cnt = 2;
+    if (n == 1 && parse_u64_arg(w[0], &uid)) { ids[0] = uid; cnt = 1; }
+    else if (n >= 1 && !str_equal(w[0], "list")) { uart_puts("usage: quota [list|<uid>] | quota set <uid> <KiB>\r\n"); return; }
+    for (int i = 0; i < cnt; ++i)
+    {
+        uint64_t lim = 0, used = 0; fs_quota_get((uint32_t)ids[i], &lim, &used);
+        print_u64(ids[i]); uart_puts("      "); if (lim) print_u64(lim / 1024ULL); else uart_puts("none");
+        uart_puts("       "); print_u64(used / 1024ULL); uart_puts("\r\n");
+    }
 }
 
 static void command_readlink(const char* argument)
@@ -754,7 +979,8 @@ static const ManualEntry manual_entries[] =
     {"df", "show filesystem free/used space", "df [-h]", "-h human readable"},
     {"nano", "edit a text file", "nano <file>", "Runs the bundled text editor"},
     {"tree", "show filesystem tree", "tree", "No options"},
-    {"mount", "show mounts / remount root", "mount [-o remount,ro|remount,rw]", "root only for remount; shows journal state"},
+    {"mount", "show mounts / mount a device or tmpfs / remount root", "mount | mount [-r] <dev> <dir> | mount -t tmpfs none <dir> | mount -o remount,ro|rw /", "root only to change; devices: ram0 ram1 nvme0n1 sda; mount /dev needs mkfs first; /tmp is tmpfs"},
+    {"mkfs", "format a device with myfs", "mkfs <dev>", "root only; dev: ram0 ram1 nvme0n1 sda; must be unmounted"},
     {"redirect", "shell output redirection", "cmd > f | cmd >> f | cmd 2> f | cmd 2>> f | cmd &> f | cmd > f 2>&1 | cmd < f", "works for every built-in; /dev/null discards; echo keeps its legacy handler"},
     {"glob", "wildcard expansion", "cmd *.txt | cmd ?.c | cmd dir/pre*", "* any chars, ? one char in unquoted words; ls/cat/wc/rm/stat/head/tail run once per match"},
     {"subst", "command substitution", "echo $(cmd) | echo `cmd`", "captures cmd output (newlines become spaces); nests up to 6 levels"},
@@ -776,7 +1002,8 @@ static const ManualEntry manual_entries[] =
     {"free", "show heap and page usage", "free", "No options"},
     {"which", "locate a command", "which <name>", "built-in or /bin program"},
     {"dhcp", "obtain/renew an IPv4 lease via DHCP", "dhcp [status|renew|release]", "applies address, mask, gateway and DNS; boot tries DHCP automatically; lease is renewed at 50% of its time at the prompt"},
-    {"nc", "TCP connect/listen tool", "nc [-z] <host> <port> [text] | nc -l <port>", "send text and print the reply; -z only tests the port; -l accepts one connection and prints data"},
+    {"nc", "TCP connect/listen tool (IPv4 and IPv6)", "nc [-z] <host|ipv6> <port> [text] | nc -l <port>", "send text and print the reply; -z only tests the port; -l accepts one IPv4 or IPv6 connection and prints data"},
+    {"udp6", "UDP over IPv6 link-local", "udp6 send <ipv6> <port> <text> | udp6 listen <port> [count]", "send waits 2.5 s for a reply; listen prints datagrams and answers 'ack6:<data>'"},
     {"telnet", "interactive TCP terminal", "telnet <host> [port]", "default port 23; Ctrl-] quits; answers telnet option negotiation with WONT/DONT"},
     {"wget", "download over HTTP or HTTPS", "wget <http[s]://host[:port]/path | host[:port] [path]> [outfile]", "GET up to 1 MiB saved to a file (default: last path part or index.html); https uses TLS 1.3 (AES-128-GCM, X25519) WITHOUT certificate verification"},
     {"httpsget", "fetch an HTTPS page (TLS 1.3)", "httpsget <host[:port]> [path] | httpsget https://host/path", "prints the first 4096 bytes of the body; server certificate is NOT validated (encrypted but unauthenticated)"},
@@ -786,13 +1013,31 @@ static const ManualEntry manual_entries[] =
     {"lspci", "list PCIe devices", "lspci", "bus 0 via ECAM; shows class and assigned BARs"},
     {"nvme", "NVMe disk status", "nvme [selftest]", "selftest is read-only on the root disk, read/write on others"},
     {"sata", "AHCI/SATA disk status", "sata [selftest]", "selftest is read-only on the root disk, read/write on others"},
-    {"umount", "unmount a filesystem", "umount <mountpoint>", "root only; / is busy"},
+    {"hexdump", "hex + ASCII dump of a file (user program)", "hexdump <file>", "runs /bin/hexdump.elf; uses libc fopen/fread"},
+    {"libctest", "libc part 2 self-test (user program)", "libctest", "FILE stdio, sscanf, strtok_r, strcasecmp, bsearch, integer math; prints N/N passed"},
+    {"fat", "FAT32 volumes on a raw device (not VFS-mounted)", "fat <dev> mkfs [label] | info | ls [path] | cat <p> | get <p> <file> | put <file> <p> | mkdir <p> | rm <p>", "root only; dev ram0 ram1 nvme0n1 sda; reads long names, new names must be 8.3; files up to 1 MiB; works on images made by other OSes"},
+    {"curl", "HTTP/HTTPS client", "curl [-s] [-i|-I] [-L] [-o file] [-X METHOD] [-H 'K: V'] [-d data] <url>", "GET/POST/HEAD, custom headers, follows up to 4 redirects with -L, -i/-I show headers, -o saves the body; https uses TLS 1.3 without certificate verification"},
+    {"ntpdate", "set the clock from an NTP server", "ntpdate [-q] <server>", "SNTP over UDP 123; -q only queries and prints the offset; setting the RTC needs root"},
+    {"fw", "IPv4 packet filter (firewall)", "fw [list] | fw add|insert <allow|deny> <in|out|both> <tcp|udp|icmp|any> [ip[/bits]|any] [port|any] | fw del <n> | fw flush | fw default <in|out> <allow|deny>", "ordered rules, first match wins, then the per-direction default policy; inbound rules apply to new connections only (SYN, new UDP flow, echo request); DHCP and DNS are exempt; changing rules needs root"},
+    {"fsck", "check the filesystem", "fsck [-r] [mountpoint]", "reports inodes/sectors, structure and bitmap; -r (root) repairs a leaked/missing bitmap"},
+    {"quota", "per-user disk quota", "quota [list|<uid>] | quota set <uid> <KiB>", "root sets; stored in /etc/quota; writes beyond the limit fail; root is exempt"},
+    {"awk", "pattern scanning and processing", "awk [-F sep] 'prog' [file]  |  cmd | awk 'prog'", "BEGIN/END, /re/ and expr patterns, print/printf, if/while/for, arrays, $N NF NR FS; length substr index split sub gsub tolower toupper int sprintf; integer arithmetic only"},
+    {"sed", "stream editor", "sed [-n] [-e script] 's/re/repl/[g]' [file]  |  cmd | sed ...", "commands s d p q y =, addresses N $ /re/ N,M and !; regex: . * + ? ^ $ [set] \\d \\w \\s a|b; & in replacement"},
+    {"xargs", "build and run commands from input", "cmd | xargs [-n N] [-I{}] command [args]", "default command echo; output is passed on"},
+    {"rev", "reverse each line", "cmd | rev", "pipeline stage / rev file"},
+    {"tac", "print lines in reverse order", "cmd | tac", "pipeline stage / tac file"},
+    {"nl", "number lines", "cmd | nl", "pipeline stage / nl file"},
+    {"alias", "define command aliases", "alias | alias name=command | unalias name|-a", "only the first word is replaced; up to 16 aliases"},
+    {"printf", "formatted output", "printf <format> [args...]", "%s %d %i %u %x %X %o %c %% with width/-/0 flags; \\n \\t escapes; format reused for extra args"},
+    {"expr", "evaluate an expression", "expr A op B | expr length S | expr substr S POS LEN", "ops + - * / % = != < > <= >= (integers)"},
+    {"more", "page through a file", "more <file>  |  less <file>", "space next page, enter next line, q quit"},
+    {"umount", "unmount a filesystem", "umount <mountpoint>", "root only; / and busy mounts (cwd inside, nested mounts) refuse"},
     {"sync", "flush filesystem to disk", "sync", "No options"},
     {"ln", "create a symbolic link", "ln -s <target> <link>", "relative targets resolve from the link's directory"},
     {"readlink", "print a symlink target", "readlink <link>", "No options"},
     {"jtest", "journal crash-recovery test", "jtest [path]", "root only; commits to journal then skips apply; reset to see replay"},
     {"ps", "show processes", "ps", "No options"},
-    {"history", "show command history", "history [10|-c]", "-c clear history; N show last N entries; Arrow Up/Down recall"},
+    {"history", "show command history", "history [10|-c|-w|-r]", "-c clear; N last N entries; -w save to /home/user/.history (loaded at boot); -r reload; Arrow Up/Down recall"},
     {"threads", "list cooperative kernel threads", "threads", "Shows state, priority, run counts, and context switches"},
     {"smp", "show CPU topology / run jobs on secondary CPUs", "smp [test]", "lists online CPUs; test offloads a computation to every secondary CPU and verifies it"},
     {"fbinfo", "show framebuffer backend status", "fbinfo", "Reports the framebuffer terminal state (QEMU window runner)"},
@@ -1296,13 +1541,19 @@ static void command_df(char* argument)
     char* words[4]; int count = split_words(argument, words, 4); int options = 0;
     char* operands[2]; int n = collect_operands(words, count, operands, 1, &options);
     if (n < 0 || (options & ~OPT_H) || n > 0) { uart_puts("df: usage: df [-h]\r\n"); return; }
-    uint64_t total = fs_total_sectors() * 512ULL;
-    uint64_t used = fs_used_sectors() * 512ULL;
-    uint64_t freeb = total > used ? total - used : 0;
     uart_puts("Filesystem  Total  Used  Free\r\n");
-    if (options & OPT_H) { print_human_bytes(total); uart_putc(' '); print_human_bytes(used); uart_putc(' '); print_human_bytes(freeb); }
-    else { print_u64(total); uart_putc(' '); print_u64(used); uart_putc(' '); print_u64(freeb); }
-    uart_puts("  /\r\n");
+    int cnt = fs_mount_count();
+    for (int i = 0; i < cnt; ++i)
+    {
+        FsMountInfo mi;
+        if (fs_mount_info(i, &mi) != 0) continue;
+        uint64_t total = mi.total_sectors * 512ULL;
+        uint64_t used = mi.used_sectors * 512ULL;
+        uint64_t freeb = total > used ? total - used : 0;
+        if (options & OPT_H) { print_human_bytes(total); uart_putc(' '); print_human_bytes(used); uart_putc(' '); print_human_bytes(freeb); }
+        else { print_u64(total); uart_putc(' '); print_u64(used); uart_putc(' '); print_u64(freeb); }
+        uart_puts("  "); uart_puts(mi.dir); uart_puts("\r\n");
+    }
 }
 
 static void command_wc(char* argument)
@@ -1361,6 +1612,7 @@ static void command_stat(char* argument)
     if (rc != 0) { uart_puts(rc == -13 ? "stat: permission denied\r\n" : "stat: path not found\r\n"); return; }
     uart_puts("  File: "); uart_puts(words[0]); uart_puts("\r\n");
     uart_puts("  Inode: "); print_u64(st.inode);
+    { int lc = fs_link_count(fs_resolve(words[0], vfs_cwd())); uart_puts("  Links: "); print_u64((uint64_t)(lc > 0 ? lc : 1)); }
     uart_puts("  Type: "); uart_puts(st.type == FS_DIR ? "directory\r\n" : "regular file\r\n");
     uart_puts("  Mode: ");
     uart_putc((char)('0' + ((st.mode >> 6) & 7U)));
@@ -1474,8 +1726,11 @@ static void command_echo_redirect(const char* text, const char* path, int append
 static int handle_shell_operators(const char* line)
 {
     if (!line) return 0;
+    char shq = 0;
     for (int i = 0; line[i]; ++i)
     {
+        if (shq) { if (line[i] == shq) shq = 0; continue; }
+        if (line[i] == '"' || line[i] == '\'') { shq = line[i]; continue; }
         if (line[i] == '|')
         {
             char left[256], right[256];
@@ -1708,93 +1963,109 @@ static void command_unset(const char* argument)
     else if (rc != 0) uart_puts("unset: invalid variable name\r\n");
 }
 
-static void command_help()
+struct HelpSection { const char* key; const char* title; const char* body; };
+static const HelpSection help_sections[] = {
+{"files", "FILES & DIRECTORIES",
+ "  ls [-l -a -R] [dir]   list            pwd / cd <dir>       where am I / go\r\n"
+ "  mkdir [-p] <d>        make directory  rmdir <d>            remove empty dir\r\n"
+ "  touch [-c] <f>        create/update   write <f> <text>     write a file\r\n"
+ "  cat [-n] <f>          read file       rm [-r -f] <f>       delete\r\n"
+ "  cp [-r -f] <a> <b>    copy            mv [-f] <a> <b>      move (also across mounts)\r\n"
+ "  ln [-s] <a> <b>       hard link / symlink (-s)   readlink <l>   show symlink target\r\n"
+ "  stat <p>              inode, mode, owner, link count\r\n"
+ "  chmod <mode> <p>  chown <uid> <gid> <p>  truncate <p> <size>\r\n"
+ "  tree  find [path] -name <n> | -type <f|d>  du [-h -s] [p]  df [-h]  sync\r\n"
+ "  nano <f>              text editor     more|less <f>        pager (space, enter, q)\r\n"
+ "  hexdump <f>           hex + ASCII dump (user program)\r\n"},
+{"text", "TEXT PROCESSING (work in pipes: cmd | filter)",
+ "  grep [-n -i -v -c] <pat> [f]   search         wc [-l -w -c] [f]   count\r\n"
+ "  head [-n N]  tail [-n N]  sort [-r -n -u]  uniq [-c]  cut -d <c> -f <n>  tr [-d] a b  tee <f>\r\n"
+ "  awk [-F sep] 'prog' [f]        patterns, print/printf, arrays, integer math\r\n"
+ "  sed [-n] 's/re/x/g' [f]        stream editor: s d p q y =, addresses, regex\r\n"
+ "  xargs [-n N] [-I{}] cmd        build command lines from stdin\r\n"
+ "  rev  tac  nl [f]               reverse chars / reverse lines / number lines\r\n"
+ "  seq [a] b   basename <p>  dirname <p>   echo <text>   printf <fmt> [args]   expr A op B\r\n"},
+{"shell", "SHELL & SCRIPTING",
+ "  > >> < 2> &> 2>&1  |  &  &&  ||  ;     redirection, pipes, background, lists  (man redirect)\r\n"
+ "  *.txt  ?.c   $(cmd)  `cmd`  $VAR  $?    wildcards, substitution (man glob, man subst)\r\n"
+ "  name() { cmd; }  return n               functions (man function)\r\n"
+ "  if / while / for ... do ... done        let X=1+2   test / [ ... ]   read VAR   true  false\r\n"
+ "  env  export V=x  unset V                environment\r\n"
+ "  alias [n=cmd]  unalias n|-a             command aliases\r\n"
+ "  history [n|-c|-w|-r]                    list / clear / save to ~/.history / reload\r\n"
+ "  jobs  fg [%n]  bg [%n]  kill [-9] <pid|%n>  wait    job control (Ctrl-C stops, Ctrl-Z suspends)\r\n"
+ "  sh <script>  source <script>  sleep <s>  which <cmd>  man <cmd>  clear  exit\r\n"},
+{"system", "SYSTEM & PROCESSES",
+ "  version  uname  uptime  date [-u] [+fmt] | date -s 'YYYY-MM-DD HH:MM:SS'\r\n"
+ "  mem  free  pages  stats  ps  tasks  sched  threads  thread-demo  fds  smp  level  mmu\r\n"
+ "  exec <elf>  apps  elf  hello  calc [expr]  syscall <t>  user demo  userdemo\r\n"
+ "  log [0-3]  irq [status|on|off|oneshot|selftest] [hz]  fbinfo  selftest  jtest <file>\r\n"
+ "  poweroff | halt | shutdown   reboot\r\n"},
+{"users", "USERS & SECURITY",
+ "  whoami  id  users   su [root|user]  logout  user [password]   (root password: 123)\r\n"
+ "  useradd <n>  userdel <n>  passwd [n]       account management (root)\r\n"
+ "  chmod / chown                              file permissions\r\n"
+ "  quota [list|<uid>] | quota set <uid> <KiB> per-user disk quota (root sets)\r\n"
+ "  fw ...                                     packet filter, see 'help network'\r\n"},
+{"storage", "DISKS & FILESYSTEMS",
+ "  disk  diskread <sec>  diskwrite <sec> <text>  diskflush     raw VirtIO disk access\r\n"
+ "  lspci  nvme  sata                          PCI, NVMe and AHCI/SATA controllers\r\n"
+ "  mount                                      list mounts;  mount [-r] <dev> <dir>  (ram0 ram1 nvme0n1 sda)\r\n"
+ "  mount -t tmpfs none <dir>  mount -o remount,ro|rw   mkfs <dev>   umount <dir>\r\n"
+ "  df [-h]  du  fsck [-r] [mnt]               usage and consistency check (-r repairs)\r\n"
+ "  ln <a> <b>                                 hard link (shared data, link count in stat)\r\n"
+ "  fat mkfs|info|ls|cat|write|mkdir|rm <dev> ...   FAT32 volumes with long names (man fat)\r\n"
+ "  usb [selftest]                             xHCI USB, HID keyboard and mouse\r\n"},
+{"network", "NETWORK",
+ "  net  ifconfig  dhcp [status|renew|release]  dnsserver <ip>  nslookup <host>\r\n"
+ "  ping <ip>  ping6 <ipv6>                    ICMP echo over IPv4 / IPv6\r\n"
+ "  httpget <host> [path]   wget <url> [file]   httpsget <host> [path]   HTTP/HTTPS (TLS 1.3)\r\n"
+ "  curl [-s -i -I -L -o f -X M -H h -d data] <url>   full HTTP client\r\n"
+ "  nc [-z] <host> <port> [text]  nc -l <port>   TCP client/server (IPv4 + IPv6)\r\n"
+ "  udp6 send|listen ...   telnet <host> [port]   httpd <port> [n]   tiny web server\r\n"
+ "  ntpdate [-q] <server>                      set the clock over NTP\r\n"
+ "  fw [list]  fw add|insert <allow|deny> <in|out|both> <tcp|udp|icmp|any> [ip[/n]] [port]\r\n"
+ "  fw del <n>  fw flush  fw default <in|out> <allow|deny>      firewall (root changes rules)\r\n"},
+{"libc", "USER PROGRAMS & LIBC",
+ "  hexdump <f>   libctest   hello  spin  upper  lcount  pipetest  ktest  dltest (see 'apps')\r\n"
+ "  libctest checks printf/stdio/string/math/locale of the user libc (18 tests)\r\n"
+ "  any /bin/<name>.elf runs by typing its name; exec <file> runs an ELF path\r\n"},
+};
+
+static void command_help(const char* argument)
 {
-    uart_puts(
-        "Available commands:\r\n"
-        "  help                 Show help\r\n"
-        "  man <command>        Show per-command manual\r\n"
-        "  clear                Clear screen\r\n"
-        "  version              Show kernel version\r\n"
-        "  mem                  Show memory\r\n"
-        "  echo <text>          Print text\r\n"
-        "  hello                Test kernel\r\n"
-        "  ls [options] [dir]   List files (-l long, -a hidden, -R recursive)\r\n"
-        "  pwd                  Show current path\r\n"
-        "  cd <path>            Change directory\r\n"
-        "  mkdir <name>         Create directory; -p creates parents\r\n"
-        "  touch <name>         Create/update file; -c skips missing files\r\n"
-        "  write <file> <text>  Write file\r\n"
-        "  cat <file>           Read file; -n numbers lines\r\n"
-        "  rm <file>            Delete file; -r recursive, -f force\r\n"
-        "  cp <src> <dst>       Copy file; -r recursive, -f overwrite\r\n"
-        "  mv <src> <dst>       Move/rename; -f overwrite\r\n"
-        "  grep [options] <pattern> <file>  Search file (-n line, -i ignore case, -v invert, -c count)\r\n"
-        "  find [path] -name <name>         Find by name\r\n"
-        "  find [path] -type <f|d>          Find by type\r\n"
-        "  history [n|-c]       Show/clear command history\r\n"
-        "  date [-u] [format]   Show RTC date/time; date -s YYYY-MM-DD HH:MM:SS\r\n"
-        "  du [-h] [-s] [path]  Show disk usage\r\n"
-        "  df [-h]              Show filesystem free/used space\r\n"
-        "  wc [-lwc] <file>     Count lines/words/chars\r\n"
-        "  chmod <mode> <file>  Change file mode (owner or root)\r\n"
-        "  stat <path>          Show inode/permission/owner metadata\r\n"
-        "  chown <uid> <gid> <path>  Change owner (root only)\r\n"
-        "  truncate <path> <size>  Resize file (max 4194304 bytes)\r\n"
-        "  env                  Show environment variables\r\n"
-        "  export VAR=val       Set environment variable\r\n"
-        "  unset VAR           Remove environment variable\r\n"
-        "  shell: > >> 2> &> 2>&1 <  Redirection for all built-ins (man redirect)\r\n"
-        "  shell: *.txt ?.c     Wildcards (man glob);  $(cmd) `cmd`  substitution (man subst)\r\n"
-        "  name() { cmd; }      Shell functions, 'return n' (man function)\r\n"
-        "  tree                 Show filesystem tree\r\n"
-        "  ps                   Show processes\r\n"
-        "  uptime               Show uptime\r\n"
-        "  sched                Show scheduler status\r\n"
-        "  exec <file>          Execute an ELF program\r\n"
-        "  nano <file>          Text editor (relative to current dir)\r\n"
-        "  calc [expr]          Calculator app (interactive if no expr)\r\n"
-        "  elf                  Show ELF loader status\r\n"
-        "  syscall <test>        Test syscall interface\r\n"
-        "  user [password]      Login as user (password: 123)\r\n"
-        "  user demo            Run preserved EL0 userspace demo\r\n"
-        "  userdemo             Run preserved EL0 userspace demo\r\n"
-        "  su [root|user]       Switch user; root asks for password\r\n"
-        "  logout               Return from root to user\r\n"
-        "  level                Show current CPU privilege level\r\n"
-        "  mmu                  Show MMU status\r\n"
-        "  disk                 Show VirtIO disk status\r\n"
-        "  diskread <sector>    Read and inspect a 512-byte sector\r\n"
-        "  diskwrite <sector> <text>  Write text to a sector\r\n"
-        "  diskflush            Flush disk cache\r\n"
-        "  apps                 List bundled user programs\r\n"
-        "  uname                Show kernel identity\r\n"
-        "  whoami               Show current security domain\r\n"
-        "  net                  Show network status\r\n"
-        "  ifconfig             Show IPv4/MAC/gateway/DNS settings\r\n"
-        "  ping <ip>            Send ICMP echo request\r\n"
-        "  nslookup <hostname>  Resolve a DNS A record over UDP\r\n"
-        "  usb [selftest]       xHCI USB status (HID keyboard/mouse)\r\n"
-        "  httpget <host> [path] Fetch a plain HTTP page over TCP\r\n"
-        "  wget <url|host[:port] [path]> [file]  Download over HTTP/HTTPS to a file\r\n"
-        "  httpsget <host[:port]> [path]    HTTPS page (TLS 1.3, no cert check)\r\n"
-        "  nc [-z] <host> <port> [text]      TCP client; nc -l <port> listens once\r\n"
-        "  telnet <host> [port]  Interactive TCP session (Ctrl-] quits)\r\n"
-        "  dhcp [status|renew|release]  DHCP lease control (auto at boot)\r\n"
-        "  dnsserver <ipv4>     Set DNS server (root only)\r\n"
-        "  selftest             Run kernel integration checks\r\n"
-        "  pages                Show physical page allocator\r\n"
-        "  tasks                Show scheduler and processes\r\n"
-        "  threads              Show cooperative kernel threads\r\n"
-        "  smp                  Show CPU topology; SMP remains disabled by default\r\n"
-        "  fbinfo               Show framebuffer terminal status\r\n"
-        "  fds                  List open file descriptors\r\n"
-        "  thread-demo          Test cooperative context switching\r\n"
-        "  mount                Show storage and filesystem mount\r\n"
-        "  stats                Show system statistics\r\n"
-        "  log [0-3]            Show/set log level\r\n"
-        "  irq [status|on|off|oneshot|stagec|staged|selftest] [hz]  Timer IRQ control/tests\r\n"
-    );
+    const int count = (int)(sizeof(help_sections) / sizeof(help_sections[0]));
+    char topic[24]; topic[0] = 0;
+    if (argument) { int i = 0; while (*argument == ' ') ++argument; while (argument[i] && argument[i] != ' ' && i < 23) { topic[i] = argument[i]; ++i; } topic[i] = 0; }
+    if (topic[0] && !str_equal(topic, "all"))
+    {
+        for (int i = 0; i < count; ++i)
+            if (str_equal(topic, help_sections[i].key))
+            {
+                uart_puts(help_sections[i].title); uart_puts("\r\n"); uart_puts(help_sections[i].body);
+                uart_puts("  (details of any command: man <command>)\r\n");
+                return;
+            }
+        uart_puts("help: no category '"); uart_puts(topic); uart_puts("'. Try: help\r\n");
+        return;
+    }
+    if (!topic[0])
+    {
+        uart_puts("RioOS help\r\n==========\r\n"
+                  "  help <category>   show one category;  help all   show everything;  man <command>   manual page\r\n\r\n"
+                  "  files    ls cd mkdir cat cp mv rm ln stat chmod find du df tree nano more hexdump ...\r\n"
+                  "  text     grep awk sed xargs sort uniq cut tr head tail wc rev tac nl printf expr ...\r\n"
+                  "  shell    redirects, pipes, jobs, functions, alias, history, env, scripts\r\n"
+                  "  system   version uname uptime date mem ps tasks sched irq poweroff reboot ...\r\n"
+                  "  users    su useradd passwd id quota permissions\r\n"
+                  "  storage  disk mount mkfs umount fsck fat nvme sata lspci usb\r\n"
+                  "  network  dhcp ping wget curl nc telnet httpd ntpdate fw ping6 udp6 ...\r\n"
+                  "  libc     user programs (hexdump, libctest, ...)\r\n");
+        return;
+    }
+    uart_puts("RioOS commands\r\n==============\r\n");
+    for (int i = 0; i < count; ++i)
+    { uart_puts("\r\n["); uart_puts(help_sections[i].title); uart_puts("]\r\n"); uart_puts(help_sections[i].body); }
 }
 
 static void command_mem()
@@ -2319,6 +2590,37 @@ static void command_mv(char* argument)
         rc = fs_rename(from, to, cwd);
         if (rc == 0) { uart_puts("Moved.\r\n"); return; }
     }
+    if (rc == -18)
+    {
+        /* different filesystems: copy then remove */
+        int src = fs_resolve(from, cwd);
+        if (src < 0) { uart_puts("mv: source not found\r\n"); return; }
+        int dst = fs_resolve(to, cwd);
+        char target[256];
+        if (dst >= 0 && fs_get_type(dst) == FS_DIR)
+        { if (build_child_path(to, fs_get_name(src), target, sizeof(target)) != 0) { uart_puts("mv: path too long\r\n"); return; } }
+        else str_copy(target, to, sizeof(target));
+        int tid = fs_resolve(target, cwd);
+        if (tid >= 0 && !force) { uart_puts("mv: destination already exists\r\n"); return; }
+        if (fs_get_type(src) == FS_FILE)
+        {
+            uint64_t size = 0;
+            if (tid >= 0 && fs_get_type(tid) == FS_DIR) { uart_puts("mv: cannot replace a directory\r\n"); return; }
+            if (fs_read_file(from, cwd, cp_buffer, CP_MAX_SIZE, &size) != 0) { uart_puts("mv: read failed (file too large)\r\n"); return; }
+            if (fs_write_data(target, cwd, cp_buffer, size) != 0) { uart_puts("mv: write failed (destination full?)\r\n"); return; }
+            tid = fs_resolve(target, cwd);
+            if (tid >= 0) (void)fs_set_mode(tid, fs_get_mode(src));
+            if (fs_rm(from, cwd) != 0) { uart_puts("mv: copied but cannot remove source\r\n"); return; }
+        }
+        else
+        {
+            if (directory_contains_path(src, target, cwd)) { uart_puts("mv: cannot move a directory into itself\r\n"); return; }
+            if (copy_tree_node(src, target, cwd, 1, force) != 0) { uart_puts("mv: copy failed\r\n"); return; }
+            if (fs_rm_recursive(from, cwd) != 0) { uart_puts("mv: copied but cannot remove source\r\n"); return; }
+        }
+        uart_puts("Moved (across filesystems).\r\n");
+        return;
+    }
     if (rc == -1) uart_puts("mv: source not found\r\n");
     else if (rc == -2) uart_puts("mv: destination already exists\r\n");
     else if (rc == -3) uart_puts("mv: cannot move the root directory\r\n");
@@ -2518,6 +2820,9 @@ static void command_apps()
     uart_puts("/bin/init.elf    - userspace self-test/demo\r\n");
     uart_puts("/bin/nano.elf    - text editor (command: nano)\r\n");
     uart_puts("/bin/calc.elf    - full terminal calculator (command: calc)\r\n");
+    uart_puts("/bin/hexdump.elf - hex + ASCII dump of a file (command: hexdump <file>)\r\n");
+    uart_puts("/bin/libctest.elf - libc part 2 self-test: FILE stdio, sscanf, strtok, math (command: libctest)\r\n");
+    uart_puts("/bin/hello.elf, upper.elf, lcount.elf, spin.elf, ktest.elf, dltest.elf, pipetest.elf - demos and tests\r\n");
 }
 
 static void command_uname()
@@ -2841,6 +3146,30 @@ static int net_resolve_host(const char* name, uint32_t* ip, const char* who)
     return 0;
 }
 
+static int host_is_v6(const char* h) { for (; *h; ++h) if (*h == ':') return 1; return 0; }
+
+/* Connect a new TCP socket to an IPv4 name/address or an IPv6 literal. Returns the handle, or -1 (quiet=1: no message). */
+static int tcp_open_any(const char* host, int port, uint32_t timeout, const char* who, int quiet)
+{
+    int sk = net_tcp_socket(0);
+    if (sk < 0) { if (!quiet) { uart_puts(who); uart_puts(": no socket\r\n"); } return -1; }
+    int rc;
+    if (host_is_v6(host))
+    {
+        uint8_t a6[16];
+        if (net_ip6_parse(host, a6) != 0) { if (!quiet) { uart_puts(who); uart_puts(": bad IPv6 address\r\n"); } net_tcp_close(0, sk); return -1; }
+        rc = net_tcp6_connect(0, sk, a6, (uint16_t)port, timeout);
+    }
+    else
+    {
+        uint32_t ip;
+        if (net_resolve_host(host, &ip, who) != 0) { net_tcp_close(0, sk); return -1; }
+        rc = net_tcp_connect(0, sk, ip, (uint16_t)port, timeout);
+    }
+    if (rc != 0) { net_tcp_close(0, sk); return -1; }
+    return sk;
+}
+
 static int ctrl_break_seen = 0;
 static int ctrl_break_filter(int c) { if (c == 3 || c == 0x1D) { ctrl_break_seen = 1; return 1; } return 0; }
 
@@ -2867,7 +3196,9 @@ static void command_nc(const char* argument)
         }
         net_tcp_close(0, ls);
         if (cs < 0) { uart_puts("nc: no connection\r\n"); return; }
-        uart_puts("nc: connection from "); net_print_ipv4(pip); uart_puts("\r\n");
+        uart_puts("nc: connection from ");
+        { uint8_t p6[16]; if (net_tcp_peer6(0, cs, p6)) net_ip6_print(p6); else net_print_ipv4(pip); }
+        uart_puts("\r\n");
         char rb[256];
         for (int idle = 0; idle < 10 && !ctrl_break_seen; )
         {
@@ -2883,15 +3214,14 @@ static void command_nc(const char* argument)
         return;
     }
     if (n - a < 2) { uart_puts("usage: nc [-z] <host> <port> [text...]  |  nc -l <port>\r\n"); return; }
-    uint32_t ip; int port = parse_uint(w[a + 1], -1);
+    int port = parse_uint(w[a + 1], -1);
     if (port <= 0 || port > 65535) { uart_puts("nc: bad port\r\n"); return; }
-    if (net_resolve_host(w[a], &ip, "nc") != 0) return;
-    int sk = net_tcp_socket(0);
-    if (sk < 0) { uart_puts("nc: no socket\r\n"); return; }
-    if (net_tcp_connect(0, sk, ip, (uint16_t)port, 4000U) != 0)
+    int sk = tcp_open_any(w[a], port, 4000U, "nc", zero);
+    if (sk < 0)
     {
-        uart_puts(zero ? "nc: " : "nc: connect failed: "); uart_puts(w[a]); uart_puts(" "); uart_puts(w[a + 1]); uart_puts(zero ? " closed\r\n" : "\r\n");
-        net_tcp_close(0, sk); return;
+        if (zero) { uart_puts("nc: "); uart_puts(w[a]); uart_puts(" "); uart_puts(w[a + 1]); uart_puts(" closed\r\n"); }
+        else { uart_puts("nc: connect failed: "); uart_puts(w[a]); uart_puts(" "); uart_puts(w[a + 1]); uart_puts("\r\n"); }
+        return;
     }
     if (zero) { uart_puts("nc: "); uart_puts(w[a]); uart_puts(" "); uart_puts(w[a + 1]); uart_puts(" open\r\n"); net_tcp_close(0, sk); return; }
     if (a + 2 < n)
@@ -2914,6 +3244,56 @@ static void command_nc(const char* argument)
     net_tcp_close(0, sk);
 }
 
+/* udp6 send <addr> <port> <text> | udp6 listen <port> [count] : UDP over IPv6 link-local */
+static void command_udp6(const char* argument)
+{
+    char buf[220]; str_copy(buf, argument ? argument : "", sizeof(buf));
+    char* w[16]; int n = split_words(buf, w, 16);
+    if (n < 2 || !net_ready()) { uart_puts("usage: udp6 send <ipv6> <port> <text>  |  udp6 listen <port> [count]\r\n"); return; }
+    int sk = net_udp_socket(0);
+    if (sk < 0) { uart_puts("udp6: no socket\r\n"); return; }
+    if (str_equal(w[0], "send") && n >= 4)
+    {
+        uint8_t a6[16]; int port = parse_uint(w[2], -1);
+        if (net_ip6_parse(w[1], a6) != 0 || port <= 0 || port > 65535) { uart_puts("udp6: bad address or port\r\n"); net_udp_close(0, sk); return; }
+        char msg[160]; int mp = 0;
+        for (int i = 3; i < n; ++i) { if (mp) msg[mp++] = ' '; for (const char* q = w[i]; *q && mp < 158; ++q) msg[mp++] = *q; }
+        int rc = net_udp6_sendto(0, sk, a6, (uint16_t)port, msg, (uint32_t)mp);
+        if (rc < 0) { uart_puts("udp6: send failed\r\n"); net_udp_close(0, sk); return; }
+        char rb[200]; uint8_t from[16]; uint16_t fp = 0;
+        int g = net_udp6_recvfrom(0, sk, from, &fp, rb, sizeof(rb), 2500U);
+        if (g < 0) uart_puts("udp6: sent, no reply\r\n");
+        else { uart_puts("udp6: reply from "); net_ip6_print(from); uart_puts(": "); for (int i = 0; i < g; ++i) uart_putc(rb[i]); uart_puts("\r\n"); }
+        net_udp_close(0, sk);
+        return;
+    }
+    if (str_equal(w[0], "listen"))
+    {
+        int port = parse_uint(w[1], -1), count = n > 2 ? parse_uint(w[2], -1) : 1;
+        if (port <= 0 || port > 65535 || count <= 0 || count > 50 || net_udp_bind(0, sk, (uint16_t)port) != 0) { uart_puts("udp6: bad arguments or port in use\r\n"); net_udp_close(0, sk); return; }
+        uart_puts("udp6: listening on port "); print_u64((uint64_t)port); uart_puts(" (Ctrl-C aborts)\r\n");
+        ctrl_break_seen = 0;
+        int got = 0;
+        for (int t = 0; t < 60 && got < count && !ctrl_break_seen; ++t)
+        {
+            uart_poll_job_keys(ctrl_break_filter);
+            char rb[200]; uint8_t from[16]; uint16_t fp = 0;
+            int g = net_udp6_recvfrom(0, sk, from, &fp, rb, sizeof(rb) - 8, 500U);
+            if (g < 0) continue;
+            ++got;
+            uart_puts("udp6: from "); net_ip6_print(from); uart_puts(": "); for (int i = 0; i < g; ++i) uart_putc(rb[i]); uart_puts("\r\n");
+            char rep[220]; int rp = 0; const char* pre = "ack6:";
+            for (int i = 0; pre[i]; ++i) rep[rp++] = pre[i];
+            for (int i = 0; i < g && rp < 210; ++i) rep[rp++] = rb[i];
+            (void)net_udp6_sendto(0, sk, from, fp, rep, (uint32_t)rp);
+        }
+        net_udp_close(0, sk);
+        return;
+    }
+    uart_puts("usage: udp6 send <ipv6> <port> <text>  |  udp6 listen <port> [count]\r\n");
+    net_udp_close(0, sk);
+}
+
 static void command_telnet(const char* argument)
 {
     char buf[120]; str_copy(buf, argument ? argument : "", sizeof(buf));
@@ -2921,13 +3301,10 @@ static void command_telnet(const char* argument)
     if (n < 1) { uart_puts("usage: telnet <host> [port]   (Ctrl-] quits)\r\n"); return; }
     if (!net_ready()) { uart_puts("telnet: network not ready\r\n"); return; }
     int port = n > 1 ? parse_uint(w[1], -1) : 23;
-    uint32_t ip;
     if (port <= 0 || port > 65535) { uart_puts("telnet: bad port\r\n"); return; }
-    if (net_resolve_host(w[0], &ip, "telnet") != 0) return;
-    int sk = net_tcp_socket(0);
-    if (sk < 0) { uart_puts("telnet: no socket\r\n"); return; }
-    uart_puts("Trying "); net_print_ipv4(ip); uart_puts("...\r\n");
-    if (net_tcp_connect(0, sk, ip, (uint16_t)port, 5000U) != 0) { uart_puts("telnet: connection failed\r\n"); net_tcp_close(0, sk); return; }
+    uart_puts("Trying "); uart_puts(w[0]); uart_puts("...\r\n");
+    int sk = tcp_open_any(w[0], port, 5000U, "telnet", 0);
+    if (sk < 0) { uart_puts("telnet: connection failed\r\n"); return; }
     uart_puts("Connected. Escape character is '^]'.\r\n");
     ctrl_break_seen = 0;
     uint8_t rb[256];
@@ -3071,6 +3448,246 @@ static void command_httpsget(const char* argument)
     kfree(body);
 }
 
+/* ============================ curl, ntpdate, fw ============================ */
+static int cw_tokens(char* s, char** w, int cap)           /* quote-aware split ('...' and "...") */
+{
+    int n = 0;
+    while (*s && n < cap)
+    {
+        while (*s == ' ' || *s == '\t') ++s;
+        if (!*s) break;
+        char* o = s; w[n++] = o; char q = 0;
+        while (*s && (q || (*s != ' ' && *s != '\t')))
+        {
+            if (q) { if (*s == q) q = 0; else *o++ = *s; }
+            else if (*s == '"' || *s == '\'') q = *s;
+            else *o++ = *s;
+            ++s;
+        }
+        if (*s) ++s;
+        *o = 0;
+    }
+    return n;
+}
+
+/* One HTTP(S) request. Returns the response size (headers + body) in *out, or -1. status = numeric code. */
+static int curl_request(const char* host, int port, const char* path, int tls, const char* method, const char* hdrs, const char* body, uint32_t blen,
+                        uint8_t** out, int* status, uint32_t* hdr_len)
+{
+    uint32_t ip;
+    if (net_resolve_host(host, &ip, "curl") != 0) return -1;
+    int sk = net_tcp_socket(0);
+    if (sk < 0) { uart_puts("curl: no socket\r\n"); return -1; }
+    if (net_tcp_connect(0, sk, ip, (uint16_t)port, 5000U) != 0) { uart_puts("curl: connection failed\r\n"); net_tcp_close(0, sk); return -1; }
+    if (tls)
+    {
+        int rc = tls_connect(sk, host);
+        if (rc != 0) { uart_puts("curl: TLS handshake failed ("); print_u64((uint64_t)(-rc)); uart_puts(")\r\n"); net_tcp_close(0, sk); return -1; }
+    }
+    char req[1024]; uint32_t rl = 0; req[0] = 0;
+    http_append(req, sizeof(req), &rl, method); http_append(req, sizeof(req), &rl, " "); http_append(req, sizeof(req), &rl, path);
+    http_append(req, sizeof(req), &rl, " HTTP/1.0\r\nHost: "); http_append(req, sizeof(req), &rl, host);
+    http_append(req, sizeof(req), &rl, "\r\nUser-Agent: curl/rioos\r\nAccept: */*\r\nConnection: close\r\n");
+    if (hdrs) http_append(req, sizeof(req), &rl, hdrs);
+    if (body)
+    {
+        char cl[16]; int cn = 0; uint32_t v = blen; char t[12]; int tn = 0;
+        do { t[tn++] = (char)('0' + v % 10); v /= 10; } while (v);
+        while (tn) cl[cn++] = t[--tn]; cl[cn] = 0;
+        http_append(req, sizeof(req), &rl, "Content-Length: "); http_append(req, sizeof(req), &rl, cl); http_append(req, sizeof(req), &rl, "\r\n");
+    }
+    http_append(req, sizeof(req), &rl, "\r\n");
+    if (body && rl + blen < sizeof(req)) { for (uint32_t i = 0; i < blen; ++i) req[rl + i] = body[i]; rl += blen; }
+    int sent = tls ? tls_send(req, rl) : net_tcp_send(0, sk, req, rl, 4000U);
+    if (sent < 0) { uart_puts("curl: send failed\r\n"); if (tls) tls_close(); net_tcp_close(0, sk); return -1; }
+    const uint32_t CAP = 1048576U;
+    uint8_t* buf = (uint8_t*)kmalloc(CAP);
+    if (!buf) { uart_puts("curl: out of memory\r\n"); if (tls) tls_close(); net_tcp_close(0, sk); return -1; }
+    uint32_t total = 0; int idle = 0;
+    ctrl_break_seen = 0;
+    while (total < CAP && idle < 6 && !ctrl_break_seen)
+    {
+        uart_poll_job_keys(ctrl_break_filter);
+        uint32_t want = CAP - total > 1024U ? 1024U : CAP - total;
+        int g = tls ? tls_recv(buf + total, want, 1000U) : net_tcp_recv(0, sk, buf + total, want, 1000U);
+        if (g == 0) break;
+        if (g < 0) { if (tls && g != -110) break; ++idle; continue; }
+        idle = 0; total += (uint32_t)g;
+    }
+    if (tls) tls_close();
+    net_tcp_close(0, sk);
+    uint32_t hl = 0; int found = 0;
+    for (uint32_t i = 0; i + 3 < total; ++i) if (buf[i] == '\r' && buf[i+1] == '\n' && buf[i+2] == '\r' && buf[i+3] == '\n') { hl = i + 4; found = 1; break; }
+    if (!found || total < 12 || buf[0] != 'H') { uart_puts("curl: no valid HTTP response\r\n"); kfree(buf); return -1; }
+    *status = (buf[9] - '0') * 100 + (buf[10] - '0') * 10 + (buf[11] - '0');
+    *hdr_len = hl; *out = buf;
+    return (int)total;
+}
+
+static int curl_find_header(const uint8_t* b, uint32_t hl, const char* name, char* val, int cap)
+{
+    int nl = str_len(name);
+    for (uint32_t i = 0; i + (uint32_t)nl + 1 < hl; ++i)
+    {
+        if (i != 0 && b[i - 1] != '\n') continue;
+        int k = 0; while (k < nl && ((b[i + k] | 32) == (name[k] | 32))) ++k;
+        if (k != nl || b[i + nl] != ':') continue;
+        uint32_t p = i + (uint32_t)nl + 1; while (p < hl && b[p] == ' ') ++p;
+        int v = 0; while (p < hl && b[p] != '\r' && b[p] != '\n' && v < cap - 1) val[v++] = (char)b[p++];
+        val[v] = 0; return 1;
+    }
+    return 0;
+}
+
+static void command_curl(const char* argument)
+{
+    char line[600]; str_copy(line, argument ? argument : "", sizeof(line));
+    char* w[24]; int n = cw_tokens(line, w, 24);
+    int silent = 0, show_hdr = 0, head = 0, follow = 0; const char* outfile = 0; const char* method = 0; const char* data = 0; const char* url = 0;
+    char hdrs[400]; hdrs[0] = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        if (str_equal(w[i], "-s")) silent = 1;
+        else if (str_equal(w[i], "-i")) show_hdr = 1;
+        else if (str_equal(w[i], "-I")) { head = 1; show_hdr = 1; }
+        else if (str_equal(w[i], "-L")) follow = 1;
+        else if (str_equal(w[i], "-o") && i + 1 < n) outfile = w[++i];
+        else if (str_equal(w[i], "-X") && i + 1 < n) method = w[++i];
+        else if (str_equal(w[i], "-d") && i + 1 < n) data = w[++i];
+        else if (str_equal(w[i], "-H") && i + 1 < n) { uint32_t u = (uint32_t)str_len(hdrs); http_append(hdrs, sizeof(hdrs), &u, w[++i]); http_append(hdrs, sizeof(hdrs), &u, "\r\n"); }
+        else if (w[i][0] == '-' && w[i][1]) { uart_puts("curl: unknown option "); uart_puts(w[i]); uart_puts("\r\n"); return; }
+        else if (!url) url = w[i];
+        else { uart_puts("curl: only one URL is supported\r\n"); return; }
+    }
+    if (!url) { uart_puts("usage: curl [-s] [-i|-I] [-L] [-o file] [-X METHOD] [-H 'K: V'] [-d data] <url>\r\n"); return; }
+    if (!net_ready()) { uart_puts("curl: network not ready\r\n"); return; }
+    if (!method) method = head ? "HEAD" : (data ? "POST" : "GET");
+    char host[96], path[200]; int port, tls, next; char* uw[1] = { (char*)url };
+    if (parse_url_args(uw, 1, host, sizeof(host), &port, path, sizeof(path), &tls, &next) != 0) { uart_puts("curl: bad URL\r\n"); return; }
+    uint8_t* resp = 0; int status = 0; uint32_t hl = 0; int total = -1;
+    for (int hop = 0; hop < 4; ++hop)
+    {
+        if (resp) { kfree(resp); resp = 0; }
+        total = curl_request(host, port, path, tls, method, hdrs[0] ? hdrs : 0, data, data ? (uint32_t)str_len(data) : 0, &resp, &status, &hl);
+        if (total < 0) return;
+        if (follow && status >= 300 && status < 400)
+        {
+            char loc[200];
+            if (!curl_find_header(resp, hl, "Location", loc, sizeof(loc))) break;
+            if (loc[0] == '/') str_copy(path, loc, sizeof(path));
+            else { char* lw[1] = { loc }; if (parse_url_args(lw, 1, host, sizeof(host), &port, path, sizeof(path), &tls, &next) != 0) break; }
+            if (!silent) { uart_puts("curl: redirected to "); uart_puts(loc); uart_puts("\r\n"); }
+            if (status == 301 || status == 302 || status == 303) { method = "GET"; data = 0; }
+            continue;
+        }
+        break;
+    }
+    uint32_t blen = (uint32_t)total - hl;
+    if (show_hdr) { for (uint32_t i = 0; i < hl; ++i) { if (resp[i] == '\n' && (i == 0 || resp[i - 1] != '\r')) uart_putc('\r'); uart_putc((char)resp[i]); } }
+    else if (!silent && outfile) { uart_puts("HTTP status "); print_u64((uint64_t)status); uart_puts("\r\n"); }
+    if (outfile)
+    {
+        if (!head && fs_write_data(outfile, vfs_cwd(), resp + hl, blen) < 0) uart_puts("curl: cannot write output file\r\n");
+        else if (!silent) { uart_puts("curl: saved "); uart_puts(outfile); uart_puts(" ("); print_u64(blen); uart_puts(" bytes)\r\n"); }
+    }
+    else if (!head)
+    {
+        for (uint32_t i = 0; i < blen; ++i) { if (resp[hl + i] == '\n') uart_putc('\r'); uart_putc((char)resp[hl + i]); }
+        if (blen && resp[hl + blen - 1] != '\n') uart_puts("\r\n");
+    }
+    kfree(resp);
+}
+
+/* ntpdate [-q] <server> : SNTP query (UDP 123); sets the RTC unless -q (root only) */
+static void command_ntpdate(const char* argument)
+{
+    char line[120]; str_copy(line, argument ? argument : "", sizeof(line));
+    char* w[4]; int n = cw_tokens(line, w, 4);
+    int query = 0; const char* server = 0;
+    for (int i = 0; i < n; ++i) { if (str_equal(w[i], "-q")) query = 1; else if (!server) server = w[i]; else server = 0; }
+    if (!server) { uart_puts("usage: ntpdate [-q] <server>   (-q: only query, do not set the clock)\r\n"); return; }
+    if (!net_ready()) { uart_puts("ntpdate: network not ready\r\n"); return; }
+    if (!query && !security_is_root()) { uart_puts("ntpdate: setting the clock needs root (use -q to only query)\r\n"); return; }
+    uint32_t ip; if (net_resolve_host(server, &ip, "ntpdate") != 0) return;
+    int sk = net_udp_socket(0);
+    if (sk < 0) { uart_puts("ntpdate: no socket\r\n"); return; }
+    uint8_t pkt[48]; for (int i = 0; i < 48; ++i) pkt[i] = 0; pkt[0] = 0x23;
+    uint8_t rsp[96]; uint32_t sip = 0; uint16_t sp = 0; int got = -1;
+    for (int attempt = 0; attempt < 3 && got < 48; ++attempt)
+    {
+        if (net_udp_sendto(0, sk, ip, 123, pkt, 48) < 0) { uart_puts("ntpdate: send failed (blocked or no route)\r\n"); net_udp_close(0, sk); return; }
+        got = net_udp_recvfrom(0, sk, &sip, &sp, rsp, sizeof(rsp), 1500U);
+    }
+    net_udp_close(0, sk);
+    if (got < 48 || (rsp[0] & 7) != 4 || rsp[1] == 0) { uart_puts("ntpdate: no valid reply from "); uart_puts(server); uart_puts("\r\n"); return; }
+    uint32_t secs = ((uint32_t)rsp[40] << 24) | ((uint32_t)rsp[41] << 16) | ((uint32_t)rsp[42] << 8) | rsp[43];
+    if (secs < 2208988800U) { uart_puts("ntpdate: invalid timestamp\r\n"); return; }
+    uint64_t epoch = (uint64_t)secs - 2208988800ULL;
+    uint64_t mine = rtc_get_epoch();
+    uart_puts("server "); uart_puts(server); uart_puts(", stratum "); print_u64(rsp[1]); uart_puts(", offset ");
+    if (epoch >= mine) { uart_putc('+'); print_u64(epoch - mine); } else { uart_putc('-'); print_u64(mine - epoch); }
+    uart_puts(" s\r\n  time: ");
+    print_date_format(epoch, "%Y-%m-%d %H:%M:%S UTC");
+    if (query) return;
+    if (rtc_set_epoch(epoch) != 0) { uart_puts("ntpdate: cannot set the RTC\r\n"); return; }
+    uart_puts("ntpdate: clock set\r\n");
+}
+
+static const char* fw_proto_name(int p) { return p == 6 ? "tcp" : p == 17 ? "udp" : p == 1 ? "icmp" : "any"; }
+static void fw_print_ip(uint32_t ip) { print_u64((ip >> 24) & 255); uart_putc('.'); print_u64((ip >> 16) & 255); uart_putc('.'); print_u64((ip >> 8) & 255); uart_putc('.'); print_u64(ip & 255); }
+static void command_fw(const char* argument)
+{
+    char line[160]; str_copy(line, argument ? argument : "", sizeof(line));
+    char* w[8]; int n = cw_tokens(line, w, 8);
+    if (n == 0 || str_equal(w[0], "list"))
+    {
+        int di, dout; uint32_t pi, po; net_fw_get_state(&di, &dout, &pi, &po);
+        uart_puts("Packet filter (IPv4)\r\n  default inbound : "); uart_puts(di ? "allow" : "deny");
+        uart_puts("\r\n  default outbound: "); uart_puts(dout ? "allow" : "deny"); uart_puts("\r\n");
+        uart_puts("  #  action dir  proto remote            port\r\n");
+        NetFwRule r; int any = 0;
+        for (int i = 0; net_fw_get(i, &r) == 0; ++i)
+        {
+            any = 1; print_u64((uint64_t)i); uart_puts("  "); uart_puts(r.allow ? "allow " : "deny  "); uart_puts(r.dir == 0 ? "in   " : r.dir == 1 ? "out  " : "both ");
+            uart_puts(fw_proto_name(r.proto)); uart_puts("   ");
+            if (r.prefix == 0) uart_puts("any"); else { fw_print_ip(r.ip); uart_putc('/'); print_u64(r.prefix); }
+            uart_puts("   "); if (r.port) print_u64(r.port); else uart_puts("any"); uart_puts("\r\n");
+        }
+        if (!any) uart_puts("  (no rules)\r\n");
+        uart_puts("  dropped: inbound "); print_u64(pi); uart_puts(", outbound "); print_u64(po); uart_puts("\r\n");
+        return;
+    }
+    if (!security_is_root()) { uart_puts("fw: permission denied (root required)\r\n"); return; }
+    if (str_equal(w[0], "flush")) { net_fw_flush(); uart_puts("fw: rules cleared\r\n"); return; }
+    if (str_equal(w[0], "default") && n == 3 && (str_equal(w[1], "in") || str_equal(w[1], "out")) && (str_equal(w[2], "allow") || str_equal(w[2], "deny")))
+    { net_fw_set_default(w[1][0] == 'o', str_equal(w[2], "allow")); uart_puts("fw: default policy set\r\n"); return; }
+    if (str_equal(w[0], "del") && n == 2) { int idx = parse_uint(w[1], -1); if (net_fw_del(idx) != 0) uart_puts("fw: no such rule\r\n"); else uart_puts("fw: rule deleted\r\n"); return; }
+    if ((str_equal(w[0], "add") || str_equal(w[0], "insert")) && n >= 4 && n <= 7)
+    {
+        NetFwRule r; r.used = 1; r.ip = 0; r.prefix = 0; r.port = 0;
+        if (str_equal(w[1], "allow")) r.allow = 1; else if (str_equal(w[1], "deny")) r.allow = 0; else goto usage;
+        if (str_equal(w[2], "in")) r.dir = 0; else if (str_equal(w[2], "out")) r.dir = 1; else if (str_equal(w[2], "both")) r.dir = 2; else goto usage;
+        if (str_equal(w[3], "tcp")) r.proto = 6; else if (str_equal(w[3], "udp")) r.proto = 17; else if (str_equal(w[3], "icmp")) r.proto = 1; else if (str_equal(w[3], "any")) r.proto = 0; else goto usage;
+        if (n >= 5 && !str_equal(w[4], "any"))
+        {
+            char ipb[24]; int k = 0; r.prefix = 32;
+            for (; w[4][k] && w[4][k] != '/' && k < 23; ++k) ipb[k] = w[4][k];
+            ipb[k] = 0;
+            if (w[4][k] == '/') { int pf = parse_uint(w[4] + k + 1, -1); if (pf < 0 || pf > 32) goto usage; r.prefix = (uint8_t)pf; }
+            if (!net_parse_ipv4(ipb, &r.ip)) goto usage;
+            if (r.prefix == 0) r.ip = 0;
+        }
+        if (n >= 6 && !str_equal(w[5], "any")) { int pt = parse_uint(w[5], -1); if (pt <= 0 || pt > 65535) goto usage; r.port = (uint16_t)pt; }
+        int idx = net_fw_add(&r, str_equal(w[0], "insert") ? 0 : -1);
+        if (idx < 0) { uart_puts("fw: rule table full\r\n"); return; }
+        uart_puts("fw: rule added at "); print_u64((uint64_t)idx); uart_puts("\r\n");
+        return;
+    }
+usage:
+    uart_puts("usage: fw [list] | fw add|insert <allow|deny> <in|out|both> <tcp|udp|icmp|any> [ip[/bits]|any] [port|any]\r\n"
+              "       fw del <n> | fw flush | fw default <in|out> <allow|deny>\r\n");
+}
+
 static void command_dnsserver(const char* argument)
 {
     if (!security_is_root())
@@ -3202,6 +3819,11 @@ static void execute_command_inner(
     if (*line == '\0')
         return;
 
+    {
+        static char aliased[1024];
+        if (shellext_alias_expand(line, aliased, sizeof(aliased))) line = aliased;
+    }
+
     /* Compound statements (if/for/while) and sh/source run before expansion. */
     if (script_handle_compound(line))
         return;
@@ -3288,7 +3910,7 @@ static void execute_command_inner(
 
     if (str_equal(command, "help"))
     {
-        command_help();
+        command_help(argument);
         return;
     }
 
@@ -3334,6 +3956,7 @@ static void execute_command_inner(
 
     if (str_equal(command, "grep")) { command_grep(argument); return; }
     if (str_equal(command, "find")) { command_find(argument); return; }
+    if (shellext_handle(command, argument)) return;
     if (str_equal(command, "history")) { command_history(argument); return; }
     if (str_equal(command, "date")) { command_date(argument); return; }
     if (str_equal(command, "du")) { command_du(argument); return; }
@@ -3488,8 +4111,12 @@ static void execute_command_inner(
     if (str_equal(command, "which")) { command_which(argument); return; }
     if (str_equal(command, "dhcp")) { command_dhcp(argument); return; }
     if (str_equal(command, "nc")) { command_nc(argument); return; }
+    if (str_equal(command, "udp6")) { command_udp6(argument); return; }
     if (str_equal(command, "telnet")) { command_telnet(argument); return; }
     if (str_equal(command, "wget")) { command_wget(argument); return; }
+    if (str_equal(command, "curl")) { command_curl(argument); return; }
+    if (str_equal(command, "ntpdate")) { command_ntpdate(argument); return; }
+    if (str_equal(command, "fw")) { command_fw(argument); return; }
     if (str_equal(command, "httpsget")) { command_httpsget(argument); return; }
     if (str_equal(command, "ping6")) { command_ping6(argument); return; }
     if (str_equal(command, "httpd")) { command_httpd(argument); return; }
@@ -3503,6 +4130,10 @@ static void execute_command_inner(
     if (str_equal(command, "readlink")) { command_readlink(argument); return; }
     if (str_equal(command, "jtest")) { command_jtest(argument); return; }
     if (str_equal(command, "mount")) { command_mount(argument); return; }
+    if (str_equal(command, "mkfs")) { command_mkfs(argument); return; }
+    if (str_equal(command, "fsck")) { command_fsck(argument); return; }
+    if (str_equal(command, "fat")) { command_fat(argument); return; }
+    if (str_equal(command, "quota")) { command_quota(argument); return; }
     if (str_equal(command, "stats")) { command_stats(); return; }
     if (str_equal(command, "log")) { command_log(argument); return; }
     if (str_equal(command, "irq")) { command_irq(argument); return; }

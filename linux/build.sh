@@ -113,7 +113,7 @@ ASMFLAGS=(
 
 MODULES=(
     uart memory string fs vfs process sched_policy scheduler timer interrupt keyboard
-    commands version shell history env rtc exceptions syscall user mmu virtio_mmio virtio_input virtio_blk storage thread fd task jobs sha256 script pci nvme ahci filters usb tls
+    commands version shell history env rtc exceptions syscall user mmu virtio_mmio virtio_input virtio_blk storage thread fd task jobs sha256 script pci nvme ahci filters textutils shellext usb tls fat32
     fb console console_font
     elf virtio_net netstack page_alloc fault diag security smp
     kernel
@@ -164,13 +164,14 @@ mkdir -p build/bin
 "$CLANG" "${ASMFLAGS[@]}" -c userspace/libc/crt0.S -o build/bin/crt0.o
 "$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/ulibc.cpp -o build/bin/ulibc.o
 "$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/dl.cpp -o build/bin/dl.o
+"$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/ulibc2.cpp -o build/bin/ulibc2.o
 EXTRA_ELFS=()
 for src in userspace/bin/*.cpp; do
     [[ -f "$src" ]] || continue
     name="$(basename "$src" .cpp)"
     "$CXX" "${UCXXFLAGS[@]}" -c "$src" -o "build/bin/$name.o"
     "$LD" -T userspace/user_init.ld -nostdlib -z max-page-size=0x1000 \
-        build/bin/crt0.o build/bin/"$name".o build/bin/ulibc.o build/bin/dl.o -o "build/bin/$name.elf"
+        build/bin/crt0.o build/bin/"$name".o build/bin/ulibc.o build/bin/ulibc2.o build/bin/dl.o -o "build/bin/$name.elf"
     EXTRA_ELFS+=("build/bin/$name.elf")
     vlog " -> build/bin/$name.elf ready"
 done
@@ -229,7 +230,7 @@ step "6/9" "Linking"
     build/commands.o build/version.o build/shell.o build/history.o build/env.o build/rtc.o build/exceptions.o build/syscall.o build/user.o build/mmu.o \
     build/virtio_mmio.o build/virtio_input.o build/virtio_blk.o build/storage.o build/elf.o build/virtio_net.o \
     build/netstack.o build/page_alloc.o build/fault.o build/diag.o build/security.o \
-    build/fb.o build/console.o build/console_font.o build/thread.o build/fd.o build/smp.o build/task.o build/jobs.o build/sha256.o build/script.o build/pci.o build/nvme.o build/ahci.o build/filters.o build/usb.o build/tls.o \
+    build/fb.o build/console.o build/console_font.o build/thread.o build/fd.o build/smp.o build/task.o build/jobs.o build/sha256.o build/script.o build/pci.o build/nvme.o build/ahci.o build/filters.o build/textutils.o build/shellext.o build/usb.o build/tls.o build/fat32.o \
     -o build/kernel.elf
 
 step "7/9" "Verifying ELF"

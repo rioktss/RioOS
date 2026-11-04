@@ -82,4 +82,23 @@ uint64_t fs_used_sectors();
 int fs_get_child_count(int id);
 int fs_get_child(int id, int index);
 int fs_persistent();
+
+/* ---- multiple mounts ----
+   Node ids are global: (mount index << 12) | inode index (mount 0 = root). Storage device numbers (storage_dev_*):
+   1 = RAM disk 0, 5 = RAM disk 1 (tmpfs), 3 = NVMe, 4 = AHCI/SATA when not the root disk. */
+/* hard links, fsck, quota */
+struct FsckInfo { int inodes, dirs, files, symlinks, hardlinks; int structure_ok, bitmap_ok, repaired; uint64_t sectors_used, leaked, missing; };
+int fs_link_hard(const char* target, const char* linkpath, int cwd);   /* node id or -errno; same-mount regular files with data only */
+int fs_link_count(int id);
+int fs_fsck(const char* path, int cwd, int repair, FsckInfo* out);   /* path = a mount root or NULL (root fs) */
+int fs_quota_set(uint32_t uid, uint64_t bytes);                         /* 0 removes the limit; persisted in /etc/quota */
+int fs_quota_get(uint32_t uid, uint64_t* limit, uint64_t* used);
+
+struct FsMountInfo { int dev; int readonly; int journal; int version; uint64_t total_sectors; uint64_t used_sectors; char dir[96]; };
+int fs_mount_count();
+int fs_mount_info(int index, FsMountInfo* out);                    /* index 0 = root filesystem */
+int fs_mount_device(int dev, const char* path, int cwd, int readonly, int format_fresh);   /* 0 ok, -errno */
+int fs_mkfs_device(int dev);                                       /* format a device (must not be mounted) */
+int fs_umount_path(const char* path, int cwd, int busy_gid);       /* busy_gid: node id the shell is in, or -1 */
+
 #endif

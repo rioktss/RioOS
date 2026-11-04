@@ -112,6 +112,8 @@ extern "C" void kernel_main()
             total_cleared += cnt; if (cnt == 0) break; }
             if (total_cleared > 0) uart_puts("VFS: /tmp cleared (volatile).\r\n");
         }
+        /* /tmp is a real tmpfs (RAM disk 0) mounted over the directory; contents vanish at reboot. */
+        if (fs_mount_device(1, "/tmp", root, 0, 1) == 0) uart_puts("VFS: tmpfs mounted on /tmp.\r\n");
     }
 
     uart_puts("[10] Initializing process manager...\r\n");

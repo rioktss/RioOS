@@ -81,7 +81,7 @@ log = run(C("ktest", "dltest", "id", "echo hello > /home/user/a.txt", "ln -s a.t
 check("core", log, "ktest: 28/28 passed", "dltest ALL PASS", "uid=1000(user)")
 check("fs", log, "[LINK] l1 -> a.txt", "hello", "a.txt", "remounted read-only", "remounted read-write", "journal        : on")
 check("script", log, "n=3", "it1", "it2")
-check("shell", log, "fb-ok", "st=127", "/bin/hello.elf", "\n9\r")
+check("shell", log, "fb-ok", "st=127", "/bin/hello.elf", "\n11\r")
 check("security", log, "Switched to root", "bob  uid=1001", "$rio$3000$", "User created")
 print("== session 1b: reboot recovers the journal")
 log = run(C("cat /jt.txt", "mount"))
@@ -121,7 +121,7 @@ log = run(C("echo hi > /home/user/r1.txt", "echo more >> /home/user/r1.txt", "ca
             "for i in $(seq 100); do mkdir /home/user/n$i; done", "ls /home/user/n100 && echo many-ok"), wait=3)
 check("shell2", log, "hi\r\nmore", "cat: file not found", "==> /home/user/r1.txt <==", "nest x", "1 2 3", "hello bob", "sum=7", "rc=3", "[FILE] t.txt", "many-ok", "Heap   :")
 log = run(C("ls /tmp", "ls /home/user/r1.txt"))
-check("tmp", log, "VFS: /tmp cleared (volatile).")
+check("tmp", log, "VFS: tmpfs mounted on /tmp.")
 print("== session 6: USB xHCI keyboard + mouse")
 log = run(C("usb", "usb selftest", "@sendkey u;sendkey s;sendkey b;sendkey spc;sendkey s;sendkey e;sendkey l;sendkey f;sendkey t;sendkey e;sendkey s;sendkey t;sendkey ret",
             "@mouse_move 10 5;mouse_button 1", "usb"), extra=["-device", "qemu-xhci,id=x", "-device", "usb-kbd,bus=x.0", "-device", "usb-mouse,bus=x.0"],
@@ -135,16 +135,79 @@ docroot = os.path.join(TMP, "www"); os.makedirs(docroot)
 open(os.path.join(docroot, "hello.txt"), "w").write("hello from host web\n")
 tls_srv = subprocess.Popen([sys.executable, os.path.join(ROOT, "tests", "tls_test_server.py"), cert, key, docroot])
 peer_log2 = os.path.join(TMP, "peer2.log")
-peer2 = subprocess.Popen([sys.executable, os.path.join(ROOT, "tests", "qemu_fake_peer2.py"), "70"], env=dict(os.environ, PEER_LOG=peer_log2))
+peer2 = subprocess.Popen([sys.executable, os.path.join(ROOT, "tests", "qemu_fake_peer2.py"), "170"], env=dict(os.environ, PEER_LOG=peer_log2))
 time.sleep(1.5)
 shutil.copy(os.path.join(ROOT, "storage", "disk.img"), os.path.join(TMP, "disk.img"))
 log = run(C("dhcp status", "dhcp renew", "wget 10.0.2.2:8081 /x.txt", "cat x.txt", "nc 10.0.2.2 2323 hi there", "nc -z 10.0.2.2 2323", "nc -z 10.0.2.2 9999",
-            "httpsget 10.0.2.2:8443 /hello.txt", "wget https://10.0.2.2:8443/hello.txt h2.txt", "cat h2.txt"), wait=7, extra=[
+            "httpsget 10.0.2.2:8443 /hello.txt", "wget https://10.0.2.2:8443/hello.txt h2.txt", "cat h2.txt",
+            "udp6 send fe80::ff:fe00:1 5353 v6ping", "nc fe80::ff:fe00:1 2323 hi6", "nc -z fe80::ff:fe00:1 2323", "nc -l 7777"), wait=7, extra=[
     "-netdev", "dgram,id=n0,local.type=inet,local.host=127.0.0.1,local.port=7001,remote.type=inet,remote.host=127.0.0.1,remote.port=7002",
     "-device", "virtio-net-device,netdev=n0,mac=52:54:00:12:34:56"])
 tls_srv.kill(); peer2.kill(); peer2.wait(); tls_srv.wait()
 check("net2", log, "DHCP: lease acquired", "dhcp: bound, server 10.0.2.2, lease 3600 s", "dhcp: lease renewed", "saved x.txt (13 bytes)", "wget-body-ok",
-      "BANNER ready", "ECHO:hi there", "10.0.2.2 2323 open", "10.0.2.2 2323 closed" if False else "10.0.2.2 9999 closed", "--- body (20 bytes", "saved h2.txt (20 bytes)", "hello from host web")
+      "BANNER ready", "ECHO:hi there", "10.0.2.2 2323 open", "10.0.2.2 2323 closed" if False else "10.0.2.2 9999 closed", "--- body (20 bytes", "saved h2.txt (20 bytes)", "hello from host web", "v6ping", "ECHO6:hi6", "fe80::ff:fe00:1 2323 open", "hello-v6-client")
+print("== session 8: multi-mount VFS (tmpfs, ram disk, NVMe/AHCI second disks, EXDEV mv)")
+shutil.copy(os.path.join(ROOT, "storage", "disk.img"), os.path.join(TMP, "disk.img"))
+for n in ("nv.img", "sd.img"):
+    with open(os.path.join(TMP, n), "wb") as f: f.truncate(8 << 20)
+x8 = ["-drive", "file=%s,if=none,id=nv,format=raw" % os.path.join(TMP, "nv.img"), "-device", "nvme,drive=nv,serial=rio",
+      "-device", "ich9-ahci,id=ahci", "-drive", "file=%s,if=none,id=sd,format=raw" % os.path.join(TMP, "sd.img"), "-device", "ide-hd,drive=sd,bus=ahci.0"]
+log = run(C("su", "123", "mount", "df", "echo vol > /tmp/v.txt", "cat /tmp/v.txt", "mkdir /mnt", "mkdir /mnt/a", "mkdir /mnt/b", "mkdir /mnt/c",
+            "mount nvme0n1 /mnt/a", "mkfs nvme0n1", "mount nvme0n1 /mnt/a", "echo nv-data > /mnt/a/f.txt", "cat /mnt/a/f.txt", "mkdir /mnt/a/sub", "echo deep > /mnt/a/sub/d.txt",
+            "mkfs sda", "mount sda /mnt/b", "mount -t tmpfs none /mnt/c", "echo ramdata > /mnt/c/r.txt", "cat /mnt/c/r.txt",
+            "mount", "df", "mv /mnt/a/f.txt /mnt/b/moved.txt", "cat /mnt/b/moved.txt", "ls /mnt/a", "cat /mnt/a/f.txt", "cp /mnt/a/sub/d.txt /mnt/c/d.txt", "cat /mnt/c/d.txt",
+            "mv /mnt/a/sub /mnt/b/subdir", "cat /mnt/b/subdir/d.txt", "cd /mnt/a/..", "ls /mnt", "cd /mnt/a", "umount /mnt/a", "cd /", "rm /mnt/a", "rmdir /mnt/a",
+            "mount nvme0n1 /mnt/a", "mount ram0 /mnt/b", "umount /mnt/b", "umount /mnt/a", "umount /mnt/c", "ls /mnt/a", "mount nvme0n1 /mnt/a", "ls /mnt/a", "cat /mnt/a/f.txt", "echo keep > /mnt/a/keep.txt", "umount /mnt/a", "ls /tmp",
+            "mount -r sda /mnt/b", "mount", "umount /nonexist", "umount /"), wait=3, extra=x8)
+check("mount", log, "VFS: tmpfs mounted on /tmp.", "vol", "no valid filesystem", "nvme0n1 formatted (myfs)", "nvme0n1 mounted on /mnt/a", "nv-data", "sda mounted on /mnt/b",
+      "tmpfs mounted on /mnt/c", "ramdata", "nvme0n1 on /mnt/a type myfs (rw)", "sda on /mnt/b type myfs (rw)", "type tmpfs", "Moved (across filesystems).", "deep",
+      "target is busy", "unmounted", "sda on /mnt/b type myfs (ro)")
+log = run(C("su", "123", "mount nvme0n1 /mnt/a", "ls /mnt/a", "cat /mnt/a/keep.txt", "umount /mnt/a"), wait=3, extra=x8)
+check("mount-persist", log, "nvme0n1 mounted on /mnt/a", "keep\r\n", "unmounted")
+print("== session 9: curl, ntpdate, fw vs fake peer 2")
+peer_log3 = os.path.join(TMP, "peer3.log")
+peer3 = subprocess.Popen([sys.executable, os.path.join(ROOT, "tests", "qemu_fake_peer2.py"), "400"], env=dict(os.environ, PEER_LOG=peer_log3))
+time.sleep(1.5)
+shutil.copy(os.path.join(ROOT, "storage", "disk.img"), os.path.join(TMP, "disk.img"))
+log = run(C("dhcp", "curl http://10.0.2.2:8081/", "curl -i http://10.0.2.2:8081/", "curl -I http://10.0.2.2:8081/", "curl -L http://10.0.2.2:8081/redir",
+            "curl -s -d 'a=1&b=2' http://10.0.2.2:8081/p", "curl -X POST -d hello http://10.0.2.2:8081/p", "curl -H 'X-Test: 42' http://10.0.2.2:8081/",
+            "curl -o /home/user/c.txt http://10.0.2.2:8081/final", "cat /home/user/c.txt", "curl -i http://10.0.2.2:8081/missing", "curl -Z x", "curl",
+            "ntpdate -q 10.0.2.2", "ntpdate 10.0.2.2", "su", "123", "ntpdate 10.0.2.2", "date",
+            "fw", "fw add deny out tcp 10.0.2.2 8081", "curl http://10.0.2.2:8081/", "fw", "fw del 0", "curl http://10.0.2.2:8081/",
+            "fw insert deny out icmp", "ping 10.0.2.2", "fw flush", "ping 10.0.2.2", "fw default out deny", "fw", "curl http://10.0.2.2:8081/", "fw default out allow",
+            "fw add allow in tcp any 22", "fw add bogus", "fw del 99", "fw flush", "fw"), wait=5, extra=[
+    "-netdev", "dgram,id=n0,local.type=inet,local.host=127.0.0.1,local.port=7001,remote.type=inet,remote.host=127.0.0.1,remote.port=7002",
+    "-device", "virtio-net-device,netdev=n0,mac=52:54:00:12:34:56"])
+peer3.kill(); peer3.wait()
+check("curl", log, "wget-body-ok", "HTTP/1.0 200 OK", "Content-Length: 13", "redirected to /final", "final-ok", "POST:a=1&b=2", "POST:hello", "hdr-seen",
+      "saved /home/user/c.txt", "HTTP/1.0 404 Not Found", "curl: unknown option -Z", "usage: curl")
+check("ntpdate", log, "stratum 2", "time: 2030-01-01 00:00:00 UTC", "needs root", "clock set")
+check("fw", log, "(no rules)", "fw: rule added at 0", "curl: connection failed", "fw: rule deleted", "fw: rules cleared", "default outbound: deny", "usage: fw", "fw: no such rule", "dropped: inbound")
+print("== session 10: text tools, shell extras, libc, hard links, fsck, quota, FAT32, help")
+shutil.copy(os.path.join(ROOT, "storage", "disk.img"), os.path.join(TMP, "disk.img"))
+fi = os.path.join(TMP, "fatx.img")
+sys.path.insert(0, os.path.join(ROOT, "tests"))
+import fat_image
+fat_image.mkimage(fi, {"HOST.TXT": b"from-host\n", "A long file name.txt": b"long-name-ok\n"})
+x10 = ["-drive", "file=%s,if=none,id=sd,format=raw" % fi, "-device", "ich9-ahci,id=ahci", "-device", "ide-hd,drive=sd,bus=ahci.0"]
+log = run(C("printf 'a b c\\n1 2 3\\n' > /home/user/t.txt", "awk '{print $2 \"-x\"}' /home/user/t.txt", "sed 's/a/Z/' /home/user/t.txt", "cat /home/user/t.txt | rev", "cat /home/user/t.txt | tac | head -n 1",
+            "cat /home/user/t.txt | nl", "seq 3 | xargs echo n:", "alias ll='ls -l'", "alias", "unalias ll", "printf '%d-%s\\n' 42 hi", "expr 6 '*' 7",
+            "echo kept > /home/user/h1.txt", "ln /home/user/h1.txt /home/user/h2.txt", "stat /home/user/h1.txt", "echo changed > /home/user/h2.txt", "cat /home/user/h1.txt",
+            "rm /home/user/h2.txt", "cat /home/user/h1.txt", "ln /home/user /home/user/dd", "fsck", "su", "123", "quota", "quota set 1000 1", "quota list", "fsck -r",
+            "libctest", "hexdump /home/user/h1.txt", "fat sda info", "fat sda ls", "fat sda cat HOST.TXT", "fat sda cat 'A long file name.txt'", "fat sda put /home/user/h1.txt back.txt", "fat sda cat back.txt", "fat sda mkdir d1", "fat sda ls",
+            "help", "help files", "help all", "help nope"), wait=3, extra=x10)
+check("text", log, "b-x", "2-x", "Z b c", "c b a", "1 2 3", "     2\t1 2 3", "n: 1 2 3" if False else "n: 1", "ll='ls -l'", "42-hi", "42")
+check("hardlink", log, "Links", "kept", "changed", "not allowed", "fsck")
+check("libc", log, "18/18", "00000000")
+check("fat", log, "from-host", "long-name-ok", "back.txt", "d1")
+check("help", log, "RioOS help", "FILES & DIRECTORIES", "RioOS commands", "help: no category")
+print("== session 10b: FAT32 image written by the kernel reads back on the host")
+sd = os.path.join(TMP, "fatk.img")
+with open(sd, "wb") as f: f.truncate(8 << 20)
+run(C("su", "123", "echo kernel-wrote > /home/user/k.txt", "fat sda mkfs KRIO", "fat sda put /home/user/k.txt KFILE.TXT", "fat sda mkdir sub"), wait=3,
+    extra=["-drive", "file=%s,if=none,id=sd,format=raw" % sd, "-device", "ich9-ahci,id=ahci", "-device", "ide-hd,drive=sd,bus=ahci.0"])
+files = fat_image.read_image(sd)
+check("fat-host", repr(files), "KFILE.TXT", "kernel-wrote")
 shutil.rmtree(TMP, ignore_errors=True)
 print("\n%d checks, %d failed" % (total, fails))
 sys.exit(1 if fails else 0)
