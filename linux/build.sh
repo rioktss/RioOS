@@ -160,6 +160,30 @@ UCXXFLAGS=(
     -fno-unwind-tables -fno-asynchronous-unwind-tables
     -nostdinc++ -nostdlib -std=c++17 -O1 -Wall -Wextra -Werror
 )
+# Newer clang releases (19/20+) reject calls that pass a `double` when the target has no FP registers under the
+# default hard-float 'aapcs' ABI ("requires 'double' type support, but ABI 'aapcs' does not support it").
+# The user libc is a soft-float library (doubles travel in integer registers), so pick the first flag set the
+# installed compiler accepts: plain flags (clang 18), then the soft-float ABI variants of newer clang.
+probe_float_abi() {
+    printf 'double f(double); int g(double, ...); int h(double d) { return g(d * 2.0, d) + (int)f(d); }\n' | \
+        "$CXX" "${UCXXFLAGS[@]}" ${1+"$@"} -x c++ -c - -o /dev/null >/dev/null 2>&1
+}
+UABI=()
+if probe_float_abi; then
+    :
+elif probe_float_abi -mabi=aapcs-soft; then
+    UABI=(-mabi=aapcs-soft)
+elif probe_float_abi -mcpu=cortex-a72+nofp -mabi=aapcs-soft; then
+    UABI=(-mcpu=cortex-a72+nofp -mabi=aapcs-soft)
+elif probe_float_abi -march=armv8-a+nofp -mabi=aapcs-soft; then
+    UABI=(-march=armv8-a+nofp -mabi=aapcs-soft)
+else
+    echo "ERROR: this clang ($("$CXX" --version | head -n1)) cannot compile soft-float double code for aarch64." >&2
+    echo "       Use clang 18 or a release that supports -mabi=aapcs-soft (clang 20+)." >&2
+    exit 1
+fi
+if [[ ${#UABI[@]} -gt 0 ]]; then UCXXFLAGS+=("${UABI[@]}"); fi
+vlog " -> user float ABI flags: ${UABI[*]-(default)}"
 mkdir -p build/bin
 "$CLANG" "${ASMFLAGS[@]}" -c userspace/libc/crt0.S -o build/bin/crt0.o
 "$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/ulibc.cpp -o build/bin/ulibc.o
