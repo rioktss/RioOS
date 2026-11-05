@@ -4,6 +4,7 @@
 #include "scheduler.h"
 #include "mmu.h"
 #include "uart.h"
+#include "filters.h"
 #include "timer.h"
 #include "interrupt.h"
 #include "fd.h"
@@ -55,11 +56,15 @@ static void user_execute_inner(const char* path, const char* args)
     uint64_t entry = 0;
     if (process_load_context(pid, &ctx) == 0) entry = ctx.elr;
     static const char hex[] = "0123456789ABCDEF";
-    uart_puts("Starting isolated userspace process: "); uart_puts(path); uart_puts("\r\n");
-    uart_puts("PID: "); put_u((uint64_t)pid);
-    uart_puts("\r\nEntry point: 0x");
-    for (int i = 15; i >= 0; --i) uart_putc(hex[(entry >> (i * 4)) & 15]);
-    uart_puts("\r\nAddress space: isolated; stack: 64 KiB + guard; preemptive (100 Hz)\r\n");
+    int quiet = filters_capturing();            /* program output feeds a pipe / $(...) / redirect: no banner */
+    if (!quiet)
+    {
+        uart_puts("Starting isolated userspace process: "); uart_puts(path); uart_puts("\r\n");
+        uart_puts("PID: "); put_u((uint64_t)pid);
+        uart_puts("\r\nEntry point: 0x");
+        for (int i = 15; i >= 0; --i) uart_putc(hex[(entry >> (i * 4)) & 15]);
+        uart_puts("\r\nAddress space: isolated; stack: 64 KiB + guard; preemptive (100 Hz)\r\n");
+    }
 
     int code = task_wait_foreground(pid, 1);
     if (code == TASK_STOPPED)
@@ -70,9 +75,12 @@ static void user_execute_inner(const char* path, const char* args)
     }
     last_exit_code = code;
     script_set_status(code);
-    uart_puts("Userspace returned to the kernel. Exit code: ");
-    if (code < 0) { uart_putc('-'); put_u((uint64_t)(-(int64_t)code)); } else put_u((uint64_t)code);
-    uart_puts("\r\n");
+    if (!quiet)
+    {
+        uart_puts("Userspace returned to the kernel. Exit code: ");
+        if (code < 0) { uart_putc('-'); put_u((uint64_t)(-(int64_t)code)); } else put_u((uint64_t)code);
+        uart_puts("\r\n");
+    }
 }
 
 void user_execute(const char* path, const char* args)

@@ -19,6 +19,11 @@ int errno = 0;
 #define SYS_MPROTECT 50
 #define SYS_GETUID 51
 #define SYS_SETUID 52
+#define SYS_FS_MKDIR 55
+#define SYS_FS_UNLINK 56
+#define SYS_FS_RENAME 57
+#define SYS_FS_READDIR 58
+#define SYS_TIME_EPOCH 59
 
 static long ret(uint64_t v)
 {
@@ -96,6 +101,20 @@ pid_t getppid(void) { return (pid_t)ret(user_syscall0(SYS_GETPPID)); }
 int kill(pid_t pid, int sig) { return (int)ret(user_syscall2(SYS_KILL, (uint64_t)(long)pid, (uint64_t)sig)); }
 unsigned getuid(void) { return (unsigned)(user_syscall0(SYS_GETUID) & 0xffffffffU); }
 unsigned getgid(void) { return (unsigned)(user_syscall0(SYS_GETUID) >> 32); }
+int mkdir(const char* path, int mode) { (void)mode; return (int)ret(user_syscall1(SYS_FS_MKDIR, (uint64_t)path)); }
+int unlink(const char* path) { return (int)ret(user_syscall1(SYS_FS_UNLINK, (uint64_t)path)); }
+int rmdir(const char* path) { return (int)ret(user_syscall1(SYS_FS_UNLINK, (uint64_t)path)); }
+int rename(const char* a, const char* b) { return (int)ret(user_syscall2(SYS_FS_RENAME, (uint64_t)a, (uint64_t)b)); }
+long readdir_text(const char* path, char* buf, size_t cap) { return ret(user_syscall3(SYS_FS_READDIR, (uint64_t)path, (uint64_t)buf, cap)); }
+long time_epoch(void) { return (long)user_syscall0(SYS_TIME_EPOCH); }
+int stat_path(const char* path, struct RioStat* st)
+{
+    UserFsStat u; long r = ret((uint64_t)user_fs_stat(path, &u));
+    if (r < 0) return -1;
+    st->inode = u.inode; st->type = u.type; st->mode = u.mode; st->uid = u.uid; st->gid = u.gid; st->sector_count = u.sector_count; st->size = u.size; st->mtime = u.mtime;
+    return 0;
+}
+int chmod(const char* path, unsigned mode) { return (int)ret((uint64_t)user_fs_chmod(path, mode)); }
 int setuid(unsigned uid, unsigned gid) { return (int)ret(user_syscall2(SYS_SETUID, uid, gid)); }
 pid_t spawn(const char* path, const char* args, int bg) { return (pid_t)ret(user_syscall3(SYS_SPAWN, (uint64_t)path, (uint64_t)args, (uint64_t)bg)); }
 pid_t spawn_fd(const char* path, const char* args, int in_fd, int out_fd)
@@ -190,6 +209,7 @@ void free(void* p)
 {
     if (!p) return;
     MBlock* b = (MBlock*)p - 1;
+    if (b->flags & 4) { free(b->next); return; }          /* aligned_alloc wrapper header */
     if (b->flags & MB_MMAP) { munmap(b, b->size + sizeof(MBlock)); return; }
     b->flags = MB_FREE;
     if (b->next && (b->next->flags & MB_FREE) && (char*)(b + 1) + b->size == (char*)b->next)
@@ -204,14 +224,47 @@ void free(void* p)
     }
 }
 void* calloc(size_t c, size_t n) { size_t t = c * n; void* p = malloc(t); if (p) memset(p, 0, t); return p; }
+size_t malloc_usable_size(void* p) { if (!p) return 0; MBlock* b = (MBlock*)p - 1; if (b->flags & 4) return 0; return b->size; }
 void* realloc(void* p, size_t n)
 {
     if (!p) return malloc(n);
     if (!n) { free(p); return 0; }
     MBlock* b = (MBlock*)p - 1;
-    if (b->size >= n) return p;
+    if (b->flags & 4) { void* q = malloc(n); if (q) { memcpy(q, p, n); free(p); } return q; }
+    size_t need = (n + 15) & ~(size_t)15;
+    if (!(b->flags & MB_MMAP))
+    {
+        if (b->size >= need)                                   /* shrink in place, give the tail back */
+        {
+            if (b->size >= need + sizeof(MBlock) + 16)
+            {
+                MBlock* r = (MBlock*)((char*)(b + 1) + need);
+                r->size = b->size - need - sizeof(MBlock); r->flags = MB_FREE; r->next = b->next; r->prev = b;
+                if (b->next) b->next->prev = r; else mtail = r;
+                b->next = r; b->size = need;
+                if (r->next && (r->next->flags & MB_FREE) && (char*)(r + 1) + r->size == (char*)r->next)
+                { r->size += sizeof(MBlock) + r->next->size; r->next = r->next->next; if (r->next) r->next->prev = r; else mtail = r; }
+            }
+            return p;
+        }
+        MBlock* nx = b->next;                                  /* grow in place into a free neighbour */
+        if (nx && (nx->flags & MB_FREE) && (char*)(b + 1) + b->size == (char*)nx && b->size + sizeof(MBlock) + nx->size >= need)
+        {
+            b->size += sizeof(MBlock) + nx->size; b->next = nx->next;
+            if (b->next) b->next->prev = b; else mtail = b;
+            if (b->size >= need + sizeof(MBlock) + 16)
+            {
+                MBlock* r = (MBlock*)((char*)(b + 1) + need);
+                r->size = b->size - need - sizeof(MBlock); r->flags = MB_FREE; r->next = b->next; r->prev = b;
+                if (b->next) b->next->prev = r; else mtail = r;
+                b->next = r; b->size = need;
+            }
+            return p;
+        }
+    }
+    else if (b->size >= need) return p;
     void* q = malloc(n);
-    if (q) { memcpy(q, p, b->size); free(p); }
+    if (q) { memcpy(q, p, b->size < n ? b->size : n); free(p); }
     return q;
 }
 
@@ -285,8 +338,8 @@ static int format(Out* o, const char* f, va_list ap)
     {
         if (*f != '%') { out_ch(o, *f); continue; }
         ++f;
-        int left = 0, zero = 0, width = 0, prec = -1, lng = 0, plus = 0;
-        for (;; ++f) { if (*f == '-') left = 1; else if (*f == '0') zero = 1; else if (*f == '+') plus = 1; else if (*f == ' ') {} else break; }
+        int left = 0, zero = 0, width = 0, prec = -1, lng = 0, plus = 0, space = 0, alt = 0;
+        for (;; ++f) { if (*f == '-') left = 1; else if (*f == '0') zero = 1; else if (*f == '+') plus = 1; else if (*f == ' ') space = 1; else if (*f == '#') alt = 1; else break; }
         if (*f == '*') { width = va_arg(ap, int); ++f; } else while (isdigit(*f)) width = width * 10 + (*f++ - '0');
         if (*f == '.') { ++f; prec = 0; if (*f == '*') { prec = va_arg(ap, int); ++f; } else while (isdigit(*f)) prec = prec * 10 + (*f++ - '0'); }
         while (*f == 'l' || *f == 'z' || *f == 'h') { if (*f != 'h') ++lng; ++f; }
@@ -308,6 +361,18 @@ static int format(Out* o, const char* f, va_list ap)
                 char rev[72]; for (int i = 0; i < t; ++i) rev[i] = tmp[t - 1 - i]; rev[t] = 0;
                 if (zero && !left && width > t && (rev[0] == '-' || rev[0] == '+')) { out_ch(o, rev[0]); out_str(o, rev + 1, width - 1, 0, 1, -1); }
                 else out_str(o, rev, width, left, zero, -1);
+                break;
+            }
+            case 'f': case 'F': case 'e': case 'E': case 'g': case 'G':
+            {
+                double dv = va_arg_double(ap);
+                static char fb[1800];
+                int fl = rio_fmt_double(fb, (int)sizeof(fb), dv, *f, prec, plus, space, alt);
+                if (fl >= (int)sizeof(fb)) fl = (int)sizeof(fb) - 1;
+                int sgn = (fb[0] == '-' || fb[0] == '+' || fb[0] == ' ');
+                int finite = isfinite_d(dv);
+                if (zero && !left && finite && width > fl) { if (sgn) { out_ch(o, fb[0]); out_str(o, fb + 1, width - 1, 0, 1, -1); } else out_str(o, fb, width, 0, 1, -1); }
+                else out_str(o, fb, width, left, 0, -1);
                 break;
             }
             case 'c': { char c[2] = { (char)va_arg(ap, int), 0 }; out_str(o, c, width, left, 0, -1); break; }
@@ -368,20 +433,28 @@ char* fgets_fd(int fd, char* buf, int cap)
 /* ---- program start ----------------------------------------------------- */
 void __libc_start(void)
 {
-    static char argbuf[256];
-    static char* argv[18];
+    static char argbuf[512];
+    static char* argv[34];
     int argc = 0;
     argv[argc++] = (char*)"prog";
     argbuf[0] = 0;
     (void)user_syscall2(USER_SYS_GETARG, (uint64_t)argbuf, sizeof(argbuf));
     char* p = argbuf;
-    while (*p && argc < 16)
+    while (*p && argc < 32)
     {
         while (*p == ' ') ++p;
         if (!*p) break;
         argv[argc++] = p;
-        while (*p && *p != ' ') ++p;
-        if (*p) *p++ = 0;
+        char* w = p; char q = 0;                       /* '...' and "..." group words and are removed */
+        while (*p && (q || *p != ' '))
+        {
+            if (q) { if (*p == q) q = 0; else *w++ = *p; }
+            else if (*p == '"' || *p == '\'') q = *p;
+            else *w++ = *p;
+            ++p;
+        }
+        if (*p) ++p;
+        *w = 0;
     }
     argv[argc] = 0;
     exit(main(argc, argv));

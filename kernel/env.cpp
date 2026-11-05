@@ -89,3 +89,11 @@ void env_print()
         uart_puts("\r\n");
     }
 }
+
+const char* env_name_at(int ordinal)
+{
+    int n = 0;
+    for (int i = 0; i < ENV_MAX; ++i)
+        if (envs[i].used) { if (n == ordinal) return envs[i].name; ++n; }
+    return 0;
+}

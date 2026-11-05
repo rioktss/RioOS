@@ -101,7 +101,7 @@ CXXFLAGS=(
     -Iinclude
     --target=aarch64-none-elf -mcpu=cortex-a72 -mgeneral-regs-only -mstrict-align
     -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-builtin
-    -fno-pic -fno-pie -fno-vectorize -fno-slp-vectorize
+    -fno-pic -fno-pie -fno-vectorize -fno-slp-vectorize -ffp-contract=off
     -fno-unwind-tables -fno-asynchronous-unwind-tables
     -nostdinc++ -std=c++17 -O1 -Wall -Wextra -Werror
 )
@@ -156,7 +156,7 @@ UCXXFLAGS=(
     -Iinclude
     --target=aarch64-none-elf -mcpu=cortex-a72 -mgeneral-regs-only
     -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-builtin
-    -fno-pic -fno-pie -fno-vectorize -fno-slp-vectorize
+    -fno-pic -fno-pie -fno-vectorize -fno-slp-vectorize -ffp-contract=off
     -fno-unwind-tables -fno-asynchronous-unwind-tables
     -nostdinc++ -nostdlib -std=c++17 -O1 -Wall -Wextra -Werror
 )
@@ -165,13 +165,17 @@ mkdir -p build/bin
 "$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/ulibc.cpp -o build/bin/ulibc.o
 "$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/dl.cpp -o build/bin/dl.o
 "$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/ulibc2.cpp -o build/bin/ulibc2.o
+"$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/ulibc3.cpp -o build/bin/ulibc3.o
+"$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/ulibm.cpp -o build/bin/ulibm.o
+"$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/softfloat.cpp -o build/bin/softfloat.o
+"$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/deflate.cpp -o build/bin/deflate.o
 EXTRA_ELFS=()
 for src in userspace/bin/*.cpp; do
     [[ -f "$src" ]] || continue
     name="$(basename "$src" .cpp)"
     "$CXX" "${UCXXFLAGS[@]}" -c "$src" -o "build/bin/$name.o"
     "$LD" -T userspace/user_init.ld -nostdlib -z max-page-size=0x1000 \
-        build/bin/crt0.o build/bin/"$name".o build/bin/ulibc.o build/bin/ulibc2.o build/bin/dl.o -o "build/bin/$name.elf"
+        build/bin/crt0.o build/bin/"$name".o build/bin/ulibc.o build/bin/ulibc2.o build/bin/ulibc3.o build/bin/ulibm.o build/bin/softfloat.o build/bin/deflate.o build/bin/dl.o -o "build/bin/$name.elf"
     EXTRA_ELFS+=("build/bin/$name.elf")
     vlog " -> build/bin/$name.elf ready"
 done
@@ -245,6 +249,21 @@ step "8/9" "Running host tests"
     tests/fs_host_test.cpp fs/fs.cpp kernel/string.cpp kernel/rtc.cpp \
     -o "$HOST_TOOLS/fs_host_test"
 "$HOST_TOOLS/fs_host_test" > /dev/null
+
+# soft-float, libm and deflate (user libc) host tests
+"$CXX" -std=c++17 -O2 -fno-strict-aliasing -ffp-contract=off -c userspace/libc/softfloat.cpp -o "$HOST_TOOLS/sf_plain.o"
+"$CXX" -std=c++17 -O2 tests/softfloat_host_test.cpp "$HOST_TOOLS/sf_plain.o" -o "$HOST_TOOLS/softfloat_host_test"
+"$HOST_TOOLS/softfloat_host_test" > /dev/null
+for f in ulibm softfloat; do
+    "$CXX" -std=c++17 -O2 -fno-strict-aliasing -ffp-contract=off -include tests/libm_rename.h -c "userspace/libc/$f.cpp" -o "$HOST_TOOLS/lm_$f.o"
+done
+"$CXX" -std=c++17 -O2 -c tests/libm_host_test.cpp -o "$HOST_TOOLS/lm_test.o"
+"$CXX" -o "$HOST_TOOLS/libm_host_test" "$HOST_TOOLS/lm_test.o" "$HOST_TOOLS/lm_ulibm.o" "$HOST_TOOLS/lm_softfloat.o"
+"$HOST_TOOLS/libm_host_test" > /dev/null
+if echo '#include <zlib.h>' | "$CXX" -x c++ -fsyntax-only - 2>/dev/null; then
+    "$CXX" -std=c++17 -O2 tests/deflate_host_test.cpp userspace/libc/deflate.cpp -lz -o "$HOST_TOOLS/deflate_host_test"
+    "$HOST_TOOLS/deflate_host_test" > /dev/null
+fi
 
 "$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -iquote include -DHOST_TEST \
     tests/net_host_test.cpp net/netstack.cpp \

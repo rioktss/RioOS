@@ -751,8 +751,8 @@ static void command_which(const char* argument)
 {
     if (!argument || !argument[0]) { uart_puts("which: missing operand\r\n"); return; }
     char path[96];
-    if (is_builtin_name(argument)) { uart_puts(argument); uart_puts(": shell built-in\r\n"); return; }
     if (jobs_resolve_program(argument, path, sizeof(path))) { uart_puts(path); uart_puts("\r\n"); return; }
+    if (is_builtin_name(argument)) { uart_puts(argument); uart_puts(": shell built-in\r\n"); return; }
     uart_puts("which: "); uart_puts(argument); uart_puts(" not found\r\n");
 }
 
@@ -1013,6 +1013,14 @@ static const ManualEntry manual_entries[] =
     {"lspci", "list PCIe devices", "lspci", "bus 0 via ECAM; shows class and assigned BARs"},
     {"nvme", "NVMe disk status", "nvme [selftest]", "selftest is read-only on the root disk, read/write on others"},
     {"sata", "AHCI/SATA disk status", "sata [selftest]", "selftest is read-only on the root disk, read/write on others"},
+    {"tar", "create/extract/list tar archives (user program)", "tar -c|-x|-t [-v] [-z] [-C dir] -f archive [paths] | tar czvf out.tgz dir | tar xzf in.tgz -C /dir", "ustar format, gzip with -z or a .gz/.tgz name; paths with .. are refused; -f - uses stdin/stdout; interoperates with GNU tar"},
+    {"gzip", "compress files with DEFLATE (user program)", "gzip [-d -c -k -f -t -l -v -1..-9] <file>", "writes <file>.gz and removes the original unless -k; -c to stdout; -d decompress; -t test; -l list sizes"},
+    {"gunzip", "decompress .gz files", "gunzip [-c -k -f -t] <file.gz>", "same as gzip -d"},
+    {"zcat", "print a .gz file", "zcat <file.gz>", "same as gzip -dc; works in pipes"},
+    {"diff", "compare two files or directories (user program)", "diff [-u|-U N] [-q -i -w -b -r -s] <a> <b>", "normal and unified output; -q only report; -i ignore case; -w ignore all blanks; -b ignore blank changes; -r recurse; -s report identical; exit 0 same / 1 differ / 2 error"},
+    {"vi", "modal text editor (user program)", "vi [-R] [file]", "normal: h j k l arrows 0 ^ $ w b e gg G {n}G x X D dd dw d$ cc cw C yy yw p P u ^R . o O i a I A r R J ~ s S / ? n N ^F ^B, counts. ex: :w [f] :q :q! :wq :x :N :$ :d :r f :e! :s/a/b/[g] :%s/a/b/g :set nu|nonu. ZZ saves and quits. Screen 80x24."},
+    {"pkg", "package manager for .rpk packages (user program)", "pkg list|info|files|install|remove|upgrade|search|verify|owner|build|update", "pkg build [-z] <dir> <out.rpk> (dir holds PKGINFO: name= version= desc= depends=a,b>=1 conflicts= provides=, plus a file tree rooted at /); pkg install <file|name> [-f] resolves dependencies from /var/cache/pkg; database /var/lib/pkg; pkg remove refuses while others depend on it; pkg verify checks size+CRC. Root needed to write system paths"},
+    {"cc", "C compiler + virtual machine (user program)", "cc [-S] [-c] [-o out.rbc] [-s steps] [-D name[=val]] file.c [args] | cc -x prog.rbc [args]", "compiles a C subset to bytecode and runs it: int/long/char/unsigned/void, pointers, arrays, enum, typedef, #define (also with arguments), #ifdef, functions, recursion, all statements incl. switch, string literals, initializers, malloc/free, printf/sprintf/snprintf/scanf/puts/putchar/getchar, str*/mem*, atoi, rand. Not supported: float/double, struct/union, goto, #if expressions. Bounds-checked memory, step limit (-s). -S prints bytecode, -c only checks, -o writes an image"},
     {"hexdump", "hex + ASCII dump of a file (user program)", "hexdump <file>", "runs /bin/hexdump.elf; uses libc fopen/fread"},
     {"libctest", "libc part 2 self-test (user program)", "libctest", "FILE stdio, sscanf, strtok_r, strcasecmp, bsearch, integer math; prints N/N passed"},
     {"fat", "FAT32 volumes on a raw device (not VFS-mounted)", "fat <dev> mkfs [label] | info | ls [path] | cat <p> | get <p> <file> | put <file> <p> | mkdir <p> | rm <p>", "root only; dev ram0 ram1 nvme0n1 sda; reads long names, new names must be 8.3; files up to 1 MiB; works on images made by other OSes"},
@@ -2014,7 +2022,7 @@ static const HelpSection help_sections[] = {
  "  mount -t tmpfs none <dir>  mount -o remount,ro|rw   mkfs <dev>   umount <dir>\r\n"
  "  df [-h]  du  fsck [-r] [mnt]               usage and consistency check (-r repairs)\r\n"
  "  ln <a> <b>                                 hard link (shared data, link count in stat)\r\n"
- "  fat mkfs|info|ls|cat|write|mkdir|rm <dev> ...   FAT32 volumes with long names (man fat)\r\n"
+ "  fat <dev> mkfs|info|ls|cat|get|put|mkdir|rm ...   FAT32 volumes with long names (man fat)\r\n"
  "  usb [selftest]                             xHCI USB, HID keyboard and mouse\r\n"},
 {"network", "NETWORK",
  "  net  ifconfig  dhcp [status|renew|release]  dnsserver <ip>  nslookup <host>\r\n"
@@ -2026,9 +2034,16 @@ static const HelpSection help_sections[] = {
  "  ntpdate [-q] <server>                      set the clock over NTP\r\n"
  "  fw [list]  fw add|insert <allow|deny> <in|out|both> <tcp|udp|icmp|any> [ip[/n]] [port]\r\n"
  "  fw del <n>  fw flush  fw default <in|out> <allow|deny>      firewall (root changes rules)\r\n"},
+{"dev", "ARCHIVES, DEVELOPMENT & EDITING (user programs)",
+ "  tar -c|-x|-t [-v] [-z] [-C dir] -f a.tar [paths]   archives (ustar; -z gzip; also: tar czvf / xzf)\r\n"
+ "  gzip [-d -c -k -f -t -l -v -1..-9] <f>  gunzip <f>  zcat <f>   gzip files (DEFLATE)\r\n"
+ "  diff [-u|-U N] [-q -i -w -b -r -s] <a> <b>   compare files/dirs (exit 0 same, 1 differ, 2 error)\r\n"
+ "  vi [-R] [file]    modal editor: i a o O x dd yy p u ^R . / ? n N w b e gg G :w :q :wq :q! :s :set nu\r\n"
+ "  pkg list|info|files|install|remove|upgrade|search|verify|owner|build|update   package manager (man pkg)\r\n"
+ "  cc [-S -c -o out.rbc -s N -D x=v] file.c [args]   C compiler + VM;  cc -x out.rbc   run image (man cc)\r\n"},
 {"libc", "USER PROGRAMS & LIBC",
  "  hexdump <f>   libctest   hello  spin  upper  lcount  pipetest  ktest  dltest (see 'apps')\r\n"
- "  libctest checks printf/stdio/string/math/locale of the user libc (18 tests)\r\n"
+ "  libctest checks printf/stdio/scanf/string/math(float)/locale/time of the user libc (54 tests)\r\n"
  "  any /bin/<name>.elf runs by typing its name; exec <file> runs an ELF path\r\n"},
 };
 
@@ -2060,6 +2075,7 @@ static void command_help(const char* argument)
                   "  users    su useradd passwd id quota permissions\r\n"
                   "  storage  disk mount mkfs umount fsck fat nvme sata lspci usb\r\n"
                   "  network  dhcp ping wget curl nc telnet httpd ntpdate fw ping6 udp6 ...\r\n"
+                  "  dev      tar gzip gunzip zcat diff vi pkg cc\r\n"
                   "  libc     user programs (hexdump, libctest, ...)\r\n");
         return;
     }
@@ -2120,7 +2136,21 @@ static void command_echo(
         return;
     }
 
-    uart_puts(text);
+    /* quote removal: 'a b' and "a b" lose their quotes (an unmatched quote is kept literally) */
+    char buf[1024]; int w = 0; char q = 0;
+    for (int i = 0; text[i] && w < (int)sizeof(buf) - 1; ++i)
+    {
+        char c = text[i];
+        if (q) { if (c == q) { q = 0; continue; } buf[w++] = c; continue; }
+        if (c == '"' || c == '\'')
+        {
+            int j = i + 1; while (text[j] && text[j] != c) ++j;
+            if (text[j] == c) { q = c; continue; }
+        }
+        buf[w++] = c;
+    }
+    buf[w] = 0;
+    uart_puts(buf);
     uart_puts("\r\n");
 }
 

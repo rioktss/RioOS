@@ -84,3 +84,9 @@ Round 2: host test `tls_host_test` (RFC 7748 X25519 vectors, NIST AES-GCM cases 
 - session 7: `tests/qemu_fake_peer2.py` TCP server (HTTP, echo, RST) and relay to `tests/tls_test_server.py` (real OpenSSL TLS 1.3): `dhcp renew`, `wget`, `nc`, `httpsget`, `wget https://`
 - session 8 (round 3): multi-mount VFS with a second NVMe and AHCI disk, tmpfs, `mkfs`, `mount/umount/df`, cross-mount `mv`/`cp`, busy checks, persistence across reboot
 - session 7 extended: IPv6 `udp6 send`, `nc` and `nc -z` over v6, `nc -l` accepting a v6 client
+
+Round 5: host tests `softfloat_host_test` (bit-exact vs hardware), `libm_host_test`, `deflate_host_test` (vs zlib) run from build.sh; QEMU sessions added:
+- session 11: `case`/`until`, echo quoting, `cat` pipe, Tab completion of arguments, `diff` (normal/-u/-q/-s/errors), `vi` (insert, yank/put, undo, search, `:s`, `:w`, `.`, `ZZ`, `-R`), new help/man entries
+- session 12: gzip/gunzip/zcat and tar (tar + tgz) exchanged with host Python through a FAT32 image (both directions)
+- session 13: `pkg` (build/update/search/install with dependency/verify/owner/remove protection) and `cc` (`tests/cprog/*.c`: language features, argv, runtime faults, compile errors, `-c -S -o -x`, scanf, step limit)
+- libctest expects 54/54

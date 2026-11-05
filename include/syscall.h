@@ -59,6 +59,11 @@ enum SyscallNumber
     SYS_MPROTECT   = 50,  /* mprotect(addr, length, prot) on mmap/brk memory (W^X enforced) */
     SYS_GETUID     = 51,  /* getuid() -> uid | gid << 32 */
     SYS_NET_TCP_LISTEN = 53, /* tcp_listen(handle, port) */
+    SYS_FS_MKDIR   = 55,  /* mkdir(path) */
+    SYS_FS_UNLINK  = 56,  /* unlink(path): file, symlink or empty directory */
+    SYS_FS_RENAME  = 57,  /* rename(from, to) within one mount */
+    SYS_FS_READDIR = 58,  /* readdir(path, buf, cap): lines "<f|d|l> <size> <name>\n" -> bytes, or -errno */
+    SYS_TIME_EPOCH = 59,  /* seconds since 1970 (RTC) */
     SYS_NET_TCP_ACCEPT = 54, /* tcp_accept(handle, uint64_t* peer(ip|port<<32) or 0, timeout_ms) -> new handle */
     SYS_SETUID     = 52,  /* setuid(uid, gid): root only (drops privilege irreversibly for non-root targets) */
 };

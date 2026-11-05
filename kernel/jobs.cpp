@@ -1,3 +1,4 @@
+#include "memory.h"
 #include "jobs.h"
 #include "script.h"
 #include "task.h"
@@ -42,6 +43,16 @@ static int is_elf_file(const char* path)
     int id = fs_resolve(path, fs_get_root());
     if (id < 0 || fs_get_type(id) != FS_FILE) return 0;
     uint64_t size = 0;
+    uint64_t fsz = fs_file_size(id);
+    if (fsz < 4) return 0;
+    if (fsz > sizeof(probe))                                   /* big program: read into a temporary heap buffer */
+    {
+        uint8_t* big = (uint8_t*)kmalloc(fsz);
+        if (!big) return 0;
+        int ok = fs_read_file(path, fs_get_root(), big, fsz, &size) == 0 && size >= 4 && big[0] == 0x7F && big[1] == 'E' && big[2] == 'L' && big[3] == 'F';
+        kfree(big);
+        return ok;
+    }
     if (fs_read_file(path, fs_get_root(), probe, sizeof(probe), &size) != 0 || size < 4) return 0;
     return probe[0] == 0x7F && probe[1] == 'E' && probe[2] == 'L' && probe[3] == 'F';
 }

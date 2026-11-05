@@ -37,6 +37,8 @@ static uint32_t cap_pop()
     return n;
 }
 
+int filters_capturing() { return cap_depth > 0; }
+
 /* Run a command line and capture everything it prints (CR removed, NUL-terminated). */
 int filters_capture(const char* cmd, char* out, int cap)
 {
@@ -299,6 +301,17 @@ static int apply(char** w, int n, const char* in, uint32_t inlen, char* out, uin
             if (o < FBUF - 1U) out[o++] = c;
         }
     }
+    else if (str_equal(name, "cat"))                 /* pipeline stage: pass through, -n numbers the lines */
+    {
+        int number = (n >= 2 && str_equal(w[1], "-n"));
+        if (n > 2 || (n == 2 && !number && !str_equal(w[1], "-"))) return -2;
+        uint32_t ln = 1; int at_start = 1;
+        for (uint32_t i = 0; i < inlen && o + 16U < FBUF; ++i)
+        {
+            if (number && at_start) { char t[16]; int tn = 0; uint32_t v = ln++; char r[12]; int rn = 0; do { r[rn++] = (char)('0' + v % 10); v /= 10; } while (v); for (int k = rn; k < 6; ++k) t[tn++] = ' '; while (rn) t[tn++] = r[--rn]; t[tn++] = '\t'; for (int k = 0; k < tn; ++k) out[o++] = t[k]; }
+            out[o++] = in[i]; at_start = in[i] == '\n';
+        }
+    }
     else if (str_equal(name, "tee"))
     {
         if (n != 2) return -2;
@@ -313,7 +326,7 @@ static int apply(char** w, int n, const char* in, uint32_t inlen, char* out, uin
 
 int filters_is_filter(const char* name)
 {
-    static const char* f[] = {"grep", "wc", "head", "tail", "sort", "uniq", "cut", "tr", "tee"};
+    static const char* f[] = {"grep", "wc", "head", "tail", "sort", "uniq", "cut", "tr", "tee", "cat"};
     for (unsigned i = 0; i < sizeof(f) / sizeof(f[0]); ++i) if (str_equal(name, f[i])) return 1;
     return textutils_is_filter(name);
 }
@@ -326,7 +339,7 @@ static void print_buf(const char* b, uint32_t n)
 /* head/tail/sort/uniq/cut/tr/tee/grep/wc with a trailing FILE operand. */
 int filters_run_file_command(const char* name, const char* args)
 {
-    if (!filters_is_filter(name) || str_equal(name, "xargs") || str_equal(name, "more") || str_equal(name, "less") || str_equal(name, "grep") || str_equal(name, "wc") || str_equal(name, "tee")) return 0;   /* grep/wc/tee keep their dedicated implementations */
+    if (!filters_is_filter(name) || str_equal(name, "xargs") || str_equal(name, "more") || str_equal(name, "less") || str_equal(name, "grep") || str_equal(name, "wc") || str_equal(name, "tee") || str_equal(name, "cat")) return 0;   /* grep/wc/tee/cat keep their dedicated implementations */
     char* in = (char*)kmalloc(FBUF); char* out = (char*)kmalloc(FBUF); char* line = (char*)kmalloc(512);
     if (!in || !out || !line) { if (in) kfree(in); if (out) kfree(out); if (line) kfree(line); return 1; }
     str_copy(line, name, 64);

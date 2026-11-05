@@ -16,6 +16,7 @@
 #include "thread.h"
 #include "task.h"
 #include "elf.h"
+#include "rtc.h"
 
 extern "C" void user_exit_return();
 
@@ -581,6 +582,62 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
             result = (uint64_t)(int64_t)fs_truncate(path, vfs_cwd(), frame->x[1]);
             break;
         }
+
+        case SYS_FS_MKDIR:
+        case SYS_FS_UNLINK:
+        {
+            char path[SYSCALL_PATH_MAX];
+            if (copy_path((const char*)frame->x[0], path, from_user) != 0) { result = (uint64_t)-14; break; }
+            int rc;
+            if (number == SYS_FS_MKDIR) { rc = fs_resolve(path, vfs_cwd()) >= 0 ? -17 : fs_mkdir(path, vfs_cwd()); if (rc == -1) rc = -2; }
+            else { rc = fs_rm(path, vfs_cwd()); if (rc == -1) rc = -2; else if (rc == -2) rc = -39; else if (rc == -3) rc = -1; else if (rc == -4 || rc == -5) rc = -5; }
+            result = (uint64_t)(int64_t)(rc >= 0 ? 0 : rc);
+            break;
+        }
+
+        case SYS_FS_RENAME:
+        {
+            char from[SYSCALL_PATH_MAX]; char to[SYSCALL_PATH_MAX];
+            if (copy_path((const char*)frame->x[0], from, from_user) != 0 || copy_path((const char*)frame->x[1], to, from_user) != 0) { result = (uint64_t)-14; break; }
+            int rc = fs_rename(from, to, vfs_cwd());
+            result = (uint64_t)(int64_t)(rc == 0 ? 0 : rc == -1 ? -2 : rc == -2 ? -17 : rc == -6 ? -5 : -22);
+            break;
+        }
+
+        case SYS_FS_READDIR:
+        {
+            char path[SYSCALL_PATH_MAX];
+            char* out = (char*)frame->x[1]; uint64_t cap = frame->x[2];
+            if (copy_path((const char*)frame->x[0], path, from_user) != 0 || out == 0 || cap == 0 ||
+                (from_user && !syscall_user_pointer_ok_write(out, cap))) { result = (uint64_t)-14; break; }
+            int id = fs_resolve(path, vfs_cwd());
+            if (id < 0) { result = (uint64_t)-2; break; }
+            if (fs_get_type(id) != FS_DIR) { result = (uint64_t)-20; break; }
+            uint64_t used = 0; int n = fs_get_child_count(id);
+            for (int i = 0; i < n; ++i)
+            {
+                int c = fs_get_child(id, i); if (c < 0) continue;
+                const char* nm = fs_get_name(c); if (!nm) continue;
+                int t = fs_get_type(c);
+                char line[96]; int l = 0;
+                line[l++] = t == FS_DIR ? 'd' : (t == FS_SYMLINK ? 'l' : 'f'); line[l++] = ' ';
+                char dg[24]; int dn = 0; uint64_t sz = t == FS_FILE ? fs_file_size(c) : 0;
+                do { dg[dn++] = (char)('0' + sz % 10); sz /= 10; } while (sz);
+                while (dn) line[l++] = dg[--dn];
+                line[l++] = ' ';
+                for (int k = 0; nm[k] && l < 94; ++k) line[l++] = nm[k];
+                line[l++] = '\n';
+                if (used + (uint64_t)l > cap) break;
+                for (int k = 0; k < l; ++k) out[used + (uint64_t)k] = line[k];
+                used += (uint64_t)l;
+            }
+            result = used;
+            break;
+        }
+
+        case SYS_TIME_EPOCH:
+            result = rtc_get_epoch();
+            break;
 
         case SYS_FS_CHMOD:
         {

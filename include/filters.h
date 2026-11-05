@@ -9,6 +9,7 @@ int filters_run_file_command(const char* name, const char* args);   /* e.g. head
 
 int filters_capture(const char* cmd, char* out, int cap);           /* run a command, capture its output (NUL-terminated); returns length */
 int filters_handle_redirect(const char* line);                      /* > >> 2> 2>> &> 2>&1 for any built-in (echo keeps its legacy handler) */
+int filters_capturing();                                            /* 1 while a command's output is being captured (pipes, $(...), redirects) */
 int filters_glob(const char* in, char* out, int cap);               /* expand * and ? in unquoted words after the command */
 
 #endif

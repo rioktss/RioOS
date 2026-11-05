@@ -49,6 +49,10 @@ def run(cmds, extra=(), disk=True, boot=8, wait=2, env=None, base_disk=None, mon
                 msock.send((part.strip() + "\n").encode()); time.sleep(0.25)
             log += "\n>>> " + c + "\n" + rd(w or wait)
             continue
+        if c.startswith("!"):                      # raw keystrokes, no trailing CR (editor tests)
+            os.write(fd, c[1:].encode())
+            log += "\n>>> " + c + "\n" + rd(w or wait)
+            continue
         os.write(fd, (c + "\r").encode())
         log += "\n>>> " + c + "\n" + rd(w or wait)
     os.kill(pid, 9)
@@ -81,7 +85,7 @@ log = run(C("ktest", "dltest", "id", "echo hello > /home/user/a.txt", "ln -s a.t
 check("core", log, "ktest: 28/28 passed", "dltest ALL PASS", "uid=1000(user)")
 check("fs", log, "[LINK] l1 -> a.txt", "hello", "a.txt", "remounted read-only", "remounted read-write", "journal        : on")
 check("script", log, "n=3", "it1", "it2")
-check("shell", log, "fb-ok", "st=127", "/bin/hello.elf", "\n11\r")
+check("shell", log, "fb-ok", "st=127", "/bin/hello.elf", "\n19\r")
 check("security", log, "Switched to root", "bob  uid=1001", "$rio$3000$", "User created")
 print("== session 1b: reboot recovers the journal")
 log = run(C("cat /jt.txt", "mount"))
@@ -198,7 +202,7 @@ log = run(C("printf 'a b c\\n1 2 3\\n' > /home/user/t.txt", "awk '{print $2 \"-x
             "help", "help files", "help all", "help nope"), wait=3, extra=x10)
 check("text", log, "b-x", "2-x", "Z b c", "c b a", "1 2 3", "     2\t1 2 3", "n: 1 2 3" if False else "n: 1", "ll='ls -l'", "42-hi", "42")
 check("hardlink", log, "Links", "kept", "changed", "not allowed", "fsck")
-check("libc", log, "18/18", "00000000")
+check("libc", log, "54/54", "00000000")
 check("fat", log, "from-host", "long-name-ok", "back.txt", "d1")
 check("help", log, "RioOS help", "FILES & DIRECTORIES", "RioOS commands", "help: no category")
 print("== session 10b: FAT32 image written by the kernel reads back on the host")
@@ -208,6 +212,68 @@ run(C("su", "123", "echo kernel-wrote > /home/user/k.txt", "fat sda mkfs KRIO", 
     extra=["-drive", "file=%s,if=none,id=sd,format=raw" % sd, "-device", "ich9-ahci,id=ahci", "-device", "ide-hd,drive=sd,bus=ahci.0"])
 files = fat_image.read_image(sd)
 check("fat-host", repr(files), "KFILE.TXT", "kernel-wrote")
+
+print("== session 11: case/until, quoting, cat pipe, tab completion, diff, vi")
+shutil.copy(os.path.join(ROOT, "storage", "disk.img"), os.path.join(TMP, "disk.img"))   # earlier sessions set quotas etc.
+log = run(C("case b in a) echo isA;; b|c) echo isBC;; *) echo other;; esac", "i=0", "until [ $i -ge 3 ]; do echo u$i; let i=i+1; done", "echo 'a|b' | cat", "echo hi | cat",
+            "echo tabfile-content > /home/user/zzfile", "!cat /home/user/zzf\t\r", "echo a > /home/user/x1", "echo b >> /home/user/x1", "echo c >> /home/user/x1", "echo d >> /home/user/x1",
+            "echo a > /home/user/x2", "echo B >> /home/user/x2", "echo c >> /home/user/x2", "echo e >> /home/user/x2", "echo f >> /home/user/x2",
+            "diff /home/user/x1 /home/user/x2", "diff -u /home/user/x1 /home/user/x2", "diff -q /home/user/x1 /home/user/x2", "diff -s /home/user/x1 /home/user/x1", "diff /home/user/x1 /nonexist",
+            "vi /home/user/v1", "!ihello world\x1botwo lines\x1byyp", "!ggx", "!3Gdd", "!u", "!:w\r", "!/two\r", "!xP", "!:s/lines/LINES/g\r", "!:wq\r", "cat /home/user/v1",
+            "vi /home/user/v1", "!dw..", "!Go\x1bix y z\x1b:%s/y/Q/\r", "!:set nu\r", "!ddZZ", "wc -l /home/user/v1", "vi -R /home/user/v1", "!x:q\r", "which vi", "help dev", "man pkg", "man cc", "help storage", "which cc"), wait=2, env=None)
+check("case", log, "isBC", "u0", "u2", "a|b", "hi", "tabfile-content")
+check("diff", log, "2c2", "< b", "> B", "4c4,5", "> f", "@@ -1,4 +1,5 @@", "-b", "+B", "Files /home/user/x1 and /home/user/x2 differ", "are identical", "No such file or directory")
+check("devhelp", log, "ARCHIVES, DEVELOPMENT", "tar -c|-x|-t", "package manager for .rpk", "C compiler + virtual machine", "fat <dev> mkfs|info|ls|cat|get|put", "/bin/cc.elf")
+check("vi", log, "ello world\r\ntwo LINES\r\ntwo lines", "3  /home/user/v1", "/bin/vi.elf")
+
+print("== session 12: gzip + tar cross-checked with host python gzip/tarfile")
+import gzip, io, tarfile
+text = ("hello gzip world\n" * 500).encode()
+bio = io.BytesIO()
+with tarfile.open(fileobj=bio, mode="w", format=tarfile.USTAR_FORMAT) as t:
+    for n, d in (("proj/a.txt", b"alpha\n"), ("proj/sub/b.txt", b"beta file\n" * 50), ("proj/c.bin", bytes(range(256)) * 3)):
+        ti = tarfile.TarInfo(n); ti.size = len(d); ti.mode = 0o644; ti.mtime = 1700000000; t.addfile(ti, io.BytesIO(d))
+fi = os.path.join(TMP, "gz.img")
+fat_image.mkimage(fi, {"HOST.GZ": gzip.compress(text, 6), "H.TGZ": gzip.compress(bio.getvalue()), "H.TAR": bio.getvalue()})
+x12 = ["-drive", "file=%s,if=none,id=sd,format=raw" % fi, "-device", "ich9-ahci,id=ahci", "-device", "ide-hd,drive=sd,bus=ahci.0"]
+log = run(C("su", "123", "fat sda get HOST.GZ /home/user/host.gz", "gzip -t /home/user/host.gz", "gzip -l /home/user/host.gz", "zcat /home/user/host.gz | head -n 1", "zcat /home/user/host.gz | wc -l",
+            "gunzip -k /home/user/host.gz", "wc -c /home/user/host", "echo alpha-beta-gamma > /home/user/p.txt", "gzip -k /home/user/p.txt", "fat sda put /home/user/p.txt.gz OUT.GZ",
+            "fat sda get H.TAR /home/user/h.tar", "tar -tf /home/user/h.tar", "tar -xf /home/user/h.tar -C /home/user/ex", "cat /home/user/ex/proj/a.txt", "fat sda get H.TGZ /home/user/h.tgz",
+            "tar -tzf /home/user/h.tgz", "mkdir /home/user/out", "mkdir /home/user/out/d", "echo ykernel > /home/user/out/d/y.txt", "tar -czf /home/user/o.tgz /home/user/out", "tar -cf /home/user/o.tar /home/user/out",
+            "fat sda put /home/user/o.tgz OUT.TGZ", "fat sda put /home/user/o.tar OUT.TAR", "tar -tvf /home/user/o.tar", "gzip /nonexistent", "tar -xf /home/user/p.txt"), wait=2, extra=x12)
+check("gzip", log, "hello gzip world", "500", "8500", "uncompressed", "proj/a.txt", "proj/sub/b.txt", "alpha", "proj/c.bin", "home/user/out/d/y.txt", "d0755", "cannot", "corrupt")
+fs = fat_image.read_image(fi)
+try:
+    check("gzip-host", gzip.decompress(fs["OUT.GZ"]).decode(), "alpha-beta-gamma")
+    tg = tarfile.open(fileobj=io.BytesIO(gzip.decompress(fs["OUT.TGZ"]))); check("tgz-host", tg.extractfile("home/user/out/d/y.txt").read().decode(), "ykernel")
+    tt = tarfile.open(fileobj=io.BytesIO(fs["OUT.TAR"])); check("tar-host", repr(sorted(m.name for m in tt.getmembers())), "home/user/out/d/y.txt")
+except Exception as e:
+    check("gzip-tar-host", "exception %r" % e, "never-matches")
+
+print("== session 13: pkg + cc")
+prog = {}
+for fn in sorted(os.listdir(os.path.join(ROOT, "tests", "cprog"))):
+    prog[fn.upper()] = open(os.path.join(ROOT, "tests", "cprog", fn), "rb").read()
+fi = os.path.join(TMP, "cc.img"); fat_image.mkimage(fi, prog)
+x13 = ["-drive", "file=%s,if=none,id=sd,format=raw" % fi, "-device", "ich9-ahci,id=ahci", "-device", "ide-hd,drive=sd,bus=ahci.0"]
+cmds = ["su", "123", "mkdir /home/user/s1", "mkdir /home/user/s1/usr", "mkdir /home/user/s1/usr/lib", "echo name=libfoo > /home/user/s1/PKGINFO", "echo version=1.0 >> /home/user/s1/PKGINFO", "echo desc=Foo library >> /home/user/s1/PKGINFO",
+        "echo foodata > /home/user/s1/usr/lib/libfoo.dat", "pkg build /home/user/s1 /var/cache/pkg/libfoo-1.0.rpk", "mkdir /home/user/s2", "mkdir /home/user/s2/usr", "mkdir /home/user/s2/usr/bin",
+        "echo name=app > /home/user/s2/PKGINFO", "echo version=2.1 >> /home/user/s2/PKGINFO", "echo desc=Demo app >> /home/user/s2/PKGINFO", "echo depends=libfoo >> /home/user/s2/PKGINFO", "echo hello > /home/user/s2/usr/bin/app.txt",
+        "pkg build -z /home/user/s2 /var/cache/pkg/app-2.1.rpk", "pkg update", "cat /var/lib/pkg/INDEX", "pkg search demo", "pkg install app", "pkg list", "pkg files app", "cat /usr/lib/libfoo.dat", "pkg verify", "pkg remove libfoo",
+        "echo X >> /usr/bin/app.txt", "pkg verify app", "pkg owner /usr/lib/libfoo.dat", "pkg info libfoo", "pkg remove app", "pkg remove libfoo", "pkg list", "pkg install /nonexistent.rpk", "pkg bogus"]
+for f in ("T1", "T3", "T4", "T5", "T6", "T7", "T8", "T10"):
+    cmds.append("fat sda get %s.C /home/user/%s.c" % (f, f.lower()))
+cmds += ["cc /home/user/t1.c one two", "echo rc=$?", "cc /home/user/t3.c", "cc /home/user/t4.c", "cc /home/user/t5.c", "cc /home/user/t7.c", "cc /home/user/t8.c", "cc -c /home/user/t1.c",
+         "cc -o /home/user/t1.rbc /home/user/t1.c", "cc -x /home/user/t1.rbc zz", "cc /nonexist.c", "cc -S /home/user/t8.c", "cc -S /home/user/t4.c", "cc /home/user/t6.c", "!10\r", "!bob\r", "cc -s 5000 /home/user/t10.c"]
+log = run(C(*cmds), wait=2, extra=x13)
+check("pkg", log, "built libfoo 1.0", "built app 2.1", "index updated: 2 packages", "app 2.1 app-2.1.rpk | Demo app", "[available] app", "installing dependency libfoo for app", "installed app 2.1",
+      "libfoo               1.0", "/usr/bin/app.txt", "foodata", "2 files checked, 0 problems", "is required by app", "SIZE differs", "is owned by libfoo", "Status     : installed", "removed app", "removed libfoo", "no packages installed",
+      "cannot read package", "unknown command")
+check("cc", log, "fib(20)=6765 gcd=12 fact(15)=1307674368000", "x=4 y=3 g=7", "sum=15 len=5 hello e", "ab cd ef", "enum 0 5 6 N=10 SQ=121", "p[9]=81 *(p+3)=9 diff=7", "00042|ab   |ff|   xy|", "four(fall)",
+      "b=44 sizeof(int)=4 sizeof(arr)=20 sizeof(long)=8", "i=10", "-10", "3 -3 -1", "args=3", "[one] [two]", "4000000000 -294967296", "rc=3",
+      "invalid memory access at address 0", "stack overflow", "division by zero", "floating point is not supported", "unexpected ';' in expression", "ok (", "wrote /home/user/t1.rbc", "args=2", "[zz]",
+      "not found" if False else "cannot read", "main:", "sum 1..10 = 55", "hi bob", "step limit exceeded")
+
 shutil.rmtree(TMP, ignore_errors=True)
 print("\n%d checks, %d failed" % (total, fails))
 sys.exit(1 if fails else 0)

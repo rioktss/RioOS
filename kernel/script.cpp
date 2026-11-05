@@ -60,7 +60,7 @@ int script_expand(const char* line, char* out, int cap)
                     while (line[st] == ' ' || line[st] == '\t') ++st;
                     char nm[8]; int nn = 0; while (line[st] && line[st] != ' ' && line[st] != '\t' && nn < 7) nm[nn++] = line[st++];
                     nm[nn] = 0;
-                    keep = str_equal(nm, "awk") || str_equal(nm, "sed") || str_equal(nm, "xargs") || str_equal(nm, "printf") || str_equal(nm, "alias") || str_equal(nm, "expr") || str_equal(nm, "curl") || str_equal(nm, "fat") || str_equal(nm, "fw");
+                    keep = str_equal(nm, "awk") || str_equal(nm, "sed") || str_equal(nm, "xargs") || str_equal(nm, "printf") || str_equal(nm, "alias") || str_equal(nm, "expr") || str_equal(nm, "curl") || str_equal(nm, "echo") || str_equal(nm, "fat") || str_equal(nm, "fw");
                 }
                 if (keep && ep < cap - 1) out[ep++] = '\'';
                 for (int k = i + 1; k < j && ep < cap - 1; ++k) out[ep++] = line[k];
@@ -357,7 +357,7 @@ static int find_end(Prog* pg, int from, int e, const char* open1, const char* op
     for (int i = from; i < e; ++i)
     {
         char* t = pg->st[i];
-        if (first_word_is(t, open1) || (open2 && first_word_is(t, open2))) ++depth;
+        if (first_word_is(t, open1) || (open2 && first_word_is(t, open2)) || (close[0] == 'd' && first_word_is(t, "until"))) ++depth;
         else if (first_word_is(t, close)) { if (--depth == 0) return i; }
     }
     return -1;
@@ -488,6 +488,101 @@ int script_call_function(const char* line)
     return 1;
 }
 
+
+/* glob match for case patterns: * ? [set] [!set] ; '|' separates alternatives */
+static int glob1(const char* p, const char* s)
+{
+    while (*p)
+    {
+        if (*p == '*') { ++p; if (!*p) return 1; for (; ; ++s) { if (glob1(p, s)) return 1; if (!*s) return 0; } }
+        if (!*s) return 0;
+        if (*p == '?') { ++p; ++s; continue; }
+        if (*p == '[')
+        {
+            const char* q = p + 1; int neg = 0, ok = 0;
+            if (*q == '!' || *q == '^') { neg = 1; ++q; }
+            int first = 1;
+            while (*q && (*q != ']' || first))
+            {
+                first = 0;
+                if (q[1] == '-' && q[2] && q[2] != ']') { if (*s >= q[0] && *s <= q[2]) ok = 1; q += 3; }
+                else { if (*s == *q) ok = 1; ++q; }
+            }
+            if (!*q) return 0;
+            if (ok == neg) return 0;
+            p = q + 1; ++s; continue;
+        }
+        if (*p == '\\' && p[1]) ++p;
+        if (*p != *s) return 0;
+        ++p; ++s;
+    }
+    return *s == 0;
+}
+static int case_match(const char* pats, const char* s)
+{
+    char one[128]; int n = 0;
+    for (const char* p = pats; ; ++p)
+    {
+        if (*p == '|' || *p == 0)
+        {
+            one[n] = 0;
+            if (glob1(one, s)) return 1;
+            n = 0;
+            if (!*p) return 0;
+            continue;
+        }
+        if (n < 127) one[n++] = *p;
+    }
+}
+static int run_range(Prog* pg, int s, int e);
+static int run_case(Prog* pg, int i, int esac)
+{
+    char* t = pg->st[i];
+    char* after = skip_ws(t + 4);
+    char* in = 0;
+    { char q = 0; for (char* p = after; *p; ++p) { if (q) { if (*p == q) q = 0; continue; } if (*p == '"' || *p == '\'') { q = *p; continue; }
+        if ((p == after || p[-1] == ' ') && p[0] == 'i' && p[1] == 'n' && (p[2] == ' ' || p[2] == 0)) { in = p; break; } } }
+    if (!in) { uart_puts("script: case: expected 'in'\r\n"); g_status = 2; return FLOW_EXIT; }
+    char wordtxt[256]; int wl = 0;
+    for (char* p = after; p < in && wl < 255; ++p) wordtxt[wl++] = *p;
+    while (wl > 0 && wordtxt[wl - 1] == ' ') --wl;
+    wordtxt[wl] = 0;
+    char val[256]; script_expand(wordtxt, val, sizeof(val));
+    char* first_after_in = skip_ws(in + 2);
+    char* hdr_saved = pg->st[i];
+    int has_first = *first_after_in != 0;
+    if (has_first) pg->st[i] = first_after_in; else ++i;             /* header carries the first clause */
+    int matched = 0;
+    int k = i;
+    int result = FLOW_NORMAL;
+    while (k < esac)
+    {
+        char* c = pg->st[k];
+        /* pattern list ends at the first unquoted ')' */
+        char* rp = 0; { char q = 0; for (char* p = c; *p; ++p) { if (q) { if (*p == q) q = 0; continue; } if (*p == '"' || *p == '\'') { q = *p; continue; } if (*p == ')') { rp = p; break; } } }
+        if (!rp) { uart_puts("script: case: syntax error near '"); uart_puts(c); uart_puts("'\r\n"); g_status = 2; result = FLOW_EXIT; break; }
+        char pat[128]; int pn = 0;
+        { char* p = skip_ws(c); if (*p == '(') p = skip_ws(p + 1); for (; p < rp && pn < 127; ++p) if (*p != ' ' && *p != '"' && *p != '\'') pat[pn++] = *p; }
+        pat[pn] = 0;
+        char* rest = skip_ws(rp + 1);
+        int body = k;
+        char* saved = pg->st[k];
+        if (*rest) pg->st[k] = rest; else ++body;
+        int endc = body;
+        while (endc < esac && !str_equal(pg->st[endc], ";;")) ++endc;
+        if (!matched && case_match(pat, val))
+        {
+            matched = 1;
+            int f = run_range(pg, body, endc);
+            if (f != FLOW_NORMAL) { result = f; pg->st[k] = saved; break; }
+        }
+        pg->st[k] = saved;
+        k = endc + 1;
+    }
+    if (has_first) pg->st[i] = hdr_saved;
+    return result;
+}
+
 static int ctrlc_filter(int c) { if (c == 3) { g_abort = 5; return 1; } return 0; }
 
 static int run_range(Prog* pg, int s, int e)
@@ -545,9 +640,19 @@ static int run_range(Prog* pg, int s, int e)
             i = fi + 1;
             continue;
         }
-        if (first_word_is(t, "for") || first_word_is(t, "while"))
+        if (first_word_is(t, "case"))
+        {
+            int esac = find_end(pg, i, e, "case", 0, "esac");
+            if (esac < 0) { uart_puts("script: syntax error: case without esac\r\n"); g_status = 2; return FLOW_EXIT; }
+            int f = run_case(pg, i, esac);
+            if (f == FLOW_EXIT || f == FLOW_BREAK || f == FLOW_CONTINUE) return f;
+            i = esac + 1;
+            continue;
+        }
+        if (first_word_is(t, "for") || first_word_is(t, "while") || first_word_is(t, "until"))
         {
             int is_for = first_word_is(t, "for");
+            int is_until = first_word_is(t, "until");
             int done = find_end(pg, i, e, "for", "while", "done");
             if (done < 0 || i + 1 >= e || !first_word_is(pg->st[i + 1], "do")) { uart_puts("script: syntax error near loop\r\n"); g_status = 2; return FLOW_EXIT; }
             if (is_for)
@@ -581,7 +686,7 @@ static int run_range(Prog* pg, int s, int e)
                 {
                     uart_poll_job_keys(ctrlc_filter);
                     if (g_abort == 5) { g_abort = 0; g_status = 130; return FLOW_EXIT; }
-                    if (!eval_cond(skip_ws(t + 5))) break;
+                    if ((eval_cond(skip_ws(t + (is_until ? 6 : 5))) != 0) == (is_until != 0)) break;
                     int f = run_range(pg, i + 2, done);
                     if (f == FLOW_EXIT) return f;
                     if (f == FLOW_BREAK) break;
@@ -624,6 +729,7 @@ static int split_statements(char* text, char** st, int cap)
         if (!end && (c == '"' || c == '\'')) { quote = c; word_start = 0; continue; }
         if (end || c == '\n' || c == ';')
         {
+            int dsemi = (c == ';' && p[1] == ';');
             *p = '\0';
             char* t = skip_ws(cur);
             int l = str_len(t);
@@ -633,6 +739,7 @@ static int split_statements(char* text, char** st, int cap)
                 /* "then"/"do"/"else" may be followed by a command on the same stmt: split it off */
                 st[n++] = t;
             }
+            if (dsemi && n < cap) { static char dsm[] = ";;"; st[n++] = dsm; ++p; }
             cur = p + 1; word_start = 1;
             if (end) break;
             continue;
@@ -733,7 +840,7 @@ int script_handle_compound(const char* line)
         const char* a = skip_ws((char*)line + 6); int ok = 1; long v = *a ? parse_int(a, &ok) : g_status;
         g_status = ok ? (int)v : 2; g_abort = 2; return 1;
     }
-    if (has_list_ops(line) && !first_word_is(line, "if") && !first_word_is(line, "for") && !first_word_is(line, "while"))
+    if (has_list_ops(line) && !first_word_is(line, "if") && !first_word_is(line, "for") && !first_word_is(line, "while") && !first_word_is(line, "case") && !first_word_is(line, "until"))
     {
         int l = str_len(line);
         char* buf = (char*)kmalloc((uint64_t)l + 2);
@@ -745,7 +852,7 @@ int script_handle_compound(const char* line)
         kfree(buf);
         return 1;
     }
-    if (first_word_is(line, "if") || first_word_is(line, "for") || first_word_is(line, "while"))
+    if (first_word_is(line, "if") || first_word_is(line, "for") || first_word_is(line, "while") || first_word_is(line, "case") || first_word_is(line, "until"))
     {
         int l = str_len(line);
         char* buf = (char*)kmalloc((uint64_t)l + 2);

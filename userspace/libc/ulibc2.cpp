@@ -191,47 +191,6 @@ void perror(const char* s)
 }
 
 /* sscanf: %d %i %u %x %s %c %n-less subset; returns number of assignments */
-int vsscanf(const char* s, const char* fmt, va_list ap)
-{
-    int count = 0;
-    for (; *fmt; ++fmt)
-    {
-        if (isspace((unsigned char)*fmt)) { while (isspace((unsigned char)*s)) ++s; continue; }
-        if (*fmt != '%') { if (*s != *fmt) return count; ++s; continue; }
-        ++fmt;
-        int lng = 0; while (*fmt == 'l') { ++lng; ++fmt; }
-        int width = 0; while (isdigit((unsigned char)*fmt)) width = width * 10 + (*fmt++ - '0');
-        char c = *fmt; if (!c) break;
-        if (c == '%') { if (*s != '%') return count; ++s; continue; }
-        if (c != 'c') while (isspace((unsigned char)*s)) ++s;
-        if (!*s) return count ? count : -1;
-        if (c == 'd' || c == 'i' || c == 'u' || c == 'x' || c == 'X')
-        {
-            int neg = 0, base = (c == 'x' || c == 'X') ? 16 : 10; long long v = 0; int any = 0;
-            if (*s == '-' || *s == '+') { neg = *s == '-'; ++s; }
-            for (;; ++s)
-            {
-                int d;
-                if (*s >= '0' && *s <= '9') d = *s - '0'; else if (base == 16 && *s >= 'a' && *s <= 'f') d = *s - 'a' + 10; else if (base == 16 && *s >= 'A' && *s <= 'F') d = *s - 'A' + 10; else break;
-                v = v * base + d; any = 1;
-            }
-            if (!any) return count;
-            if (neg) v = -v;
-            if (lng >= 2) *va_arg(ap, long long*) = v; else if (lng == 1) *va_arg(ap, long*) = (long)v; else *va_arg(ap, int*) = (int)v;
-            ++count;
-        }
-        else if (c == 's')
-        {
-            char* d = va_arg(ap, char*); int k = 0;
-            while (*s && !isspace((unsigned char)*s) && (!width || k < width)) d[k++] = *s++;
-            d[k] = 0; ++count;
-        }
-        else if (c == 'c') { *va_arg(ap, char*) = *s++; ++count; }
-        else return count;
-    }
-    return count;
-}
-int sscanf(const char* s, const char* fmt, ...) { va_list ap; va_start(ap, fmt); int n = vsscanf(s, fmt, ap); va_end(ap); return n; }
 
 /* ---- string / stdlib extras ----------------------------------------------------------- */
 size_t strnlen(const char* s, size_t n) { size_t k = 0; while (k < n && s[k]) ++k; return k; }

@@ -163,7 +163,6 @@ UCXXFLAGS=(
 mkdir -p build/bin
 "$CLANG" "${ASMFLAGS[@]}" -c userspace/libc/crt0.S -o build/bin/crt0.o
 "$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/ulibc.cpp -o build/bin/ulibc.o
-"$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/ulibc2.cpp -o build/bin/ulibc2.o
 "$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/dl.cpp -o build/bin/dl.o
 EXTRA_ELFS=()
 for src in userspace/bin/*.cpp; do
@@ -171,7 +170,7 @@ for src in userspace/bin/*.cpp; do
     name="$(basename "$src" .cpp)"
     "$CXX" "${UCXXFLAGS[@]}" -c "$src" -o "build/bin/$name.o"
     "$LD" -T userspace/user_init.ld -nostdlib -z max-page-size=0x1000 \
-        build/bin/crt0.o build/bin/"$name".o build/bin/ulibc.o build/bin/ulibc2.o build/bin/dl.o -o "build/bin/$name.elf"
+        build/bin/crt0.o build/bin/"$name".o build/bin/ulibc.o build/bin/dl.o -o "build/bin/$name.elf"
     EXTRA_ELFS+=("build/bin/$name.elf")
     vlog " -> build/bin/$name.elf ready"
 done
