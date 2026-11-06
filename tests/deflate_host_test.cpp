@@ -27,7 +27,6 @@ int main(){ int fails=0,total=0;
    uint8_t* o2; unsigned long ol; ++total; if(rio_inflate(zc,zl,&o2,&ol,0)||ol!=n||memcmp(o2,d,n)){++fails;printf("FAIL ours-inflates-zlib t=%d lv=%d\n",t,lv);} else free(o2); free(zc);}
   // gzip container
   { uint8_t* g; unsigned long gl; ++total; rio_gzip_compress(d,n,"file.txt",12345,&g,&gl,6); uint8_t* o2; unsigned long ol; char nm[64]; if(rio_gzip_decompress(g,gl,&o2,&ol,nm,64)||ol!=n||memcmp(o2,d,n)||strcmp(nm,"file.txt")){++fails;printf("FAIL gzip self t=%d\n",t);} else free(o2);
-    FILE*f=fopen("/tmp/t.gz","wb"); fwrite(g,1,gl,f); fclose(f); free(g); if(t%20==0){ ++total; char cmd[128]; snprintf(cmd,sizeof cmd,"gzip -dc /tmp/t.gz | cmp - /dev/stdin </dev/null >/dev/null 2>&1"); (void)cmd; FILE*o=fopen("/tmp/t.raw","wb"); fwrite(d,1,n,o); fclose(o); if(system("gzip -dc /tmp/t.gz | cmp -s - /tmp/t.raw")){++fails;printf("FAIL gzip(1) rejects ours t=%d\n",t);} } }
     { /* optional interop check against the system gzip(1); skipped when there is no writable temp dir or no gzip */
       const char* td=getenv("TMPDIR"); if(!td||!*td) td="."; char pg[300],pr[300]; snprintf(pg,sizeof pg,"%s/rio_t.gz",td); snprintf(pr,sizeof pr,"%s/rio_t.raw",td);
       FILE*f=fopen(pg,"wb"); if(f){ fwrite(g,1,gl,f); fclose(f); }
