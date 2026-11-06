@@ -1021,8 +1021,6 @@ static const ManualEntry manual_entries[] =
     {"vi", "modal text editor (user program)", "vi [-R] [file]", "normal: h j k l arrows 0 ^ $ w b e gg G {n}G x X D dd dw d$ cc cw C yy yw p P u ^R . o O i a I A r R J ~ s S / ? n N ^F ^B, counts. ex: :w [f] :q :q! :wq :x :N :$ :d :r f :e! :s/a/b/[g] :%s/a/b/g :set nu|nonu. ZZ saves and quits. Screen 80x24."},
     {"pkg", "package manager for .rpk packages (user program)", "pkg list|info|files|install|remove|upgrade|search|verify|owner|build|update", "pkg build [-z] <dir> <out.rpk> (dir holds PKGINFO: name= version= desc= depends=a,b>=1 conflicts= provides=, plus a file tree rooted at /); pkg install <file|name> [-f] resolves dependencies from /var/cache/pkg; database /var/lib/pkg; pkg remove refuses while others depend on it; pkg verify checks size+CRC. Root needed to write system paths"},
     {"cc", "C compiler + virtual machine (user program)", "cc [-S] [-c] [-o out.rbc] [-s steps] [-D name[=val]] file.c [args] | cc -x prog.rbc [args]", "compiles a C subset to bytecode and runs it: int/long/char/unsigned/void, pointers, arrays, enum, typedef, #define (also with arguments), #ifdef, functions, recursion, all statements incl. switch, string literals, initializers, malloc/free, printf/sprintf/snprintf/scanf/puts/putchar/getchar, str*/mem*, atoi, rand. Not supported: float/double, struct/union, goto, #if expressions. Bounds-checked memory, step limit (-s). -S prints bytecode, -c only checks, -o writes an image"},
-<<<<<<< HEAD
-=======
     {"help", "list commands by category", "help [category|all]", "categories: files text shell system users storage network dev libc; details of one command: man <command>"},
     {"man", "manual page of a command", "man <command>", "shows summary, usage and notes; 'help' lists all commands"},
     {"clear", "clear the screen", "clear", "sends the ANSI clear-screen sequence"},
@@ -1083,7 +1081,6 @@ static const ManualEntry manual_entries[] =
     {"id", "show user and group ids", "id", ""},
     {"return", "return from a shell function", "return [n]", "sets the function exit status"},
     {"users", "list accounts", "users", "shows the accounts in /etc/passwd"},
->>>>>>> 5a08207 (update)
     {"hexdump", "hex + ASCII dump of a file (user program)", "hexdump <file>", "runs /bin/hexdump.elf; uses libc fopen/fread"},
     {"libctest", "libc part 2 self-test (user program)", "libctest", "FILE stdio, sscanf, strtok_r, strcasecmp, bsearch, integer math; prints N/N passed"},
     {"fat", "FAT32 volumes on a raw device (not VFS-mounted)", "fat <dev> mkfs [label] | info | ls [path] | cat <p> | get <p> <file> | put <file> <p> | mkdir <p> | rm <p>", "root only; dev ram0 ram1 nvme0n1 sda; reads long names, new names must be 8.3; files up to 1 MiB; works on images made by other OSes"},
