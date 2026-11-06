@@ -101,7 +101,7 @@ CXXFLAGS=(
     -Iinclude
     --target=aarch64-none-elf -mcpu=cortex-a72 -mgeneral-regs-only -mstrict-align
     -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-builtin
-    -fno-pic -fno-pie -fno-vectorize -fno-slp-vectorize
+    -fno-pic -fno-pie -fno-vectorize -fno-slp-vectorize -ffp-contract=off
     -fno-unwind-tables -fno-asynchronous-unwind-tables
     -nostdinc++ -std=c++17 -O1 -Wall -Wextra -Werror
 )
@@ -113,7 +113,7 @@ ASMFLAGS=(
 
 MODULES=(
     uart memory string fs vfs process sched_policy scheduler timer interrupt keyboard
-    commands version shell history env rtc exceptions syscall user mmu virtio_mmio virtio_input virtio_blk storage thread fd task jobs sha256 script pci nvme ahci filters usb tls
+    commands version shell history env rtc exceptions syscall user mmu virtio_mmio virtio_input virtio_blk storage thread fd task jobs sha256 script pci nvme ahci filters textutils shellext usb tls fat32
     fb console console_font
     elf virtio_net netstack page_alloc fault diag security smp
     kernel
@@ -156,21 +156,50 @@ UCXXFLAGS=(
     -Iinclude
     --target=aarch64-none-elf -mcpu=cortex-a72 -mgeneral-regs-only
     -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-builtin
-    -fno-pic -fno-pie -fno-vectorize -fno-slp-vectorize
+    -fno-pic -fno-pie -fno-vectorize -fno-slp-vectorize -ffp-contract=off
     -fno-unwind-tables -fno-asynchronous-unwind-tables
     -nostdinc++ -nostdlib -std=c++17 -O1 -Wall -Wextra -Werror
 )
+# Newer clang releases (19/20+) reject calls that pass a `double` when the target has no FP registers under the
+# default hard-float 'aapcs' ABI ("requires 'double' type support, but ABI 'aapcs' does not support it").
+# The user libc is a soft-float library (doubles travel in integer registers), so pick the first flag set the
+# installed compiler accepts: plain flags (clang 18), then the soft-float ABI variants of newer clang.
+probe_float_abi() {
+    printf 'double f(double); int g(double, ...); int h(double d) { return g(d * 2.0, d) + (int)f(d); }\n' | \
+        "$CXX" "${UCXXFLAGS[@]}" ${1+"$@"} -x c++ -c - -o /dev/null >/dev/null 2>&1
+}
+UABI=()
+if probe_float_abi; then
+    :
+elif probe_float_abi -mabi=aapcs-soft; then
+    UABI=(-mabi=aapcs-soft)
+elif probe_float_abi -mcpu=cortex-a72+nofp -mabi=aapcs-soft; then
+    UABI=(-mcpu=cortex-a72+nofp -mabi=aapcs-soft)
+elif probe_float_abi -march=armv8-a+nofp -mabi=aapcs-soft; then
+    UABI=(-march=armv8-a+nofp -mabi=aapcs-soft)
+else
+    echo "ERROR: this clang ($("$CXX" --version | head -n1)) cannot compile soft-float double code for aarch64." >&2
+    echo "       Use clang 18 or a release that supports -mabi=aapcs-soft (clang 20+)." >&2
+    exit 1
+fi
+if [[ ${#UABI[@]} -gt 0 ]]; then UCXXFLAGS+=("${UABI[@]}"); fi
+vlog " -> user float ABI flags: ${UABI[*]-(default)}"
 mkdir -p build/bin
 "$CLANG" "${ASMFLAGS[@]}" -c userspace/libc/crt0.S -o build/bin/crt0.o
 "$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/ulibc.cpp -o build/bin/ulibc.o
 "$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/dl.cpp -o build/bin/dl.o
+"$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/ulibc2.cpp -o build/bin/ulibc2.o
+"$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/ulibc3.cpp -o build/bin/ulibc3.o
+"$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/ulibm.cpp -o build/bin/ulibm.o
+"$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/softfloat.cpp -o build/bin/softfloat.o
+"$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/deflate.cpp -o build/bin/deflate.o
 EXTRA_ELFS=()
 for src in userspace/bin/*.cpp; do
     [[ -f "$src" ]] || continue
     name="$(basename "$src" .cpp)"
     "$CXX" "${UCXXFLAGS[@]}" -c "$src" -o "build/bin/$name.o"
     "$LD" -T userspace/user_init.ld -nostdlib -z max-page-size=0x1000 \
-        build/bin/crt0.o build/bin/"$name".o build/bin/ulibc.o build/bin/dl.o -o "build/bin/$name.elf"
+        build/bin/crt0.o build/bin/"$name".o build/bin/ulibc.o build/bin/ulibc2.o build/bin/ulibc3.o build/bin/ulibm.o build/bin/softfloat.o build/bin/deflate.o build/bin/dl.o -o "build/bin/$name.elf"
     EXTRA_ELFS+=("build/bin/$name.elf")
     vlog " -> build/bin/$name.elf ready"
 done
@@ -229,7 +258,7 @@ step "6/9" "Linking"
     build/commands.o build/version.o build/shell.o build/history.o build/env.o build/rtc.o build/exceptions.o build/syscall.o build/user.o build/mmu.o \
     build/virtio_mmio.o build/virtio_input.o build/virtio_blk.o build/storage.o build/elf.o build/virtio_net.o \
     build/netstack.o build/page_alloc.o build/fault.o build/diag.o build/security.o \
-    build/fb.o build/console.o build/console_font.o build/thread.o build/fd.o build/smp.o build/task.o build/jobs.o build/sha256.o build/script.o build/pci.o build/nvme.o build/ahci.o build/filters.o build/usb.o build/tls.o \
+    build/fb.o build/console.o build/console_font.o build/thread.o build/fd.o build/smp.o build/task.o build/jobs.o build/sha256.o build/script.o build/pci.o build/nvme.o build/ahci.o build/filters.o build/textutils.o build/shellext.o build/usb.o build/tls.o build/fat32.o \
     -o build/kernel.elf
 
 step "7/9" "Verifying ELF"
@@ -244,6 +273,21 @@ step "8/9" "Running host tests"
     tests/fs_host_test.cpp fs/fs.cpp kernel/string.cpp kernel/rtc.cpp \
     -o "$HOST_TOOLS/fs_host_test"
 "$HOST_TOOLS/fs_host_test" > /dev/null
+
+# soft-float, libm and deflate (user libc) host tests
+"$CXX" -std=c++17 -O2 -fno-strict-aliasing -ffp-contract=off -c userspace/libc/softfloat.cpp -o "$HOST_TOOLS/sf_plain.o"
+"$CXX" -std=c++17 -O2 tests/softfloat_host_test.cpp "$HOST_TOOLS/sf_plain.o" -o "$HOST_TOOLS/softfloat_host_test"
+"$HOST_TOOLS/softfloat_host_test" > /dev/null
+for f in ulibm softfloat; do
+    "$CXX" -std=c++17 -O2 -fno-strict-aliasing -ffp-contract=off -include tests/libm_rename.h -c "userspace/libc/$f.cpp" -o "$HOST_TOOLS/lm_$f.o"
+done
+"$CXX" -std=c++17 -O2 -c tests/libm_host_test.cpp -o "$HOST_TOOLS/lm_test.o"
+"$CXX" -o "$HOST_TOOLS/libm_host_test" "$HOST_TOOLS/lm_test.o" "$HOST_TOOLS/lm_ulibm.o" "$HOST_TOOLS/lm_softfloat.o"
+"$HOST_TOOLS/libm_host_test" > /dev/null
+if echo '#include <zlib.h>' | "$CXX" -x c++ -fsyntax-only - 2>/dev/null; then
+    "$CXX" -std=c++17 -O2 tests/deflate_host_test.cpp userspace/libc/deflate.cpp -lz -o "$HOST_TOOLS/deflate_host_test"
+    "$HOST_TOOLS/deflate_host_test" > /dev/null
+fi
 
 "$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -iquote include -DHOST_TEST \
     tests/net_host_test.cpp net/netstack.cpp \
