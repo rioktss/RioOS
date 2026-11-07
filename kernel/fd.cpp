@@ -23,6 +23,7 @@ struct FdEntry
 {
     int used;
     int object;
+    int cloexec;     /* FD_CLOEXEC: closed by exec */
 };
 
 struct FdTable
@@ -121,6 +122,7 @@ static void clear_descriptor(FdTable* table, int descriptor)
     if (!table || descriptor < 0 || descriptor >= FD_MAX_DESCRIPTORS) return;
     table->entries[descriptor].used = 0;
     table->entries[descriptor].object = -1;
+    table->entries[descriptor].cloexec = 0;
 }
 
 static void install_standard_descriptors(FdTable* table)
@@ -349,6 +351,8 @@ int fd_open(const char* path, uint32_t flags, int cwd)
     if (!table) return -24;
     if (!path || !path[0] || string_length(path) >= (int)sizeof(open_files[0].path))
         return -22;
+    const int want_cloexec = (flags & 0x1000U) != 0;   /* O_CLOEXEC */
+    flags &= ~0x1000U;
     if ((flags & ~(FD_O_CREAT | FD_O_TRUNC | FD_O_APPEND | 3U)) != 0 ||
         access_mode(flags) == 3U)
         return -22;
@@ -390,6 +394,7 @@ int fd_open(const char* path, uint32_t flags, int cwd)
 
     table->entries[descriptor].used = 1;
     table->entries[descriptor].object = object;
+    table->entries[descriptor].cloexec = want_cloexec;
     return descriptor;
 }
 
@@ -668,6 +673,7 @@ int fd_clone_table(int src_pid, int dst_pid)
         int object = a->entries[d].object;
         b->entries[d].used = 1;
         b->entries[d].object = object;
+        b->entries[d].cloexec = a->entries[d].cloexec;
         if (!open_files[object].permanent) ++open_files[object].refs;
     }
     return 0;
@@ -703,4 +709,39 @@ int fd_is_pipe(int descriptor)
     if (!descriptor_valid_in(table, descriptor)) return 0;
     int k = open_files[table->entries[descriptor].object].kind;
     return k == FD_KIND_PIPE_READ || k == FD_KIND_PIPE_WRITE;
+}
+
+/* FD_CLOEXEC handling (fcntl F_GETFD/F_SETFD and exec) */
+int fd_get_cloexec(int descriptor)
+{
+    FdTable* table = current_table();
+    if (!descriptor_valid_in(table, descriptor)) return -9;
+    return table->entries[descriptor].cloexec ? 1 : 0;
+}
+int fd_set_cloexec(int descriptor, int value)
+{
+    FdTable* table = current_table();
+    if (!descriptor_valid_in(table, descriptor)) return -9;
+    table->entries[descriptor].cloexec = value ? 1 : 0;
+    return 0;
+}
+void fd_close_on_exec(int pid)
+{
+    int t = find_table(pid);
+    if (t < 0) return;
+    for (int d = 0; d < FD_MAX_DESCRIPTORS; ++d)
+        if (tables[t].entries[d].used && tables[t].entries[d].cloexec) close_entry(&tables[t], d);
+}
+
+/* Path, directory and open flags of a regular-file descriptor (for MAP_SHARED write-back). */
+int fd_file_info(int descriptor, char* path, int cap, int* cwd, uint32_t* flags)
+{
+    FdTable* table = current_table();
+    if (!descriptor_valid_in(table, descriptor)) return -9;
+    OpenFile* entry = &open_files[table->entries[descriptor].object];
+    if (entry->kind != FD_KIND_FILE) return -19;   /* ENODEV */
+    copy_string(path, entry->path, cap);
+    if (cwd) *cwd = entry->cwd;
+    if (flags) *flags = entry->flags;
+    return 0;
 }

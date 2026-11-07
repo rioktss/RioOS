@@ -90,6 +90,16 @@ extern "C" void exception_sync_el0(void* raw)
             return;
     }
 
+#ifndef HOST_TEST
+    /* A program that installed a SIGSEGV / SIGBUS / SIGILL handler gets to run it (siglongjmp out of it to recover). */
+    {
+        int fsig = SIG_SEGV;
+        uint64_t fsc2 = frame->esr & 0x3FULL;
+        if (ec == 0x00ULL || ec == 0x0EULL) fsig = SIG_ILL;
+        else if (ec == 0x22ULL || ec == 0x26ULL || ((ec == 0x24ULL || ec == 0x20ULL) && fsc2 == 0x21ULL)) fsig = SIG_BUS;
+        if (pid >= 0 && task_deliver_fault(frame, fsig, frame->far) == 0) return;
+    }
+#endif
     fault_report(frame->esr, frame->elr, frame->far, frame->spsr);
     uart_puts("[EL0] Fatal user exception; terminating process.\r\n");
     user_set_exit_code(-14);

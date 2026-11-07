@@ -7,6 +7,7 @@ typedef void (*uart_output_flush_hook_t)();
 void uart_init();
 void uart_putc(char c);
 void uart_puts(const char* s);
+int uart_at_line_start(void);   /* 1 when the last character written was a newline */
 /* Serial only: not mirrored to the framebuffer console. */
 void uart_putc_serial_only(char c);
 void uart_puts_serial_only(const char* s);

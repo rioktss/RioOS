@@ -21,11 +21,14 @@ int task_exec(ExceptionFrame* frame, const char* path, const char* args);
 extern "C" void task_exit_current(int code, int signal);
 int task_wait(int parent, int pid, int* status, int options);
 int task_kill(int pid, int signal);
+int task_kill_info(int pid, int signal, int sender, int code, uint64_t value);   /* sender pid, si_code, si_value */
+int task_deliver_fault(ExceptionFrame* frame, int sig, uint64_t addr);       /* 0 = a user handler was entered */
 int task_reap(int pid);                 /* destroy a zombie's record */
 int task_reap_orphans(int shell_pid, void (*notify)(int pid, int code, int sig));
 int task_running_count();
 
-extern "C" void task_deliver_signals();
+extern "C" void task_deliver_signals(ExceptionFrame* frame);
+int task_sigreturn(ExceptionFrame* frame);          /* restores the context saved by a signal frame */
 extern "C" void task_context_enter(int pid);
 
 /* Console job control used by SYS_READ: returns 1 if the byte was consumed

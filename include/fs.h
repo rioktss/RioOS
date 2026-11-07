@@ -46,6 +46,7 @@ uint32_t fs_current_gid();
 int fs_check_access(int id, uint32_t requested);
 int fs_check_access_as(int id, uint32_t uid, uint32_t gid, uint32_t requested);
 int fs_stat_path(const char* path, int cwd, FsStat* out);
+int fs_lstat_path(const char* path, int cwd, FsStat* out);   /* like stat but does not follow a final symbolic link */
 int fs_set_owner(int id, uint32_t uid, uint32_t gid);
 int fs_set_owner_path(const char* path, int cwd, uint32_t uid, uint32_t gid);
 int fs_truncate(const char* path, int cwd, uint64_t size);

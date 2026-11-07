@@ -13,6 +13,7 @@ int errno = 0;
 #define SYS_YIELD 42
 #define SYS_BRK 43
 #define SYS_MMAP 44
+#define SYS_MMAPX 72
 #define SYS_MUNMAP 45
 #define SYS_SPAWN 46
 #define SYS_SPAWN_FD 49
@@ -22,6 +23,11 @@ int errno = 0;
 #define SYS_FS_MKDIR 55
 #define SYS_FS_UNLINK 56
 #define SYS_FS_RENAME 57
+#define SYS_FS_SYMLINK 60
+#define SYS_FS_READLINK 61
+#define SYS_FS_LINK 62
+#define SYS_FS_LSTAT 63
+#define SYS_FS_REALPATH 64
 #define SYS_FS_READDIR 58
 #define SYS_TIME_EPOCH 59
 
@@ -84,7 +90,7 @@ int toupper(int c) { return islower(c) ? c - 32 : c; }
 int tolower(int c) { return isupper(c) ? c + 32 : c; }
 
 /* ---- syscalls ---------------------------------------------------------- */
-pid_t fork(void) { return (pid_t)ret(user_syscall0(SYS_FORK)); }
+pid_t fork(void) { pid_t r = (pid_t)ret(user_syscall0(SYS_FORK)); if (r == 0 && __rio_threads_started) __rio_thread_after_fork(); return r; }
 int execv_args(const char* path, const char* args) { return (int)ret(user_syscall2(SYS_EXEC, (uint64_t)path, (uint64_t)args)); }
 pid_t waitpid(pid_t pid, int* st, int opt)
 {
@@ -106,10 +112,26 @@ int unlink(const char* path) { return (int)ret(user_syscall1(SYS_FS_UNLINK, (uin
 int rmdir(const char* path) { return (int)ret(user_syscall1(SYS_FS_UNLINK, (uint64_t)path)); }
 int rename(const char* a, const char* b) { return (int)ret(user_syscall2(SYS_FS_RENAME, (uint64_t)a, (uint64_t)b)); }
 long readdir_text(const char* path, char* buf, size_t cap) { return ret(user_syscall3(SYS_FS_READDIR, (uint64_t)path, (uint64_t)buf, cap)); }
+int symlink(const char* target, const char* linkpath) { long r = ret(user_syscall2(SYS_FS_SYMLINK, (uint64_t)target, (uint64_t)linkpath)); return r < 0 ? -1 : 0; }
+int link(const char* target, const char* linkpath) { long r = ret(user_syscall2(SYS_FS_LINK, (uint64_t)target, (uint64_t)linkpath)); return r < 0 ? -1 : 0; }
+long readlink(const char* path, char* buf, size_t cap) { long r = ret(user_syscall3(SYS_FS_READLINK, (uint64_t)path, (uint64_t)buf, cap)); return r < 0 ? -1 : r; }
+char* realpath(const char* path, char* out)
+{
+    static char sbuf[256]; char* dst = out ? out : sbuf;
+    long r = ret(user_syscall3(SYS_FS_REALPATH, (uint64_t)path, (uint64_t)dst, 256));
+    return r < 0 ? 0 : dst;
+}
 long time_epoch(void) { return (long)user_syscall0(SYS_TIME_EPOCH); }
 int stat_path(const char* path, struct RioStat* st)
 {
     UserFsStat u; long r = ret((uint64_t)user_fs_stat(path, &u));
+    if (r < 0) return -1;
+    st->inode = u.inode; st->type = u.type; st->mode = u.mode; st->uid = u.uid; st->gid = u.gid; st->sector_count = u.sector_count; st->size = u.size; st->mtime = u.mtime;
+    return 0;
+}
+int lstat_path(const char* path, struct RioStat* st)
+{
+    UserFsStat u; long r = ret(user_syscall2(SYS_FS_LSTAT, (uint64_t)path, (uint64_t)&u));
     if (r < 0) return -1;
     st->inode = u.inode; st->type = u.type; st->mode = u.mode; st->uid = u.uid; st->gid = u.gid; st->sector_count = u.sector_count; st->size = u.size; st->mtime = u.mtime;
     return 0;
@@ -119,22 +141,36 @@ int setuid(unsigned uid, unsigned gid) { return (int)ret(user_syscall2(SYS_SETUI
 pid_t spawn(const char* path, const char* args, int bg) { return (pid_t)ret(user_syscall3(SYS_SPAWN, (uint64_t)path, (uint64_t)args, (uint64_t)bg)); }
 pid_t spawn_fd(const char* path, const char* args, int in_fd, int out_fd)
 { return (pid_t)ret(user_syscall4(SYS_SPAWN_FD, (uint64_t)path, (uint64_t)args, (uint64_t)(long)in_fd, (uint64_t)(long)out_fd)); }
-void sched_yield(void) { (void)user_syscall0(SYS_YIELD); }
-unsigned sleep_ms(unsigned ms) { while (ms > 10000) { user_sleep_ms(10000); ms -= 10000; } user_sleep_ms(ms); return 0; }
+void sched_yield(void) { if (__rio_threads_started && __rio_thread_yield()) return; (void)user_syscall0(SYS_YIELD); }
+unsigned sleep_ms(unsigned ms)   /* returns the milliseconds left when a signal interrupted the sleep */
+{
+    if (__rio_threads_started) { unsigned r = __rio_thread_sleep(ms); if (r != 0xFFFFFFFFU) return r; }
+    while (ms > 10000) { long left = (long)user_sleep_ms(10000); if (left > 0) return (unsigned)left + (ms - 10000); ms -= 10000; }
+    long left = (long)user_sleep_ms(ms);
+    return left > 0 ? (unsigned)left : 0;
+}
 unsigned long clock_ms(void) { return (unsigned long)user_time_ms(); }
 int open(const char* p, int f) { return (int)ret((uint64_t)user_fd_open(p, (uint64_t)f)); }
 int close(int fd) { return (int)ret((uint64_t)user_fd_close(fd)); }
-ssize_t read(int fd, void* b, size_t n) { return ret((uint64_t)user_fd_read(fd, b, n)); }
-ssize_t write(int fd, const void* b, size_t n) { return ret((uint64_t)user_fd_write(fd, b, n)); }
+int __rio_sa_restart = 0;   /* set by the signal dispatcher when a SA_RESTART handler ran */
+ssize_t read(int fd, void* b, size_t n)
+{
+    for (;;) { ssize_t r = ret((uint64_t)user_fd_read(fd, b, n)); if (r < 0 && errno == EINTR && __rio_sa_restart) { __rio_sa_restart = 0; continue; } return r; }
+}
+ssize_t write(int fd, const void* b, size_t n)
+{
+    for (;;) { ssize_t r = ret((uint64_t)user_fd_write(fd, b, n)); if (r < 0 && errno == EINTR && __rio_sa_restart) { __rio_sa_restart = 0; continue; } return r; }
+}
 long lseek(int fd, long o, int w) { return ret((uint64_t)user_fd_seek(fd, o, w)); }
 int dup(int fd) { return (int)ret((uint64_t)user_fd_dup(fd)); }
 int dup2(int a, int b) { return (int)ret((uint64_t)user_fd_dup2(a, b)); }
 int pipe(int fds[2]) { return (int)ret((uint64_t)user_fd_pipe(fds)); }
 const char* getargs(void)
 {
-    static char buf[256];
+    static char buf[1100];
     buf[0] = 0;
     (void)user_syscall2(USER_SYS_GETARG, (uint64_t)buf, sizeof(buf));
+    for (char* p = buf; *p; ++p) if (*p == 1) { *p = 0; break; }     /* environment follows after \x01 */
     return buf;
 }
 
@@ -158,8 +194,8 @@ void* sbrk(long inc)
 }
 void* mmap(void* addr, size_t len, int prot, int flags, int fd, long off)
 {
-    (void)addr; (void)flags;
-    unsigned long r = (unsigned long)user_syscall4(SYS_MMAP, len, (uint64_t)prot, (uint64_t)(long)fd, (uint64_t)off);
+    (void)addr;
+    unsigned long r = (unsigned long)user_syscall4(SYS_MMAPX, len, (uint64_t)prot, (uint64_t)(long)fd, ((uint64_t)(unsigned)flags << 32) | ((uint64_t)off & 0xFFFFFFFFULL));
     if ((long)r < 0 && (long)r > -4096) { errno = (int)-(long)r; return MAP_FAILED; }
     return (void*)r;
 }
@@ -433,14 +469,29 @@ char* fgets_fd(int fd, char* buf, int cap)
 /* ---- program start ----------------------------------------------------- */
 void __libc_start(void)
 {
-    static char argbuf[512];
-    static char* argv[34];
+    static char argbuf[1100];
+    static char* argv[66];
     int argc = 0;
     argv[argc++] = (char*)"prog";
     argbuf[0] = 0;
     (void)user_syscall2(USER_SYS_GETARG, (uint64_t)argbuf, sizeof(argbuf));
+    /* argument line [ \x01 \x02argv0 ] [ \x01 NAME=value ]... */
+    char* envs = 0;
+    for (char* e = argbuf; *e; ++e) if (*e == 1) { *e = 0; envs = e + 1; break; }
+    if (envs)
+    {
+        char* q = envs;
+        while (q)
+        {
+            char* nx = 0;
+            for (char* e = q; *e; ++e) if (*e == 1) { *e = 0; nx = e + 1; break; }
+            if (q[0] == 2) argv[0] = q + 1;
+            else if (q[0]) (void)putenv(q);
+            q = nx;
+        }
+    }
     char* p = argbuf;
-    while (*p && argc < 32)
+    while (*p && argc < 64)
     {
         while (*p == ' ') ++p;
         if (!*p) break;

@@ -45,6 +45,7 @@
 #define USER_X 4U
 #define USER_COW  8U   /* shared frame: hardware-read-only until first write */
 #define USER_LAZY 16U  /* reserved, backed on first touch (demand paging) */
+#define USER_SHARED 32U /* MAP_SHARED: frame stays shared across fork (never copy-on-write) */
 #define USER_PERM_MASK 7U
 
 static uint64_t l1_table[512]
@@ -567,7 +568,7 @@ int mmu_user_space_clone(int src_pid, int dst_pid)
         if (user_frames[s][i] != 0)
         {
             if (page_ref((void*)user_frames[s][i]) != 0) { (void)mmu_user_space_destroy(dst_pid); return -5; }
-            if ((m & USER_W) != 0) { m = (uint8_t)(m | USER_COW); user_space_modes[s][i] = m; image_pte(s, i); }
+            if ((m & USER_W) != 0 && (m & USER_SHARED) == 0) { m = (uint8_t)(m | USER_COW); user_space_modes[s][i] = m; image_pte(s, i); }
         }
         user_frames[d][i] = user_frames[s][i];
         user_space_modes[d][i] = m;
@@ -669,6 +670,41 @@ int mmu_user_mmap(int pid, uint64_t length, uint32_t prot, uint64_t* out)
     }
     sp->mmap_cur = base;
     *out = base;
+    return 0;
+}
+
+/* MAP_SHARED reservation: pages are backed explicitly by mmu_user_install_frame (no lazy faults). */
+int mmu_user_mmap_shared(int pid, uint64_t length, uint32_t prot, uint64_t* out)
+{
+    int slot = user_space_find(pid);
+    if (slot < 0 || length == 0 || prot == 0 || (prot & ~7U) != 0 || (prot & USER_X)) return -1;
+    UserAddressSpace* sp = &user_spaces[slot];
+    uint64_t len = (length + MMU_PAGE_SIZE - 1ULL) & ~(MMU_PAGE_SIZE - 1ULL);
+    uint64_t floor = (sp->brk_cur ? ((sp->brk_cur + MMU_PAGE_SIZE - 1ULL) & ~(MMU_PAGE_SIZE - 1ULL)) : sp->brk_start) + 0x10000ULL;
+    if (len > sp->mmap_cur || sp->mmap_cur - len < floor) return -2;
+    uint64_t base = sp->mmap_cur - len;
+    for (uint64_t va = base; va < base + len; va += MMU_PAGE_SIZE)
+    {
+        uint64_t i = (va - MMU_USER_BASE) / MMU_PAGE_SIZE;
+        user_space_modes[slot][i] = (uint8_t)(prot | USER_SHARED);
+        user_frames[slot][i] = 0;
+        image_pte(slot, i);
+    }
+    sp->mmap_cur = base;
+    *out = base;
+    return 0;
+}
+
+/* Back one page of a shared reservation with `frame` (the caller's page reference is consumed). */
+int mmu_user_install_frame(int pid, uint64_t va, uint64_t frame)
+{
+    int slot = user_space_find(pid);
+    if (slot < 0 || va < MMU_USER_BASE || va >= MMU_USER_LIMIT || (va & (MMU_PAGE_SIZE - 1ULL)) != 0) return -1;
+    uint64_t i = (va - MMU_USER_BASE) / MMU_PAGE_SIZE;
+    if ((user_space_modes[slot][i] & USER_SHARED) == 0 || user_frames[slot][i] != 0) return -1;
+    user_frames[slot][i] = frame;
+    image_pte(slot, i);
+    tlb_flush_all();
     return 0;
 }
 

@@ -60,7 +60,8 @@ int main(int argc, char** argv)
         ++count;
         if (mode == 't')
         {
-            if (verbose) printf("%c%04o %5u/%-5u %8lu %s\n", e.type == '5' ? 'd' : '-', e.mode & 07777, e.uid, e.gid, e.size, e.name); else printf("%s\n", e.name);
+            if (verbose) { printf("%c%04o %5u/%-5u %8lu %s", e.type == '5' ? 'd' : e.type == '2' ? 'l' : '-', e.mode & 07777, e.uid, e.gid, e.size, e.name); if (e.type == '2') printf(" -> %s", e.link); printf("\n"); }
+            else printf("%s\n", e.name);
             continue;
         }
         const char* safe = tar_safe_path(e.name);
@@ -69,6 +70,14 @@ int main(int argc, char** argv)
         size_t tl = strlen(target); while (tl > 1 && target[tl - 1] == '/') target[--tl] = 0;
         if (verbose) printf("%s\n", e.name);
         if (tar_mkdirs(target)) { printf("tar: %s: cannot create parent directories\n", target); ++errors; continue; }
+        if (tar_parent_is_link(target)) { printf("tar: %s: refusing to extract through a symbolic link\n", target); ++errors; continue; }
+        if (e.type == '2')
+        {
+            struct RioStat st;
+            if (lstat_path(target, &st) == 0) { if (st.type == 1) { printf("tar: %s: is a directory\n", target); ++errors; continue; } unlink(target); }
+            if (!e.link[0] || symlink(e.link, target) != 0) { printf("tar: %s: cannot create symbolic link\n", target); ++errors; }
+            continue;
+        }
         if (e.type == '5') { struct RioStat st; if (stat_path(target, &st) != 0 && mkdir(target, 0755) != 0) { printf("tar: %s: cannot create directory\n", target); ++errors; } else chmod(target, e.mode & 0777); continue; }
         if (e.type != '0' && e.type != '7') { printf("tar: %s: unsupported entry type '%c' skipped\n", e.name, e.type); continue; }
         FILE* f = fopen(target, "w");

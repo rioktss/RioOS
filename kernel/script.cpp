@@ -17,6 +17,7 @@
 enum Flow { FLOW_NORMAL = 0, FLOW_BREAK = 1, FLOW_CONTINUE = 2, FLOW_EXIT = 3 };
 
 static int g_status = 0;
+static int g_prev = -1;   /* $? seen by the command about to run (status before the per-command reset) */
 static int g_depth = 0;
 static int g_abort = 0;
 static char* g_pos[10];       /* $0..$9 of the running script */
@@ -98,7 +99,7 @@ int script_expand(const char* line, char* out, int cap)
         }
         if (line[i] != '$') { out[ep++] = line[i++]; continue; }
         ++i;
-        if (line[i] == '?') { ++i; put_num(out, &ep, cap, g_status); continue; }
+        if (line[i] == '?') { ++i; put_num(out, &ep, cap, g_prev >= 0 ? g_prev : g_status); continue; }
         if (line[i] == '#') { ++i; put_num(out, &ep, cap, g_argc > 0 ? g_argc - 1 : 0); continue; }
         if (line[i] >= '0' && line[i] <= '9')
         {
@@ -397,8 +398,10 @@ static void exec_andor(const char* stmt)
         if (run && *t)
         {
             char cmd[512]; str_copy(cmd, t, sizeof(cmd));
+            g_prev = g_status;
             g_status = 0;
             execute_command(cmd);
+            g_prev = -1;
         }
         if (end) break;
         op = is_and ? 1 : 2;
@@ -409,7 +412,6 @@ static void exec_andor(const char* stmt)
 
 static int exec_stmt(char* stmt)
 {
-    g_status = 0;
     exec_andor(stmt);
     return 0;
 }

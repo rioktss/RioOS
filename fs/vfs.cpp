@@ -325,6 +325,8 @@ void vfs_ls(const char* spec)
     }
 }
 
+void vfs_path_of(int id, char* out, int capacity) { build_path(id, out, capacity); }
+
 void vfs_get_path(char* out, int capacity)
 {
     if (out == 0 || capacity <= 0) return;
@@ -403,6 +405,22 @@ static void tree_recursive(int id, int depth)
     {
         int child = fs_get_child(id, i);
         if (child >= 0) tree_recursive(child, depth + 1);
+    }
+}
+
+void vfs_tree_path(const char* path)
+{
+    if (!path || !path[0]) { vfs_tree(); return; }
+    int id = fs_resolve(path, current_directory);
+    if (id < 0) { uart_puts("tree: path not found\r\n"); return; }
+    if (fs_get_type(id) != FS_DIR) { uart_puts(path); uart_puts("\r\n"); return; }
+    if (fs_check_access(id, FS_ACCESS_READ | FS_ACCESS_EXEC) != 0) { uart_puts("tree: permission denied\r\n"); return; }
+    uart_puts(path); uart_puts("\r\n");
+    int count = fs_get_child_count(id);
+    for (int i = 0; i < count; ++i)
+    {
+        int child = fs_get_child(id, i);
+        if (child >= 0) tree_recursive(child, 1);
     }
 }
 

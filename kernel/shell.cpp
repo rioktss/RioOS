@@ -21,7 +21,7 @@ static const char* command_names[] = {
     "diskwrite","diskflush","apps","uname","whoami","net","ping","selftest","pages","tasks",
     "mount","stats","log","irq","grep","find","history","date","du","df","wc","chmod","env","export",
     "ifconfig","nslookup","httpget","dnsserver","smp","fbinfo",
-    "stat","chown","truncate","seq","basename","dirname","poweroff","reboot","head","tail","sort","uniq","cut","tr","tee","sleep","rmdir","free","which","dhcp","ping6","httpd","lspci","nvme","sata","umount","mkfs","fsck","fat","quota","awk","sed","xargs","rev","tac","nl","alias","unalias","printf","expr","more","less","hexdump","libctest","sync","ln","readlink","jtest","threads","thread-demo","unset","fds","sh","source","jobs","fg","bg","kill","let","test","true","false","read","useradd","userdel","passwd","id","users","return","nc","udp6","wget","telnet","usb","httpsget","curl","ntpdate","fw","gzip","gunzip","zcat","tar","diff","vi","pkg","cc"
+    "stat","chown","truncate","seq","basename","dirname","poweroff","reboot","head","tail","sort","uniq","cut","tr","tee","sleep","rmdir","free","which","dhcp","ping6","httpd","lspci","nvme","sata","umount","mkfs","fsck","fat","quota","awk","sed","xargs","rev","tac","nl","alias","unalias","printf","expr","more","less","hexdump","libctest","sync","ln","readlink","realpath","jtest","threads","thread-demo","unset","fds","sh","source","jobs","fg","bg","kill","let","test","true","false","read","useradd","userdel","passwd","id","users","return","nc","udp6","wget","telnet","usb","httpsget","curl","ntpdate","fw","gzip","gunzip","zcat","tar","diff","vi","pkg","cc"
 };
 
 static void shell_prompt_text()

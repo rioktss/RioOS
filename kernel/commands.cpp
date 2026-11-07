@@ -590,7 +590,7 @@ static void command_fat(const char* argument)
 static void command_lspci() { pci_list(); }
 static void command_usb(const char* argument)
 {
-    if (argument && str_equal(argument, "selftest")) { int rc = usb_selftest(); uart_puts(rc == 0 ? "usb selftest: PASS\r\n" : "usb selftest: FAIL\r\n"); return; }
+    if (argument && str_equal(argument, "selftest")) { if (!usb_present()) { uart_puts("usb: no xHCI controller (try QEMU: -device qemu-xhci -device usb-kbd)\r\n"); return; } int rc = usb_selftest(); uart_puts(rc == 0 ? "usb selftest: PASS\r\n" : "usb selftest: FAIL\r\n"); return; }
     usb_status();
 }
 
@@ -881,10 +881,23 @@ static void command_quota(const char* argument)
     }
 }
 
+static void command_realpath(const char* path)
+{
+    int id = fs_resolve(path, vfs_cwd());
+    if (id < 0) { uart_puts(id == -40 ? "realpath: too many levels of symbolic links\r\n" : "realpath: path not found\r\n"); return; }
+    char out[256]; vfs_path_of(id, out, sizeof(out)); uart_puts(out); uart_puts("\r\n");
+}
+
 static void command_readlink(const char* argument)
 {
     char t[260];
-    if (!argument || !argument[0]) { uart_puts("usage: readlink <link>\r\n"); return; }
+    if (!argument || !argument[0]) { uart_puts("usage: readlink [-f] <link>\r\n"); return; }
+    if (argument[0] == '-' && argument[1] == 'f' && argument[2] == ' ')
+    {
+        const char* p = argument + 3; while (*p == ' ') ++p;
+        if (!*p) { uart_puts("usage: readlink [-f] <link>\r\n"); return; }
+        command_realpath(p); return;
+    }
     int rc = fs_readlink(argument, vfs_cwd(), t, sizeof(t));
     if (rc > 0) { uart_puts(t); uart_puts("\r\n"); }
     else uart_puts("readlink: not a symlink or not found\r\n");
@@ -964,12 +977,12 @@ static const ManualEntry manual_entries[] =
     {"ls", "list directory contents", "ls [-l] [-a] [-R] [path]", "-l long format; -a show hidden; -R recursive"},
     {"cat", "display file contents", "cat [-n] <file>", "-n show line numbers"},
     {"grep", "search for a pattern in files", "grep [-r] [-i] [-n] [-v] [-c] <pattern> <file|dir>", "-r recursive; -i ignore case; -n show line numbers; -v invert match; -c count matches"},
-    {"find", "search filesystem entries", "find [path] -name <name> | -type <f/d>", "-name match entry name; -type f files; -type d directories"},
+    {"find", "search filesystem entries", "find [path] -name <name> | -type <f/d/l>", "-name match entry name; -type f files; -type d directories; -type l symbolic links"},
     {"chmod", "change file mode", "chmod <mode> <file>", "numeric 000-777; symbolic +r/+w/+x or -r/-w/-x; owner or root"},
-    {"stat", "show file metadata", "stat <path>", "shows inode, type, mode, owner, size, sector count, modification time"},
+    {"stat", "show file metadata", "stat [-L] <path>", "shows inode, links, type, mode, owner, size, mtime; a symlink is shown as itself with its target, -L follows it"},
     {"chown", "change file owner", "chown <uid> <gid> <path>", "root only; UID/GID are decimal numbers"},
     {"truncate", "resize a file", "truncate <path> <size>", "size 0-4194304 bytes; extended bytes are zero-filled"},
-    {"cp", "copy files or directories", "cp [-r] [-f] <source> <destination>", "-r recursive; -f overwrite destination"},
+    {"cp", "copy files or directories", "cp [-r] [-f] [-P] <source> <destination>", "-r recursive; -f overwrite destination; -P copy symbolic links as links instead of following them"},
     {"mv", "move or rename files", "mv [-f] <source> <destination>", "-f overwrite destination"},
     {"rm", "remove files or directories", "rm [-r] [-f] <file|dir>...", "-r recursive; -f force/ignore missing"},
     {"mkdir", "create a directory", "mkdir [-p] <dir>", "-p create parent directories as needed"},
@@ -978,7 +991,7 @@ static const ManualEntry manual_entries[] =
     {"du", "show disk usage", "du [-h] [-s] [path]", "-h human readable; -s summary"},
     {"df", "show filesystem free/used space", "df [-h]", "-h human readable"},
     {"nano", "edit a text file", "nano <file>", "Runs the bundled text editor"},
-    {"tree", "show filesystem tree", "tree", "No options"},
+    {"tree", "show filesystem tree", "tree [path]", "without a path the whole tree from / is printed"},
     {"mount", "show mounts / mount a device or tmpfs / remount root", "mount | mount [-r] <dev> <dir> | mount -t tmpfs none <dir> | mount -o remount,ro|rw /", "root only to change; devices: ram0 ram1 nvme0n1 sda; mount /dev needs mkfs first; /tmp is tmpfs"},
     {"mkfs", "format a device with myfs", "mkfs <dev>", "root only; dev: ram0 ram1 nvme0n1 sda; must be unmounted"},
     {"redirect", "shell output redirection", "cmd > f | cmd >> f | cmd 2> f | cmd 2>> f | cmd &> f | cmd > f 2>&1 | cmd < f", "works for every built-in; /dev/null discards; echo keeps its legacy handler"},
@@ -1102,7 +1115,8 @@ static const ManualEntry manual_entries[] =
     {"umount", "unmount a filesystem", "umount <mountpoint>", "root only; / and busy mounts (cwd inside, nested mounts) refuse"},
     {"sync", "flush filesystem to disk", "sync", "No options"},
     {"ln", "create a symbolic link", "ln -s <target> <link>", "relative targets resolve from the link's directory"},
-    {"readlink", "print a symlink target", "readlink <link>", "No options"},
+    {"readlink", "print a symlink target", "readlink [-f] <link>", "-f resolves every symlink and prints the canonical absolute path"},
+    {"realpath", "canonical absolute path", "realpath <path>", "resolves every symlink, . and .. (also across mounts); fails on loops (ELOOP) or missing targets"},
     {"jtest", "journal crash-recovery test", "jtest [path]", "root only; commits to journal then skips apply; reset to see replay"},
     {"ps", "show processes", "ps", "No options"},
     {"history", "show command history", "history [10|-c|-w|-r]", "-c clear; N last N entries; -w save to /home/user/.history (loaded at boot); -r reload; Arrow Up/Down recall"},
@@ -1358,6 +1372,8 @@ static int find_substr_line(const char* line, const char* pattern, int ignore_ca
     return ci_contains(line, pattern);
 }
 
+static int str_has_slash(const char* s) { for (; *s; ++s) if (*s == '/') return 1; return 0; }
+
 static void grep_print_file(const char* display_path, int options, const char* pattern)
 {
     static uint8_t buffer[262145];
@@ -1376,6 +1392,7 @@ static void grep_print_file(const char* display_path, int options, const char* p
     uint64_t start = 0;
     while (start <= size)
     {
+        if (start == size && (size == 0 || buffer[size - 1] == '\n')) break;   /* no phantom empty last line */
         uint64_t end = start;
         while (end < size && buffer[end] != '\n') ++end;
         char* line = (char*)(buffer + start);
@@ -1491,7 +1508,7 @@ static void find_walk(int id, const char* display_path, const char* name, int ty
 {
     if (id < 0) return;
     if ((name == 0 || str_equal(fs_get_name(id), name)) &&
-        (type_filter == 0 || (type_filter == 'f' && fs_get_type(id) == FS_FILE) || (type_filter == 'd' && fs_get_type(id) == FS_DIR)))
+        (type_filter == 0 || (type_filter == 'f' && fs_get_type(id) == FS_FILE) || (type_filter == 'd' && fs_get_type(id) == FS_DIR) || (type_filter == 'l' && fs_get_type(id) == FS_SYMLINK)))
     {
         uart_puts(display_path); uart_puts("\r\n");
     }
@@ -1528,7 +1545,7 @@ static void command_find(char* argument)
     while (i < count)
     {
         if (str_equal(words[i], "-name") && i + 1 < count) name = words[++i];
-        else if (str_equal(words[i], "-type") && i + 1 < count) { type_filter = words[++i][0]; if (type_filter != 'f' && type_filter != 'd') { uart_puts("find: type must be f or d\r\n"); return; } }
+        else if (str_equal(words[i], "-type") && i + 1 < count) { type_filter = words[++i][0]; if (type_filter != 'f' && type_filter != 'd' && type_filter != 'l') { uart_puts("find: type must be f, d or l\r\n"); return; } }
         else { uart_puts("find: usage: find [path] -name <name> | -type <f/d>\r\n"); return; }
         ++i;
     }
@@ -1672,16 +1689,21 @@ static void command_chmod(char* argument)
 
 static void command_stat(char* argument)
 {
-    char* words[3];
-    int count = split_words(argument, words, 3);
-    if (count != 1) { uart_puts("stat: usage: stat <path>\r\n"); return; }
+    char* words[4];
+    int count = split_words(argument, words, 4);
+    int follow = 0; int pi = 0;
+    if (count >= 1 && (str_equal(words[0], "-L") || str_equal(words[0], "-l"))) { follow = 1; pi = 1; }
+    if (count - pi != 1) { uart_puts("stat: usage: stat [-L] <path>   (-L follows a final symbolic link)\r\n"); return; }
+    const char* path = words[pi];
     FsStat st;
-    int rc = fs_stat_path(words[0], vfs_cwd(), &st);
-    if (rc != 0) { uart_puts(rc == -13 ? "stat: permission denied\r\n" : "stat: path not found\r\n"); return; }
-    uart_puts("  File: "); uart_puts(words[0]); uart_puts("\r\n");
+    int rc = follow ? fs_stat_path(path, vfs_cwd(), &st) : fs_lstat_path(path, vfs_cwd(), &st);
+    if (rc != 0) { uart_puts(rc == -13 ? "stat: permission denied\r\n" : rc == -40 ? "stat: too many levels of symbolic links\r\n" : "stat: path not found\r\n"); return; }
+    uart_puts("  File: "); uart_puts(path);
+    if (st.type == FS_SYMLINK) { char t[260]; int tl = fs_readlink(path, vfs_cwd(), t, sizeof(t)); if (tl > 0) { uart_puts(" -> "); uart_puts(t); } }
+    uart_puts("\r\n");
     uart_puts("  Inode: "); print_u64(st.inode);
-    { int lc = fs_link_count(fs_resolve(words[0], vfs_cwd())); uart_puts("  Links: "); print_u64((uint64_t)(lc > 0 ? lc : 1)); }
-    uart_puts("  Type: "); uart_puts(st.type == FS_DIR ? "directory\r\n" : "regular file\r\n");
+    { int lc = fs_link_count(follow ? fs_resolve(path, vfs_cwd()) : fs_resolve_nofollow(path, vfs_cwd())); uart_puts("  Links: "); print_u64((uint64_t)(lc > 0 ? lc : 1)); }
+    uart_puts("  Type: "); uart_puts(st.type == FS_DIR ? "directory\r\n" : st.type == FS_SYMLINK ? "symbolic link\r\n" : "regular file\r\n");
     uart_puts("  Mode: ");
     uart_putc((char)('0' + ((st.mode >> 6) & 7U)));
     uart_putc((char)('0' + ((st.mode >> 3) & 7U)));
@@ -1888,7 +1910,18 @@ static int handle_shell_operators(const char* line)
                 uart_puts("\r\n");
                 return 1;
             }
-            uart_puts("pipe: right side must be grep or wc\r\n"); return 1;
+            if (rc == 2 && str_equal(rw[0], "read"))
+            {
+                char val[256]; int n = 0;
+                for (uint64_t k = 0; k < psz && n < 200 && pipebuf[k] != (uint8_t)'\n' && pipebuf[k] != (uint8_t)'\r'; ++k) val[n++] = (char)pipebuf[k];
+                val[n] = 0;
+                char asg[300]; int a = 0;
+                for (const char* q = rw[1]; *q && a < 60; ++q) asg[a++] = *q;
+                asg[a++] = '='; for (int k = 0; k < n; ++k) asg[a++] = val[k]; asg[a] = 0;
+                script_set_status(env_set(asg) == 0 ? 0 : 1);
+                return 1;
+            }
+            uart_puts("pipe: right side must be grep, wc or read\r\n"); return 1;
         }
         if (line[i] == '>' || line[i] == '<')
         {
@@ -2039,7 +2072,7 @@ static const HelpSection help_sections[] = {
  "  touch [-c] <f>        create/update   write <f> <text>     write a file\r\n"
  "  cat [-n] <f>          read file       rm [-r -f] <f>       delete\r\n"
  "  cp [-r -f] <a> <b>    copy            mv [-f] <a> <b>      move (also across mounts)\r\n"
- "  ln [-s] <a> <b>       hard link / symlink (-s)   readlink <l>   show symlink target\r\n"
+ "  ln [-s] <a> <b>       hard link / symlink (-s)   readlink [-f] <l>   realpath <p>\r\n"
  "  stat <p>              inode, mode, owner, link count\r\n"
  "  chmod <mode> <p>  chown <uid> <gid> <p>  truncate <p> <size>\r\n"
  "  tree  find [path] -name <n> | -type <f|d>  du [-h -s] [p]  df [-h]  sync\r\n"
@@ -2291,7 +2324,7 @@ static int option_bits(const char* word)
     for (int i = 1; word[i]; ++i)
     {
         if (word[i] == 'a') bits |= OPT_ALL;
-        else if (word[i] == 'p') bits |= OPT_P;
+        else if (word[i] == 'p' || word[i] == 'P') bits |= OPT_P;
         else if (word[i] == 'r') bits |= OPT_R;
         else if (word[i] == 'f') bits |= OPT_F;
         else if (word[i] == 'c') bits |= OPT_C;
@@ -2385,7 +2418,7 @@ static void command_cat(char* argument)
     if (result == -1) uart_puts("cat: file not found\r\n");
     else if (result == -2) uart_puts("cat: is a directory\r\n");
     else if (result < 0) uart_puts("cat: read error\r\n");
-    else uart_puts("\r\n");
+    else if (!uart_at_line_start()) uart_puts("\r\n");   /* a file that ends with a newline needs none */
 }
 
 static void command_write(
@@ -2518,6 +2551,7 @@ static int build_child_path(const char* dir, const char* name, char* out, int ca
     return 0;
 }
 
+static int g_two_opts = 0;   /* option bits seen by the last parse_two_operands call */
 static int parse_two_operands(char* argument, int allowed_options, int* force, int* recursive,
                               char** from, char** to)
 {
@@ -2526,6 +2560,7 @@ static int parse_two_operands(char* argument, int allowed_options, int* force, i
     int options = 0;
     int n = collect_operands(words, count, operands, 2, &options);
     if (n < 0 || (options & ~allowed_options)) return -1;
+    g_two_opts = options;
     *force = (options & OPT_F) != 0;
     *recursive = (options & OPT_R) != 0;
     if (n != 2) return 0;
@@ -2566,7 +2601,18 @@ static int copy_tree_node(int src, const char* target, int cwd, int recursive, i
         char child_target[256];
         if (build_child_path(target, fs_get_name(child), child_target, sizeof(child_target)) != 0)
             return -6;
-        if (fs_get_type(child) == FS_DIR)
+        if (fs_get_type(child) == FS_SYMLINK && (g_two_opts & OPT_P))
+        {
+            /* cp -P: copy the link itself, not what it points to */
+            char lp[256], tgt[260];
+            vfs_path_of(child, lp, sizeof(lp));
+            int tl = fs_readlink(lp, 0, tgt, sizeof(tgt) - 1);
+            if (tl <= 0) return -9;
+            tgt[tl] = 0;
+            if (fs_resolve_nofollow(child_target, cwd) >= 0) { if (!force) return -7; (void)fs_rm(child_target, cwd); }
+            if (fs_symlink(tgt, child_target, cwd) < 0) return -10;
+        }
+        else if (fs_get_type(child) == FS_DIR)
         {
             int rc = copy_tree_node(child, child_target, cwd, 1, force);
             if (rc != 0) return rc;
@@ -2592,14 +2638,32 @@ static int copy_tree_node(int src, const char* target, int cwd, int recursive, i
 static void command_cp(char* argument)
 {
     int force = 0, recursive = 0; char* from = 0; char* to = 0;
-    int parsed = parse_two_operands(argument, OPT_R | OPT_F, &force, &recursive, &from, &to);
+    int parsed = parse_two_operands(argument, OPT_R | OPT_F | OPT_P, &force, &recursive, &from, &to);
     if (parsed != 1)
     {
-        uart_puts("cp: usage: cp [-r] [-f] <source> <destination>\r\n");
+        uart_puts("cp: usage: cp [-r] [-f] [-P] <source> <destination>\r\n");
         return;
     }
 
     int cwd = vfs_cwd();
+    if (g_two_opts & OPT_P)
+    {
+        FsStat ls;
+        if (fs_lstat_path(from, cwd, &ls) == 0 && ls.type == FS_SYMLINK)
+        {
+            /* cp -P <link> <dst>: duplicate the symbolic link itself */
+            char tgt[260]; int tl = fs_readlink(from, cwd, tgt, sizeof(tgt) - 1);
+            if (tl <= 0) { uart_puts("cp: cannot read link\r\n"); return; }
+            tgt[tl] = 0;
+            char lt[256]; int dd = fs_resolve(to, cwd);
+            if (dd >= 0 && fs_get_type(dd) == FS_DIR) { const char* b = from; for (const char* q = from; *q; ++q) if (*q == '/' && q[1]) b = q + 1; if (build_child_path(to, b, lt, sizeof(lt)) != 0) { uart_puts("cp: path too long\r\n"); return; } }
+            else str_copy(lt, to, sizeof(lt));
+            if (fs_resolve_nofollow(lt, cwd) >= 0) { if (!force) { uart_puts("cp: destination exists (use -f to overwrite)\r\n"); return; } (void)fs_rm(lt, cwd); }
+            if (fs_symlink(tgt, lt, cwd) < 0) { uart_puts("cp: cannot create symbolic link\r\n"); return; }
+            uart_puts("Copied symbolic link.\r\n");
+            return;
+        }
+    }
     int src = fs_resolve(from, cwd);
     if (src < 0) { uart_puts("cp: source not found\r\n"); return; }
 
@@ -4122,7 +4186,7 @@ static void execute_command_inner(
 
     if (str_equal(command, "tree"))
     {
-        vfs_tree();
+        vfs_tree_path(argument && argument[0] ? argument : 0);
         return;
     }
 
@@ -4218,6 +4282,7 @@ static void execute_command_inner(
     if (str_equal(command, "sync")) { command_sync(); return; }
     if (str_equal(command, "ln")) { command_ln(argument); return; }
     if (str_equal(command, "readlink")) { command_readlink(argument); return; }
+    if (str_equal(command, "realpath")) { if (!argument || !argument[0]) uart_puts("usage: realpath <path>\r\n"); else command_realpath(argument); return; }
     if (str_equal(command, "jtest")) { command_jtest(argument); return; }
     if (str_equal(command, "mount")) { command_mount(argument); return; }
     if (str_equal(command, "mkfs")) { command_mkfs(argument); return; }
@@ -4308,6 +4373,11 @@ static void execute_command_inner(
         while (*p && *p != ' ' && pi < (int)sizeof(path) - 1)
             path[pi++] = *p++;
         path[pi] = '\0';
+        {   /* a bare program name resolves like at the prompt (/bin/<name>[.elf]) */
+            char resolved[96];
+            if (!str_has_slash(path) && jobs_resolve_program(path, resolved, (int)sizeof(resolved)) > 0)
+            { int k = 0; while (resolved[k] && k < (int)sizeof(path) - 1) { path[k] = resolved[k]; ++k; } path[k] = '\0'; }
+        }
 
         while (*p == ' ') ++p;
         int ai = 0;

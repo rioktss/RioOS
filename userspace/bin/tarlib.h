@@ -18,7 +18,7 @@ static void tar_octal(char* f, int n, unsigned long long v)
 {
     f[n - 1] = 0; for (int i = n - 2; i >= 0; --i) { f[i] = (char)('0' + (v & 7)); v >>= 3; }
 }
-/* typeflag: '0' file, '5' directory. Returns 0 or -1 (name too long / out of memory). */
+/* typeflag: '0' file, '5' directory, '2' symbolic link (data = link target, size 0). Returns 0 or -1 (name too long / out of memory). */
 static int tar_add(TarBuf* b, const char* name, char type, unsigned mode, unsigned long mtime, unsigned uid, unsigned gid, const void* data, unsigned long size)
 {
     char h[512]; memset(h, 0, sizeof(h));
@@ -32,14 +32,15 @@ static int tar_add(TarBuf* b, const char* name, char type, unsigned mode, unsign
     }
     else memcpy(h, nm, nl);
     tar_octal(h + 100, 8, mode & 07777); tar_octal(h + 108, 8, uid); tar_octal(h + 116, 8, gid);
-    tar_octal(h + 124, 12, type == '5' ? 0 : size); tar_octal(h + 136, 12, mtime);
+    tar_octal(h + 124, 12, (type == '5' || type == '2') ? 0 : size); tar_octal(h + 136, 12, mtime);
     memset(h + 148, ' ', 8); h[156] = type;
+    if (type == '2' && data) { strncpy(h + 157, (const char*)data, 99); }
     memcpy(h + 257, "ustar", 6); h[263] = '0'; h[264] = '0';
     strcpy(h + 265, "root"); strcpy(h + 297, "root");
     unsigned sum = 0; for (int i = 0; i < 512; ++i) sum += (unsigned char)h[i];
     tar_octal(h + 148, 7, sum); h[155] = ' ';
     if (tb_put(b, h, 512)) return -1;
-    if (type != '5' && size)
+    if (type != '5' && type != '2' && size)
     {
         if (tb_put(b, data, size)) return -1;
         unsigned long pad = (512 - (size & 511)) & 511; char z[512]; memset(z, 0, sizeof(z));
@@ -49,7 +50,7 @@ static int tar_add(TarBuf* b, const char* name, char type, unsigned mode, unsign
 }
 static int tar_finish(TarBuf* b) { char z[1024]; memset(z, 0, sizeof(z)); return tb_put(b, z, 1024); }
 
-struct TarEntry { char name[256]; char type; unsigned mode, uid, gid; unsigned long size, mtime; const unsigned char* data; };
+struct TarEntry { char name[256]; char link[101]; char type; unsigned mode, uid, gid; unsigned long size, mtime; const unsigned char* data; };
 static unsigned long tar_parse_octal(const char* f, int n)
 {
     unsigned long v = 0; int i = 0; while (i < n && (f[i] == ' ' || f[i] == 0)) ++i;
@@ -72,6 +73,7 @@ static int tar_next(const unsigned char* a, unsigned long alen, unsigned long* p
         char nm[101]; memcpy(nm, h, 100); nm[100] = 0;
         if (pre[0]) snprintf(e->name, sizeof(e->name), "%s/%s", pre, nm); else snprintf(e->name, sizeof(e->name), "%s", nm);
         e->type = h[156] ? h[156] : '0';
+        memcpy(e->link, h + 157, 100); e->link[100] = 0;
         e->mode = (unsigned)tar_parse_octal(h + 100, 8); e->uid = (unsigned)tar_parse_octal(h + 108, 8); e->gid = (unsigned)tar_parse_octal(h + 116, 8);
         e->size = tar_parse_octal(h + 124, 12); e->mtime = tar_parse_octal(h + 136, 12);
         *pos += 512; e->data = a + *pos;
@@ -81,6 +83,14 @@ static int tar_next(const unsigned char* a, unsigned long alen, unsigned long* p
         if (e->type == 'x' || e->type == 'g' || e->type == 'L' || e->type == 'K') continue;   /* extended headers are ignored */
         return 1;
     }
+}
+/* 1 when a parent directory component of `path` is a symbolic link (extraction through it could escape the target dir) */
+static inline int tar_parent_is_link(const char* path)
+{
+    char t[300]; strncpy(t, path, 299); t[299] = 0;
+    for (char* p = t + 1; *p; ++p)
+        if (*p == '/') { *p = 0; struct RioStat st; if (lstat_path(t, &st) == 0 && st.type == 2) return 1; *p = '/'; }
+    return 0;
 }
 /* safe relative path: strips leading '/', refuses '..' components; returns pointer into name or 0 */
 static const char* tar_safe_path(const char* name)
@@ -114,7 +124,7 @@ static unsigned char* tar_slurp(const char* path, unsigned long* n)
 static inline int tar_add_path(TarBuf* b, const char* path, int verbose, int* errors)
 {
     struct RioStat st;
-    if (stat_path(path, &st) != 0) { printf("tar: %s: cannot stat\n", path); ++*errors; return 0; }
+    if (lstat_path(path, &st) != 0) { printf("tar: %s: cannot stat\n", path); ++*errors; return 0; }
     const char* an = path; while (*an == '/') ++an; while (an[0] == '.' && an[1] == '/') an += 2;
     if (!*an) an = path;
     if (st.type == 1)
@@ -128,18 +138,26 @@ static inline int tar_add_path(TarBuf* b, const char* path, int verbose, int* er
         for (char* ln = list; *ln;)
         {
             char* nl = ln; while (*nl && *nl != '\n') ++nl; if (*nl) *nl++ = 0;
-            char kind = ln[0]; char* name = ln + 1; while (*name == ' ') ++name; while (*name >= '0' && *name <= '9') ++name; while (*name == ' ') ++name;
+            char* name = ln + 1; while (*name == ' ') ++name; while (*name >= '0' && *name <= '9') ++name; while (*name == ' ') ++name;
             ln = nl;
             if (!*name) continue;
             char child[256]; size_t pl = strlen(path);
             if (pl && path[pl - 1] == '/') snprintf(child, sizeof(child), "%s%s", path, name); else snprintf(child, sizeof(child), "%s/%s", path, name);
-            if (kind == 'l') { printf("tar: %s: symbolic link skipped\n", child); continue; }
             if (tar_add_path(b, child, verbose, errors)) { free(list); return -1; }
         }
         free(list);
         return 0;
     }
-    if (st.type == 2) { printf("tar: %s: symbolic link skipped\n", path); return 0; }
+    if (st.type == 2)
+    {
+        char tgt[256]; long tn = readlink(path, tgt, sizeof(tgt) - 1);
+        if (tn < 0) { printf("tar: %s: cannot read link\n", path); ++*errors; return 0; }
+        tgt[tn] = 0;
+        if (tn > 99) { printf("tar: %s: link target too long\n", path); ++*errors; return 0; }
+        if (verbose) printf("%s -> %s\n", an, tgt);
+        if (tar_add(b, an, '2', st.mode, (unsigned long)st.mtime, st.uid, st.gid, tgt, 0)) { printf("tar: %s: name too long\n", an); ++*errors; }
+        return 0;
+    }
     FILE* f = fopen(path, "r"); if (!f) { printf("tar: %s: cannot open\n", path); ++*errors; return 0; }
     unsigned char* data = (unsigned char*)malloc((unsigned long)st.size + 1); if (!data) { fclose(f); return -1; }
     size_t got = st.size ? fread(data, 1, (size_t)st.size, f) : 0; fclose(f);

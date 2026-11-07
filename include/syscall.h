@@ -63,7 +63,25 @@ enum SyscallNumber
     SYS_FS_UNLINK  = 56,  /* unlink(path): file, symlink or empty directory */
     SYS_FS_RENAME  = 57,  /* rename(from, to) within one mount */
     SYS_FS_READDIR = 58,  /* readdir(path, buf, cap): lines "<f|d|l> <size> <name>\n" -> bytes, or -errno */
-    SYS_TIME_EPOCH = 59,  /* seconds since 1970 (RTC) */
+    SYS_TIME_EPOCH = 59,
+    SYS_FS_SYMLINK = 60,  /* symlink(target, linkpath) */
+    SYS_FS_READLINK= 61,  /* readlink(path, buf, cap) -> length (no NUL) or -errno */
+    SYS_FS_LINK    = 62,  /* link(existing, newpath): hard link, same filesystem */
+    SYS_FS_LSTAT   = 63,  /* lstat(path, FsStat*): does not follow a final symlink */
+    SYS_FS_REALPATH= 64,  /* realpath(path, buf, cap) -> length or -errno; follows every symlink */  /* seconds since 1970 (RTC) */
+    SYS_SIGACTION  = 65,  /* sigaction(sig, handler|0 default|1 ignore, restorer, amask | flags<<32) -> old handler */
+    SYS_SIGPROCMASK= 66,  /* sigprocmask(how 0 block/1 unblock/2 set/3 query, mask) -> old mask */
+    SYS_SIGRETURN  = 67,  /* returns from a signal handler (called by the libc restorer) */
+    SYS_ALARM_MS   = 68,  /* alarm_ms(ms) -> previous remaining ms; 0 cancels; raises SIGALRM */
+    SYS_PAUSE      = 69,  /* pause(): waits for a deliverable signal, -EINTR */
+    SYS_SIGPENDING = 70,  /* sigpending() -> mask of pending but blocked signals */
+    SYS_FCNTL      = 71,  /* fcntl(fd, cmd 0 DUPFD / 1 GETFD / 2 SETFD, arg) */
+    SYS_MMAPX      = 72,  /* mmapx(length, prot, fd, off | flags<<32): MAP_SHARED/PRIVATE/ANON */
+    SYS_MSYNC      = 73,  /* msync(addr, length): write shared file pages back */
+    SYS_SIGQUEUE   = 74,  /* sigqueue(pid, sig, value) */
+    SYS_SIGALTSTACK= 75,  /* sigaltstack(const stack_t* new, stack_t* old) */
+    SYS_SIGWAIT    = 76,  /* sigwait(set, timeout_ms | ~0 = forever, siginfo* out) -> signal / -EAGAIN / -EINTR */
+    SYS_SETITIMER  = 77,  /* setitimer(value_ms, interval_ms) -> previous remaining ms (SIGALRM) */
     SYS_NET_TCP_ACCEPT = 54, /* tcp_accept(handle, uint64_t* peer(ip|port<<32) or 0, timeout_ms) -> new handle */
     SYS_SETUID     = 52,  /* setuid(uid, gid): root only (drops privilege irreversibly for non-root targets) */
 };

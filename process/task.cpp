@@ -11,6 +11,7 @@
 #include "netstack.h"
 #include "string.h"
 #include "security.h"
+#include "mapping.h"
 
 #define USER_SPSR_EL0T 0x340ULL   /* EL0t, IRQ unmasked, D/A/F masked */
 #define TASK_EXEC_TMP_BASE 0x10000
@@ -147,6 +148,7 @@ int task_fork(ExceptionFrame* frame)
     (void)process_set_background(pid, process_is_background(parent));
     (void)process_set_start(pid, timer_millis());
     (void)process_set_creds(pid, process_uid(parent), process_gid(parent));
+    (void)process_sig_inherit(parent, pid);
 
     if (mmu_user_space_clone(parent, pid) != 0)
     {
@@ -158,6 +160,7 @@ int task_fork(ExceptionFrame* frame)
         drop_process(pid);
         return -11;
     }
+    mapping_clone(parent, pid);
     if (fd_set_process(pid) != 0 || fd_clone_table(parent, pid) != 0)
     {
         (void)fd_set_process(parent);
@@ -204,7 +207,10 @@ int task_exec(ExceptionFrame* frame, const char* path, const char* args)
     }
     (void)process_set_args(pid, args ? args : "");
     (void)process_set_name(pid, path);
-    (void)process_sig_take(pid);
+    mapping_release_pid(pid);
+    mapping_gc();
+    (void)process_sig_reset_on_exec(pid);
+    (void)fd_close_on_exec(pid);
     (void)mmu_user_space_activate(pid);
 
     for (int i = 0; i < 31; ++i) frame->x[i] = 0;
@@ -226,10 +232,12 @@ extern "C" void task_exit_current(int code, int signal)
     net_udp_close_all_for(pid);
     net_tcp_close_all_for(pid);
     (void)fd_set_process(pid);
+    mapping_release_pid(pid);                  /* shared file pages are written back before the space goes */
     fd_close_all();
     fd_release_process(pid);
     (void)scheduler_remove(pid);
     (void)mmu_user_space_destroy(pid);         /* also returns TTBR0 to the kernel space */
+    mapping_gc();
 
     process_reparent_children(pid, 1);
     (void)process_set_term_signal(pid, signal);
@@ -242,7 +250,7 @@ extern "C" void task_exit_current(int code, int signal)
     thread_exit();
 }
 
-int task_kill(int pid, int sig)
+int task_kill_info(int pid, int sig, int sender, int code, uint64_t value)
 {
     if (pid <= 1) return -1;                   /* kernel and shell are not killable */
     if (!process_is_user(pid)) return -3;
@@ -250,8 +258,9 @@ int task_kill(int pid, int sig)
     if (sig == 0) return 0;                    /* existence check */
     if (sig < 0 || sig >= 32) return -22;
     if (sig == SIG_CONT) (void)process_set_stopped(pid, 0);
-    return process_sig_raise(pid, sig);
+    return process_sig_raise_info(pid, sig, sender, code, value);
 }
+int task_kill(int pid, int sig) { return task_kill_info(pid, sig, 0, 0, 0); }
 
 int task_reap(int pid)
 {
@@ -276,6 +285,7 @@ int task_wait(int parent, int pid, int* status, int options)
         if (pid > 0 ? !process_is_child_of(parent, pid) : !process_has_children(parent))
             return -10;                         /* ECHILD */
         if (options & TASK_WNOHANG) return 0;
+        process_alarm_check(parent, timer_millis());
         if (process_sig_pending(parent) & ~((1U << SIG_CHLD) | (1U << SIG_CONT))) return -4;   /* EINTR */
         thread_wait_ms(2);
     }
@@ -298,13 +308,106 @@ int task_reap_orphans(int shell_pid, void (*notify)(int pid, int code, int sig))
 
 int task_running_count() { return user_task_total; }
 
-extern "C" void task_deliver_signals()
+/* Frame pushed on the user stack when a caught signal is delivered. The handler is called as
+   handler(sig, &info, &uc) so SA_SIGINFO handlers work; plain handlers just ignore x1/x2. */
+struct SigInfoK { int32_t si_signo, si_errno, si_code, si_pid; uint64_t si_value; uint64_t si_addr; };
+struct SigFrame
+{
+    uint64_t magic;
+    uint32_t old_mask;
+    uint32_t sig;
+    SigInfoK info;
+    uint64_t x[31];
+    uint64_t elr, spsr, sp;
+    uint64_t pad;
+};
+#define SIGFRAME_MAGIC 0x52494F5349474652ULL   /* "RIOSIGFR" */
+#define SA_ONSTACK_FLAG 0x08000000U
+
+static int push_signal_frame(ExceptionFrame* frame, int pid, int sig, uint64_t handler, uint64_t fault_addr)
+{
+    uint32_t amask = 0, flags = 0;
+    (void)process_sig_handler(pid, sig, &amask, &flags);
+    uint64_t sp;
+    asm volatile("mrs %0, sp_el0" : "=r"(sp));
+    uint64_t base = sp;
+    uint64_t asp = 0, asz = 0;
+    if ((flags & SA_ONSTACK_FLAG) && process_altstack_get(pid, &asp, &asz) == 0 && asp && asz)
+        if (!(sp >= asp && sp < asp + asz)) base = asp + asz;        /* switch to the alternate stack unless already on it */
+    uint64_t nsp = (base - (base == sp ? 128ULL : 0ULL) - sizeof(SigFrame)) & ~15ULL;
+    if (!mmu_user_pointer_ok(nsp, sizeof(SigFrame), 1)) return -1;
+    SigFrame* sf = (SigFrame*)nsp;
+    sf->magic = SIGFRAME_MAGIC;
+    sf->old_mask = process_sig_mask(pid);
+    sf->sig = (uint32_t)sig;
+    int sender = 0, code = 0; uint64_t value = 0;
+    (void)process_sig_info_get(pid, sig, &sender, &code, &value);
+    sf->info.si_signo = sig; sf->info.si_errno = 0; sf->info.si_code = code; sf->info.si_pid = sender; sf->info.si_value = value; sf->info.si_addr = fault_addr;
+    for (int i = 0; i < 31; ++i) sf->x[i] = frame->x[i];
+    sf->elr = frame->elr; sf->spsr = frame->spsr; sf->sp = sp; sf->pad = 0;
+    uint32_t nm = sf->old_mask | amask;
+    if (!(flags & 0x40000000U)) nm |= (1U << sig);          /* SA_NODEFER not set */
+    (void)process_sig_set_mask(pid, nm);
+    if (flags & 0x80000000U) { uint64_t o; (void)process_sig_set_action(pid, sig, 0, 0, 0, 0, &o); }   /* SA_RESETHAND */
+    uint64_t rest = process_sig_restorer(pid);
+    for (int i = 0; i < 31; ++i) frame->x[i] = 0;
+    frame->x[0] = (uint64_t)sig;
+    frame->x[1] = (uint64_t)&sf->info;
+    frame->x[2] = (uint64_t)&sf->x[0];
+    frame->x[30] = rest;
+    frame->elr = handler;
+    asm volatile("msr sp_el0, %0" :: "r"(nsp));
+    return 0;
+}
+
+/* A fatal user fault (SIG_SEGV / SIG_BUS / SIG_ILL): run the program's handler when it has one and the
+   signal is not already being handled. Returns 0 when a handler frame was pushed. */
+int task_deliver_fault(ExceptionFrame* frame, int sig, uint64_t addr)
+{
+    int pid = thread_current_pid();
+    if (pid < 0 || !frame) return -1;
+    uint64_t h = process_sig_handler(pid, sig, 0, 0);
+    if (h <= 1) return -1;
+    if (process_sig_mask(pid) & (1U << sig)) return -1;     /* fault inside its own handler: terminate */
+    (void)process_sig_info_get(pid, sig, 0, 0, 0);
+    (void)process_sig_raise_info(pid, sig, 0, 1 /* SEGV_MAPERR */, 0);
+    (void)process_sig_take(pid);                           /* consume the pending bit we just set */
+    return push_signal_frame(frame, pid, sig, h, addr);
+}
+
+int task_sigreturn(ExceptionFrame* frame)
+{
+    int pid = thread_current_pid();
+    uint64_t sp;
+    asm volatile("mrs %0, sp_el0" : "=r"(sp));
+    if (pid < 0 || !mmu_user_pointer_ok(sp, sizeof(SigFrame), 0)) return -14;
+    const SigFrame* sf = (const SigFrame*)sp;
+    if (sf->magic != SIGFRAME_MAGIC) return -22;
+    for (int i = 0; i < 31; ++i) frame->x[i] = sf->x[i];
+    frame->elr = sf->elr;
+    frame->spsr = (frame->spsr & ~0xF0000000ULL) | (sf->spsr & 0xF0000000ULL);   /* only the condition flags come back */
+    uint32_t om = sf->old_mask; uint64_t nsp = sf->sp;
+    (void)process_sig_set_mask(pid, om);
+    asm volatile("msr sp_el0, %0" :: "r"(nsp));
+    return 0;
+}
+
+extern "C" void task_deliver_signals(ExceptionFrame* frame)
 {
     int pid = thread_current_pid();
     if (pid < 0) return;
+    process_alarm_check(pid, timer_millis());
     int sig;
     while ((sig = process_sig_take(pid)) != 0)
     {
+        uint64_t handler = process_sig_handler(pid, sig, 0, 0);
+        if (handler == 1) continue;                      /* ignored */
+        if (handler > 1)
+        {
+            if (frame && push_signal_frame(frame, pid, sig, handler, 0) == 0) return;   /* one handler per return; the rest stay pending */
+            task_exit_current(128 + SIG_SEGV, SIG_SEGV);  /* no room for the signal frame */
+            return;
+        }
         switch (sig)
         {
             case SIG_CHLD:

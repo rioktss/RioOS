@@ -47,6 +47,12 @@ extern int errno;
 #define EMFILE 24
 #define EPIPE 32
 #define ENOSYS 38
+#ifndef E2BIG
+#define E2BIG 7
+#define ENOEXEC 8
+#define ERANGE 34
+#define ELOOP 40
+#endif
 
 /* string.h */
 void* memcpy(void* d, const void* s, size_t n);
@@ -112,12 +118,27 @@ char* fgets_fd(int fd, char* buf, int cap);
 #define PROT_WRITE 2
 #define PROT_EXEC 4
 #define MAP_FAILED ((void*)-1)
+#define MAP_SHARED 0x01
+#define MAP_PRIVATE 0x02
+#define MAP_FIXED 0x10
+#define MAP_ANONYMOUS 0x20
+#define MAP_ANON MAP_ANONYMOUS
+#define MS_ASYNC 1
+#define MS_SYNC 4
+#define O_CLOEXEC 0x1000
+#define F_DUPFD 0
+#define F_GETFD 1
+#define F_SETFD 2
+#define FD_CLOEXEC 1
 
 #define SIGHUP 1
 #define SIGINT 2
 #define SIGKILL 9
 #define SIGUSR1 10
+#define SIGQUIT 3
 #define SIGSEGV 11
+#define SIGUSR2 12
+#define SIGALRM 14
 #define SIGPIPE 13
 #define SIGTERM 15
 #define SIGCHLD 17
@@ -130,6 +151,99 @@ char* fgets_fd(int fd, char* buf, int cap);
 #define WIFSIGNALED(s) (((s) & 0xFF) != 0)
 #define WTERMSIG(s) ((s) & 0xFF)
 
+typedef struct FILE FILE;
+typedef void (*sighandler_t)(int);
+typedef unsigned int sigset_t;
+#define SIG_DFL ((sighandler_t)0)
+#define SIG_IGN ((sighandler_t)1)
+#define SIG_ERR ((sighandler_t)-1)
+#define SIG_BLOCK 0
+#define SIG_UNBLOCK 1
+#define SIG_SETMASK 2
+#define SA_RESTART 0x10000000
+#define SA_NODEFER 0x40000000
+#define SA_RESETHAND 0x80000000U
+#define SA_SIGINFO 0x00000004
+#define SA_ONSTACK 0x08000000
+#define SI_USER 0
+#define SI_QUEUE (-1)
+#define SI_TIMER 0x80
+#define SEGV_MAPERR 1
+#define SIGILL 4
+#define SIGBUS 7
+#define SIGFPE 8
+#define SS_DISABLE 2
+#define MINSIGSTKSZ 2048
+#define SIGSTKSZ 8192
+union sigval { int sival_int; void* sival_ptr; };
+typedef struct { int si_signo; int si_errno; int si_code; int si_pid; union sigval si_value; void* si_addr; } siginfo_t;
+typedef struct { void* ss_sp; int ss_flags; size_t ss_size; } stack_t;
+struct sigaction
+{
+    union { sighandler_t sa_handler; void (*sa_sigaction)(int, siginfo_t*, void*); };
+    sigset_t sa_mask;
+    unsigned int sa_flags;
+};
+typedef unsigned long long jmp_buf_word;
+typedef jmp_buf_word jmp_buf[24];
+typedef jmp_buf_word sigjmp_buf[26];
+int setjmp(jmp_buf env) __attribute__((returns_twice));
+void longjmp(jmp_buf env, int val) __attribute__((noreturn));
+int sigsetjmp(sigjmp_buf env, int savemask) __attribute__((returns_twice));
+void siglongjmp(sigjmp_buf env, int val) __attribute__((noreturn));
+int sigaltstack(const stack_t* ss, stack_t* old);
+int sigqueue(pid_t pid, int sig, union sigval value);
+int sigwait(const sigset_t* set, int* sig);
+int sigwaitinfo(const sigset_t* set, siginfo_t* info);
+struct timeval { long tv_sec; long tv_usec; };
+struct timespec { long tv_sec; long tv_nsec; };
+struct itimerval { struct timeval it_interval; struct timeval it_value; };
+#define ITIMER_REAL 0
+#define CLOCK_REALTIME 0
+#define CLOCK_MONOTONIC 1
+int setitimer(int which, const struct itimerval* nv, struct itimerval* old);
+int getitimer(int which, struct itimerval* cur);
+int nanosleep(const struct timespec* req, struct timespec* rem);
+int gettimeofday(struct timeval* tv, void* tz);
+int clock_gettime(int clk, struct timespec* ts);
+int sigtimedwait(const sigset_t* set, siginfo_t* info, const struct timespec* timeout);
+const char* strsignal(int sig);
+void psignal(int sig, const char* msg);
+int sigaction(int sig, const struct sigaction* act, struct sigaction* old);
+sighandler_t signal(int sig, sighandler_t handler);
+int raise(int sig);
+int sigemptyset(sigset_t* s); int sigfillset(sigset_t* s);
+int sigaddset(sigset_t* s, int sig); int sigdelset(sigset_t* s, int sig); int sigismember(const sigset_t* s, int sig);
+int sigprocmask(int how, const sigset_t* set, sigset_t* old);
+int sigpending(sigset_t* set);
+int sigsuspend(const sigset_t* mask);
+unsigned alarm(unsigned seconds);
+int pause(void);
+/* process creation: POSIX fork/exec family (programs are ELF files; argv[0] is preserved) */
+int execve(const char* path, char* const argv[], char* const envp[]);
+int execv(const char* path, char* const argv[]);
+int execvp(const char* file, char* const argv[]);
+int execl(const char* path, const char* arg0, ...);
+int execlp(const char* file, const char* arg0, ...);
+int execle(const char* path, const char* arg0, ...);
+pid_t vfork(void);
+int system(const char* cmd);
+FILE* popen(const char* cmd, const char* mode);
+int pclose(FILE* f);
+FILE* fdopen(int fd, const char* mode);
+struct posix_spawn_file_actions { int n; int kind[8]; int fd[8]; int fd2[8]; const char* path[8]; int flags[8]; };
+typedef struct posix_spawn_file_actions posix_spawn_file_actions_t;
+int posix_spawn_file_actions_init(posix_spawn_file_actions_t* a);
+int posix_spawn_file_actions_adddup2(posix_spawn_file_actions_t* a, int fd, int newfd);
+int posix_spawn_file_actions_addclose(posix_spawn_file_actions_t* a, int fd);
+int posix_spawn_file_actions_addopen(posix_spawn_file_actions_t* a, int fd, const char* path, int flags, int mode);
+int posix_spawn_file_actions_destroy(posix_spawn_file_actions_t* a);
+int posix_spawn(pid_t* pid, const char* path, const posix_spawn_file_actions_t* actions, const void* attr, char* const argv[], char* const envp[]);
+int posix_spawnp(pid_t* pid, const char* file, const posix_spawn_file_actions_t* actions, const void* attr, char* const argv[], char* const envp[]);
+int fcntl(int fd, int cmd, ...);
+int msync(void* addr, size_t len, int flags);
+pid_t getpgrp(void); pid_t getpgid(pid_t pid); pid_t setsid(void); int setpgid(pid_t pid, pid_t pgid);
+#define WIFSTOPPED(s) (0)
 pid_t fork(void);
 int execv_args(const char* path, const char* args);   /* RioOS exec: single argument string */
 pid_t waitpid(pid_t pid, int* status, int options);
@@ -167,7 +281,12 @@ int rmdir(const char* path);                 /* empty directories only */
 int rename(const char* from, const char* to);
 long readdir_text(const char* path, char* buf, size_t cap);   /* lines "<f|d|l> <size> <name>\n"; bytes or -1 */
 long time_epoch(void);                       /* seconds since 1970 (RTC, UTC) */
-int stat_path(const char* path, struct RioStat* st);
+int stat_path(const char* path, struct RioStat* st);          /* follows symlinks */
+int lstat_path(const char* path, struct RioStat* st);         /* does not follow a final symlink (type 2) */
+int symlink(const char* target, const char* linkpath);
+int link(const char* target, const char* linkpath);           /* hard link */
+long readlink(const char* path, char* buf, size_t cap);        /* length, not NUL terminated; -1 on error */
+char* realpath(const char* path, char* out);                   /* out: 256 bytes or NULL for a static buffer */
 int chmod(const char* path, unsigned mode);
 
 /* dynamic loading (ET_DYN shared objects) */
@@ -275,6 +394,92 @@ int rio_inflate(const uint8_t* in, unsigned long inlen, uint8_t** out, unsigned 
 int rio_gzip_compress(const uint8_t* in, unsigned long inlen, const char* name, uint32_t mtime, uint8_t** out, unsigned long* outlen, int level);
 int rio_gzip_decompress(const uint8_t* in, unsigned long inlen, uint8_t** out, unsigned long* outlen, char* name_out, int name_cap);   /* 0 ok, -1 not gzip, -2 corrupt, -3 crc */
 int rio_fmt_double(char* out, int cap, double v, char conv, int prec, int plus, int space, int alt);
+
+
+/* ---- POSIX threads: user-level (M:1) threads inside one process ----------------------------
+   Threads share the address space and descriptors and are scheduled cooperatively: a switch happens at
+   pthread_yield/sched_yield, sleep/usleep/nanosleep, pthread_join, mutex/cond/rwlock/barrier/semaphore waits
+   and thread exit. A thread blocked in a kernel call (read on a pipe, waitpid) blocks the whole process. */
+#ifndef ETIMEDOUT
+#define ETIMEDOUT 110
+#define EBUSY 16
+#define EDEADLK 35
+#endif
+typedef unsigned long pthread_t;
+typedef struct { int detachstate; unsigned long stacksize; } pthread_attr_t;
+typedef struct { int type; int lock; int owner; int count; } pthread_mutex_t;
+typedef struct { int type; } pthread_mutexattr_t;
+typedef struct { int dummy; } pthread_condattr_t;
+typedef struct { int seq; } pthread_cond_t;
+typedef struct { int readers; int writer; int waiting_writers; } pthread_rwlock_t;
+typedef struct { unsigned count; unsigned waiting; unsigned phase; } pthread_barrier_t;
+typedef int pthread_spinlock_t;
+typedef int pthread_once_t;
+typedef unsigned pthread_key_t;
+typedef struct { unsigned value; } sem_t;
+#define PTHREAD_MUTEX_NORMAL 0
+#define PTHREAD_MUTEX_RECURSIVE 1
+#define PTHREAD_MUTEX_ERRORCHECK 2
+#define PTHREAD_MUTEX_DEFAULT 0
+#define PTHREAD_CREATE_JOINABLE 0
+#define PTHREAD_CREATE_DETACHED 1
+#define PTHREAD_CANCELED ((void*)-1)
+#define PTHREAD_CANCEL_ENABLE 0
+#define PTHREAD_CANCEL_DISABLE 1
+#define PTHREAD_CANCEL_DEFERRED 0
+#define PTHREAD_CANCEL_ASYNCHRONOUS 1
+#define PTHREAD_BARRIER_SERIAL_THREAD (-1)
+#define PTHREAD_MUTEX_INITIALIZER { 0, 0, 0, 0 }
+#define PTHREAD_RECURSIVE_MUTEX_INITIALIZER { 1, 0, 0, 0 }
+#define PTHREAD_ERRORCHECK_MUTEX_INITIALIZER { 2, 0, 0, 0 }
+#define PTHREAD_COND_INITIALIZER { 0 }
+#define PTHREAD_RWLOCK_INITIALIZER { 0, 0, 0 }
+#define PTHREAD_ONCE_INIT 0
+int pthread_create(pthread_t* t, const pthread_attr_t* attr, void* (*fn)(void*), void* arg);
+int pthread_join(pthread_t t, void** ret);
+int pthread_detach(pthread_t t);
+void pthread_exit(void* ret) __attribute__((noreturn));
+pthread_t pthread_self(void);
+int pthread_equal(pthread_t a, pthread_t b);
+int pthread_yield(void);
+int pthread_cancel(pthread_t t);
+int pthread_setcancelstate(int state, int* old);
+int pthread_setcanceltype(int type, int* old);
+void pthread_testcancel(void);
+int pthread_kill(pthread_t t, int sig);
+int pthread_sigmask(int how, const sigset_t* set, sigset_t* old);
+int pthread_once(pthread_once_t* once, void (*fn)(void));
+int pthread_attr_init(pthread_attr_t* a); int pthread_attr_destroy(pthread_attr_t* a);
+int pthread_attr_setdetachstate(pthread_attr_t* a, int s); int pthread_attr_getdetachstate(const pthread_attr_t* a, int* s);
+int pthread_attr_setstacksize(pthread_attr_t* a, unsigned long sz); int pthread_attr_getstacksize(const pthread_attr_t* a, unsigned long* sz);
+int pthread_mutexattr_init(pthread_mutexattr_t* a); int pthread_mutexattr_destroy(pthread_mutexattr_t* a);
+int pthread_mutexattr_settype(pthread_mutexattr_t* a, int t); int pthread_mutexattr_gettype(const pthread_mutexattr_t* a, int* t);
+int pthread_mutex_init(pthread_mutex_t* m, const pthread_mutexattr_t* a); int pthread_mutex_destroy(pthread_mutex_t* m);
+int pthread_mutex_lock(pthread_mutex_t* m); int pthread_mutex_trylock(pthread_mutex_t* m); int pthread_mutex_unlock(pthread_mutex_t* m);
+int pthread_mutex_timedlock(pthread_mutex_t* m, const struct timespec* abs);
+int pthread_condattr_init(pthread_condattr_t* a); int pthread_condattr_destroy(pthread_condattr_t* a);
+int pthread_cond_init(pthread_cond_t* c, const pthread_condattr_t* a); int pthread_cond_destroy(pthread_cond_t* c);
+int pthread_cond_wait(pthread_cond_t* c, pthread_mutex_t* m);
+int pthread_cond_timedwait(pthread_cond_t* c, pthread_mutex_t* m, const struct timespec* abs);
+int pthread_cond_signal(pthread_cond_t* c); int pthread_cond_broadcast(pthread_cond_t* c);
+int pthread_rwlock_init(pthread_rwlock_t* l, const void* a); int pthread_rwlock_destroy(pthread_rwlock_t* l);
+int pthread_rwlock_rdlock(pthread_rwlock_t* l); int pthread_rwlock_wrlock(pthread_rwlock_t* l);
+int pthread_rwlock_tryrdlock(pthread_rwlock_t* l); int pthread_rwlock_trywrlock(pthread_rwlock_t* l); int pthread_rwlock_unlock(pthread_rwlock_t* l);
+int pthread_barrier_init(pthread_barrier_t* b, const void* a, unsigned count); int pthread_barrier_destroy(pthread_barrier_t* b);
+int pthread_barrier_wait(pthread_barrier_t* b);
+int pthread_spin_init(pthread_spinlock_t* s, int shared); int pthread_spin_destroy(pthread_spinlock_t* s);
+int pthread_spin_lock(pthread_spinlock_t* s); int pthread_spin_trylock(pthread_spinlock_t* s); int pthread_spin_unlock(pthread_spinlock_t* s);
+int pthread_key_create(pthread_key_t* k, void (*destructor)(void*)); int pthread_key_delete(pthread_key_t k);
+void* pthread_getspecific(pthread_key_t k); int pthread_setspecific(pthread_key_t k, const void* v);
+int sem_init(sem_t* s, int pshared, unsigned value); int sem_destroy(sem_t* s);
+int sem_wait(sem_t* s); int sem_trywait(sem_t* s); int sem_post(sem_t* s); int sem_getvalue(sem_t* s, int* v);
+int sem_timedwait(sem_t* s, const struct timespec* abs);
+int pthread_setname_np(pthread_t t, const char* name);
+/* internal hooks between the thread scheduler and sleep/yield/fork */
+extern int __rio_threads_started;
+unsigned __rio_thread_sleep(unsigned ms);
+int __rio_thread_yield(void);
+void __rio_thread_after_fork(void);
 
 #ifdef __cplusplus
 }

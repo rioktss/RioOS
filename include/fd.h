@@ -36,5 +36,9 @@ int fd_clone_table(int src_pid, int dst_pid);
 int fd_redirect(int dst_pid, int dst_fd, int src_pid, int src_fd);
 int fd_close_in(int pid, int descriptor);
 int fd_is_pipe(int descriptor);
+int fd_file_info(int descriptor, char* path, int cap, int* cwd, uint32_t* flags);
+int fd_get_cloexec(int descriptor);
+int fd_set_cloexec(int descriptor, int value);
+void fd_close_on_exec(int pid);
 
 #endif

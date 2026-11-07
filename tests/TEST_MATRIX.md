@@ -90,3 +90,10 @@ Round 5: host tests `softfloat_host_test` (bit-exact vs hardware), `libm_host_te
 - session 12: gzip/gunzip/zcat and tar (tar + tgz) exchanged with host Python through a FAT32 image (both directions)
 - session 13: `pkg` (build/update/search/install with dependency/verify/owner/remove protection) and `cc` (`tests/cprog/*.c`: language features, argv, runtime faults, compile errors, `-c -S -o -x`, scanf, step limit)
 - libctest expects 54/54
+
+Round 6: host syscall test extended for syscalls 60-64; QEMU session added:
+- session 14: cross-mount symlinks (absolute/relative, directories, pwd), `stat/-L`, `find -type l`, `readlink -f`, `realpath`, `cp -P`, tar symlinks; `lntest` (15 userspace symlink checks); `proctest` (46 checks: fork/wait, execve with argv[0]/env, popen/system/posix_spawn, signal handlers/masks/alarm/pause/kill/SIGCHLD, exec handler reset, FD_CLOEXEC, shared anonymous and file mmap incl. cross-process visibility and write-back)
+
+Round 7: QEMU session added:
+- session 15: `thrtest` (31 pthread checks: create/join, mutex, cond, rwlock, barrier, semaphores, keys, cancel, pthread_kill, deadlock), `sigtest` (36 checks: siginfo, SA_RESTART, sigaltstack, SEGV handler, sigqueue, sigwait, itimer, nanosleep, setjmp), shell fixes (`$?`, `| read`, `usb selftest`)
+- every one of the 152 shell commands was run in QEMU by hand (see regression sessions 1-15 for the automated part)

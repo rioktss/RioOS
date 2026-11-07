@@ -25,6 +25,18 @@ struct Process
     int background;
     int stopped;
     uint32_t sig_pending;
+    uint32_t sig_mask;
+    uint64_t sig_handler[32];
+    uint32_t sig_amask[32];
+    uint32_t sig_flags[32];
+    uint64_t sig_restorer;
+    uint64_t alarm_at;
+    uint64_t alarm_interval;
+    int sig_sender[32];
+    int sig_code[32];
+    uint64_t sig_value[32];
+    uint64_t alt_sp;
+    uint64_t alt_size;
     uint32_t uid;
     uint32_t gid;
     uint64_t start_ms;
@@ -66,6 +78,13 @@ static void reset_mt_fields(Process* p)
     p->background = 0;
     p->stopped = 0;
     p->sig_pending = 0;
+    p->sig_mask = 0;
+    for (int i = 0; i < 32; ++i) { p->sig_handler[i] = 0; p->sig_amask[i] = 0; p->sig_flags[i] = 0; }
+    p->sig_restorer = 0;
+    p->alarm_at = 0;
+    p->alarm_interval = 0;
+    for (int i = 0; i < 32; ++i) { p->sig_sender[i] = 0; p->sig_code[i] = 0; p->sig_value[i] = 0; }
+    p->alt_sp = 0; p->alt_size = 0;
     p->uid = 0;
     p->gid = 0;
     p->start_ms = 0;
@@ -473,27 +492,178 @@ int process_set_stopped(int pid, int v)
     process_irq_restore(f); return slot >= 0 ? 0 : -1;
 }
 int process_is_stopped(int pid) { PROC_GET(processes[slot].stopped, 0) }
-int process_sig_raise(int pid, int sig)
+int process_sig_raise_info(int pid, int sig, int sender, int code, uint64_t value)
 {
     if (sig <= 0 || sig >= 32) return -22;
     uint64_t f = process_irq_save(); int slot = find_slot_locked(pid);
-    if (slot >= 0 && processes[slot].state != PROCESS_ZOMBIE) processes[slot].sig_pending |= (1U << sig);
+    if (slot >= 0 && processes[slot].state != PROCESS_ZOMBIE
+        && !(processes[slot].sig_handler[sig] == 1 && sig != 9 && sig != 19))   /* ignored signals are discarded */
+    {
+        processes[slot].sig_pending |= (1U << sig);
+        processes[slot].sig_sender[sig] = sender; processes[slot].sig_code[sig] = code; processes[slot].sig_value[sig] = value;
+    }
     process_irq_restore(f);
     return slot >= 0 ? 0 : -3;
 }
-/* Returns the lowest pending signal and clears it, or 0 when none. */
+int process_sig_raise(int pid, int sig) { return process_sig_raise_info(pid, sig, 0, 0, 0); }
+int process_sig_info_get(int pid, int sig, int* sender, int* code, uint64_t* value)
+{
+    if (sig <= 0 || sig >= 32) return -22;
+    uint64_t f = process_irq_save(); int slot = find_slot_locked(pid);
+    if (slot >= 0) { if (sender) *sender = processes[slot].sig_sender[sig]; if (code) *code = processes[slot].sig_code[sig]; if (value) *value = processes[slot].sig_value[sig]; }
+    process_irq_restore(f); return slot >= 0 ? 0 : -3;
+}
+int process_sig_take_set(int pid, uint32_t set)
+{
+    uint64_t f = process_irq_save(); int slot = find_slot_locked(pid);
+    int sig = 0;
+    if (slot >= 0)
+    {
+        uint32_t ready = processes[slot].sig_pending & set;
+        for (int i = 1; ready && i < 32; ++i)
+            if (ready & (1U << i)) { sig = i; processes[slot].sig_pending &= ~(1U << i); break; }
+    }
+    process_irq_restore(f); return sig;
+}
+int process_altstack_set(int pid, uint64_t sp, uint64_t size)
+{
+    uint64_t f = process_irq_save(); int slot = find_slot_locked(pid);
+    if (slot >= 0) { processes[slot].alt_sp = sp; processes[slot].alt_size = size; }
+    process_irq_restore(f); return slot >= 0 ? 0 : -3;
+}
+int process_altstack_get(int pid, uint64_t* sp, uint64_t* size)
+{
+    uint64_t f = process_irq_save(); int slot = find_slot_locked(pid);
+    if (slot >= 0) { *sp = processes[slot].alt_sp; *size = processes[slot].alt_size; }
+    process_irq_restore(f); return slot >= 0 ? 0 : -3;
+}
+uint64_t process_itimer_get(int pid, uint64_t now, uint64_t* interval_ms)
+{
+    uint64_t f = process_irq_save(); int slot = find_slot_locked(pid);
+    uint64_t rem = 0;
+    if (slot >= 0) { if (processes[slot].alarm_at > now) rem = processes[slot].alarm_at - now; if (interval_ms) *interval_ms = processes[slot].alarm_interval; }
+    process_irq_restore(f); return rem;
+}
+uint64_t process_itimer_set(int pid, uint64_t value_ms, uint64_t interval_ms, uint64_t now)
+{
+    uint64_t f = process_irq_save(); int slot = find_slot_locked(pid);
+    uint64_t rem = 0;
+    if (slot >= 0)
+    {
+        if (processes[slot].alarm_at > now) rem = processes[slot].alarm_at - now;
+        processes[slot].alarm_at = value_ms ? now + value_ms : 0;
+        processes[slot].alarm_interval = interval_ms;
+    }
+    process_irq_restore(f); return rem;
+}
+#define SIG_UNBLOCKABLE ((1U << 9) | (1U << 19))
+/* Returns the lowest pending, unblocked signal and clears it, or 0 when none. */
 int process_sig_take(int pid)
 {
     uint64_t f = process_irq_save(); int slot = find_slot_locked(pid);
     int sig = 0;
-    if (slot >= 0 && processes[slot].sig_pending)
+    if (slot >= 0)
     {
-        for (int i = 1; i < 32; ++i)
-            if (processes[slot].sig_pending & (1U << i)) { sig = i; processes[slot].sig_pending &= ~(1U << i); break; }
+        uint32_t ready = processes[slot].sig_pending & (~processes[slot].sig_mask | SIG_UNBLOCKABLE);
+        for (int i = 1; ready && i < 32; ++i)
+            if (ready & (1U << i)) { sig = i; processes[slot].sig_pending &= ~(1U << i); break; }
     }
     process_irq_restore(f); return sig;
 }
-uint32_t process_sig_pending(int pid) { PROC_GET(processes[slot].sig_pending, 0U) }
+uint32_t process_sig_pending(int pid)
+{
+    uint64_t f = process_irq_save(); int slot = find_slot_locked(pid);
+    uint32_t v = slot >= 0 ? (processes[slot].sig_pending & (~processes[slot].sig_mask | SIG_UNBLOCKABLE)) : 0U;
+    process_irq_restore(f); return v;
+}
+uint32_t process_sig_pending_raw(int pid) { PROC_GET(processes[slot].sig_pending, 0U) }
+int process_sig_set_action(int pid, int sig, uint64_t handler, uint32_t amask, uint32_t flags, uint64_t restorer, uint64_t* old)
+{
+    if (sig <= 0 || sig >= 32 || sig == 9 || sig == 19) return -22;
+    uint64_t f = process_irq_save(); int slot = find_slot_locked(pid);
+    if (slot >= 0)
+    {
+        if (old) *old = processes[slot].sig_handler[sig];
+        processes[slot].sig_handler[sig] = handler;
+        processes[slot].sig_amask[sig] = amask & ~SIG_UNBLOCKABLE;
+        processes[slot].sig_flags[sig] = flags;
+        if (restorer) processes[slot].sig_restorer = restorer;
+        if (handler == 1) processes[slot].sig_pending &= ~(1U << sig);   /* ignoring discards pending */
+    }
+    process_irq_restore(f); return slot >= 0 ? 0 : -3;
+}
+uint64_t process_sig_handler(int pid, int sig, uint32_t* amask, uint32_t* flags)
+{
+    uint64_t f = process_irq_save(); int slot = find_slot_locked(pid);
+    uint64_t h = 0;
+    if (slot >= 0 && sig > 0 && sig < 32)
+    {
+        h = processes[slot].sig_handler[sig];
+        if (amask) *amask = processes[slot].sig_amask[sig];
+        if (flags) *flags = processes[slot].sig_flags[sig];
+    }
+    process_irq_restore(f); return h;
+}
+uint64_t process_sig_restorer(int pid) { PROC_GET(processes[slot].sig_restorer, 0ULL) }
+uint32_t process_sig_mask(int pid) { PROC_GET(processes[slot].sig_mask, 0U) }
+int process_sig_set_mask(int pid, uint32_t mask)
+{
+    uint64_t f = process_irq_save(); int slot = find_slot_locked(pid);
+    if (slot >= 0) processes[slot].sig_mask = mask & ~SIG_UNBLOCKABLE;
+    process_irq_restore(f); return slot >= 0 ? 0 : -3;
+}
+int process_sig_inherit(int parent, int child)
+{
+    uint64_t f = process_irq_save(); int ps = find_slot_locked(parent); int cs = find_slot_locked(child);
+    if (ps >= 0 && cs >= 0)
+    {
+        processes[cs].sig_mask = processes[ps].sig_mask;
+        for (int i = 0; i < 32; ++i) { processes[cs].sig_handler[i] = processes[ps].sig_handler[i]; processes[cs].sig_amask[i] = processes[ps].sig_amask[i]; processes[cs].sig_flags[i] = processes[ps].sig_flags[i]; }
+        processes[cs].sig_restorer = processes[ps].sig_restorer;
+        processes[cs].alarm_at = 0; processes[cs].alarm_interval = 0;   /* alarms are not inherited */
+        processes[cs].alt_sp = processes[ps].alt_sp; processes[cs].alt_size = processes[ps].alt_size;
+        processes[cs].sig_pending = 0;
+    }
+    process_irq_restore(f); return (ps >= 0 && cs >= 0) ? 0 : -1;
+}
+int process_sig_reset_on_exec(int pid)
+{
+    uint64_t f = process_irq_save(); int slot = find_slot_locked(pid);
+    if (slot >= 0)
+        for (int i = 0; i < 32; ++i)
+            if (processes[slot].sig_handler[i] > 1) { processes[slot].sig_handler[i] = 0; processes[slot].sig_flags[i] = 0; processes[slot].sig_amask[i] = 0; }
+    if (slot >= 0) { processes[slot].alt_sp = 0; processes[slot].alt_size = 0; }
+    process_irq_restore(f); return slot >= 0 ? 0 : -1;
+}
+int process_sig_clear_all(int pid)
+{
+    uint64_t f = process_irq_save(); int slot = find_slot_locked(pid);
+    if (slot >= 0) processes[slot].sig_pending = 0;
+    process_irq_restore(f); return slot >= 0 ? 0 : -1;
+}
+uint64_t process_alarm_set(int pid, uint64_t ms, uint64_t now)
+{
+    uint64_t f = process_irq_save(); int slot = find_slot_locked(pid);
+    uint64_t rem = 0;
+    if (slot >= 0)
+    {
+        if (processes[slot].alarm_at > now) rem = processes[slot].alarm_at - now;
+        processes[slot].alarm_at = ms ? now + ms : 0;
+        processes[slot].alarm_interval = 0;
+    }
+    process_irq_restore(f); return rem;
+}
+void process_alarm_check(int pid, uint64_t now)
+{
+    uint64_t f = process_irq_save(); int slot = find_slot_locked(pid);
+    if (slot >= 0 && processes[slot].alarm_at && now >= processes[slot].alarm_at)
+    {
+        processes[slot].alarm_at = processes[slot].alarm_interval ? now + processes[slot].alarm_interval : 0;
+        processes[slot].sig_pending |= (1U << 14);
+        processes[slot].sig_sender[14] = 0; processes[slot].sig_code[14] = 0x80; processes[slot].sig_value[14] = 0;   /* SI_TIMER-ish */
+    }
+    process_irq_restore(f);
+}
 int process_set_creds(int pid, uint32_t uid, uint32_t gid)
 {
     uint64_t f = process_irq_save(); int slot = find_slot_locked(pid);

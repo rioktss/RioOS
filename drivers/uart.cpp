@@ -120,6 +120,8 @@ static void probe_feed(char c)
     probe_line_start = (c == '\n');
 }
 
+int uart_at_line_start(void) { return probe_line_start; }
+
 void uart_putc(char c)
 {
     probe_feed(c);

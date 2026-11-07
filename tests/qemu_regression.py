@@ -85,7 +85,7 @@ log = run(C("ktest", "dltest", "id", "echo hello > /home/user/a.txt", "ln -s a.t
 check("core", log, "ktest: 28/28 passed", "dltest ALL PASS", "uid=1000(user)")
 check("fs", log, "[LINK] l1 -> a.txt", "hello", "a.txt", "remounted read-only", "remounted read-write", "journal        : on")
 check("script", log, "n=3", "it1", "it2")
-check("shell", log, "fb-ok", "st=127", "/bin/hello.elf", "\n19\r")
+check("shell", log, "fb-ok", "st=127", "/bin/hello.elf", "\n23\r")
 check("security", log, "Switched to root", "bob  uid=1001", "$rio$3000$", "User created")
 print("== session 1b: reboot recovers the journal")
 log = run(C("cat /jt.txt", "mount"))
@@ -273,6 +273,44 @@ check("cc", log, "fib(20)=6765 gcd=12 fact(15)=1307674368000", "x=4 y=3 g=7", "s
       "b=44 sizeof(int)=4 sizeof(arr)=20 sizeof(long)=8", "i=10", "-10", "3 -3 -1", "args=3", "[one] [two]", "4000000000 -294967296", "rc=3",
       "invalid memory access at address 0", "stack overflow", "division by zero", "floating point is not supported", "unexpected ';' in expression", "ok (", "wrote /home/user/t1.rbc", "args=2", "[zz]",
       "not found" if False else "cannot read", "main:", "sum 1..10 = 55", "hi bob", "step limit exceeded")
+
+print("== session 14: symlinks (all filesystems, userspace API, tools) + POSIX process layer (exec/env/signals/shared mmap)")
+shutil.copy(os.path.join(ROOT, "storage", "disk.img"), os.path.join(TMP, "disk.img"))
+cmds = ["su", "123", "mkdir /mnt", "mkdir /mnt/c", "mount -t tmpfs none /mnt/c", "echo tm > /mnt/c/tf", "mkdir /mnt/c/dd", "echo inner > /mnt/c/dd/g",
+        "ln -s /mnt/c/tf /home/user/xm", "cat /home/user/xm", "echo rootdata > /home/user/rootfile", "ln -s /home/user/rootfile /mnt/c/back", "cat /mnt/c/back",
+        "ln -s /mnt/c/dd /home/user/ddl", "cat /home/user/ddl/g", "ln -s ../../home/user/rootfile /mnt/c/relback", "cat /mnt/c/relback", "cd /home/user/ddl", "pwd", "cd /",
+        "mkdir /t", "echo data > /t/f", "ln -s /t/f /t/l", "ln -s ../t /t/d", "stat /t/l", "stat -L /t/l", "find /t -type l", "readlink -f /t/d/d/f", "realpath /t/d/f",
+        "mkdir /t/src", "echo a > /t/src/a", "ln -s a /t/src/lk", "cp -r -P /t/src /t/dst", "readlink /t/dst/lk", "cp -P /t/l /t/l2", "readlink /t/l2",
+        "tar -cf /t/x.tar /t/src", "tar -tvf /t/x.tar", "mkdir /t/out", "tar -xf /t/x.tar -C /t/out", "readlink /t/out/t/src/lk", "rm /t/f", "cat /t/l", "realpath /t/l", "man realpath",
+        "lntest"]
+log = run(C(*cmds), wait=2)
+check("symlinks-shell", log, "tm", "rootdata", "inner", "/mnt/c/dd", "File: /t/l -> /t/f", "Type: symbolic link", "Type: regular file", "/t/l\r\r\n/t/d", "\n/t/f\r", "Copied symbolic link.",
+      "t/src/lk -> a", "cat: file not found", "realpath: path not found", "canonical absolute path")
+check("symlinks-userspace", log, "PASS symlink", "PASS readlink", "PASS lstat-type", "PASS stat-follows", "PASS open-through-link", "PASS relative-symlink", "PASS realpath-dir", "PASS link-hard",
+      "PASS loop-detected", "PASS dangling-lstat-ok", "PASS dangling-stat-fails", "PASS unlink-link-only", "PASS readlink-nonlink", "lntest done fails=0")
+log = run(C("su", "123", "proctest"), wait=75)
+names = ["fork-wait-exit", "wait-no-child", "execve-status", "popen-open", "popen-output", "popen-status", "env-inherited", "exec-missing", "system-exit", "system-and", "system-or",
+         "system-notfound", "system-redirect", "posix_spawn", "sigaction", "handler-runs", "blocked-not-delivered", "sigpending", "unblock-delivers", "signal-blocked-in-handler",
+         "mask-restored-after-handler", "ignored", "signal()-returns-old", "alarm-pause", "alarm-cancel-returns-left", "child-handler-via-kill", "sigchld-handler", "default-terminate",
+         "kill-esrch", "exec-resets-handlers", "exec-keeps-ignored", "getfd", "setfd", "dupfd", "cloexec-closed-on-exec", "mmap-shared-anon", "shared-anon-visible-to-parent",
+         "private-anon-isolated", "mmap-file-shared", "msync", "msync-written-to-file", "shared-file-live-across-processes", "exit-writeback-persisted", "shared-write-needs-rdwr",
+         "shared-ro-ok", "map-fixed-rejected"]
+check("posix-process", log, *(["PASS " + n for n in names] + ["proctest done fails=0"]))
+
+print("== session 15: pthread + full userspace signals + shell fixes")
+shutil.copy(os.path.join(ROOT, "storage", "disk.img"), os.path.join(TMP, "disk.img"))
+log = run(C("su", "123", "thrtest"), wait=60)
+check("pthread", log, "thrtest done fails=0")
+total += 0
+if "FAIL " in log.replace("FAIL cmd", ""):
+    fails += 1; total += 1; print("  FAIL  pthread: a FAIL line was printed")
+log = run(C("su", "123", "sigtest"), wait=60)
+check("signals", log, "sigtest done fails=0")
+if "FAIL " in log:
+    fails += 1; total += 1; print("  FAIL  signals: a FAIL line was printed")
+log = run(C("su", "123", "echo 'f(){ return 3; }' > /tmp/s1.sh", "echo 'f a; echo rc=$?' >> /tmp/s1.sh", "echo 'false; echo rc2=$?' >> /tmp/s1.sh", "source /tmp/s1.sh",
+            "echo hello | read W", "echo W=$W", "usb selftest"), wait=2)
+check("shell-fixes", log, "rc=3", "rc2=1", "W=hello", "usb: no xHCI controller")
 
 shutil.rmtree(TMP, ignore_errors=True)
 print("\n%d checks, %d failed" % (total, fails))

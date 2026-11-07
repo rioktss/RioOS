@@ -63,9 +63,15 @@ int fs_get_type(int id) { return id == 1 ? FS_FILE : -1; }
 int fs_mkdir(const char*, int) { return -1; }
 int fs_rm(const char*, int) { return -1; }
 int fs_rename(const char*, const char*, int) { return -1; }
+int fs_symlink(const char*, const char*, int) { return -1; }
+int fs_readlink(const char*, int, char*, int) { return -1; }
+int fs_link_hard(const char*, const char*, int) { return -1; }
+int fs_lstat_path(const char*, int, FsStat*) { return -1; }
 int fs_get_child_count(int) { return 0; }
 int fs_get_child(int, int) { return -1; }
 const char* fs_get_name(int) { return ""; }
+int fs_get_parent(int) { return -1; }
+void vfs_path_of(int, char* out, int) { out[0] = '/'; out[1] = 0; }
 uint64_t rtc_get_epoch() { return 0; }
 uint64_t fs_file_size(int id) { return id == 1 ? fake_size : 0; }
 static uint32_t fake_uid = 0, fake_gid = 0, fake_mode = 0644U;

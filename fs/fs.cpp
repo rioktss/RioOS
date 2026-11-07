@@ -1807,6 +1807,16 @@ int fs_set_owner_path(const char* path, int cwd, uint32_t uid, uint32_t gid)
     return id < 0 ? id : fs_set_owner(id, uid, gid);
 }
 
+int fs_lstat_path_impl(const char* path, int cwd, FsStat* out)
+{
+    if (!out) return -14;
+    int id = fs_resolve_nofollow(path, cwd);
+    if (id < 0) return id;
+    out->inode = (uint32_t)id; out->type = (uint32_t)nodes[id].type; out->mode = nodes[id].mode; out->uid = nodes[id].uid; out->gid = nodes[id].gid;
+    out->sector_count = nodes[id].sector_count; out->size = nodes[id].size; out->mtime = nodes[id].mtime;
+    return 0;
+}
+
 int fs_stat_path(const char* path, int cwd, FsStat* out)
 {
     if (!out) return -14;
@@ -2066,17 +2076,20 @@ static void act(int c) { cur = &ctxs[c]; }
 
 struct Route { int ctx; int cwd; const char* rest; char buf[200]; };
 
-static void route(const char* path, int cwd_gid, Route* r, int cross_last)
+/* One routing pass. Returns 1 when a symbolic link had to be expanded: the rewritten path is left in nb and
+   the directory it must be resolved from in *ncwd (absolute targets restart at the global root, so links may
+   cross mount points in both directions). Returns -1 when the rewritten path would be too long. */
+static int route_step(const char* path, int cwd_gid, Route* r, int cross_last, int follow, char* nb, int nbcap, int* ncwd)
 {
     int c = 0, loc = cwd_gid;
     if (cwd_gid >= 0) { if (gid_ok(cwd_gid)) { c = cwd_gid >> 12; loc = cwd_gid & 0xFFF; } else { c = 0; loc = -1; } }
     r->rest = path;
-    if (!path) { act(c); r->ctx = c; r->cwd = loc; return; }
+    if (!path) { act(c); r->ctx = c; r->cwd = loc; return 0; }
     if (path[0] == '/') { c = 0; loc = 0; }
     act(c);
     r->ctx = c; r->cwd = loc;
-    if (loc < 0) return;
-    if (str_len(path) >= (int)sizeof(r->buf)) return;                 /* too long: leave it to the implementation */
+    if (loc < 0) return 0;
+    if (str_len(path) >= (int)sizeof(r->buf)) return 0;                 /* too long: leave it to the implementation */
     char* b = r->buf;
     str_copy(b, path, sizeof(r->buf));
     int n = str_len(b);
@@ -2118,6 +2131,24 @@ static void route(const char* path, int cwd_gid, Route* r, int cross_last)
             {
                 int ch = find_child(loc, comp);
                 if (ch < 0) stop = 1;
+                else if (cur->nodes[ch].type == FS_SYMLINK && (more || follow))
+                {
+                    char tgt[260];
+                    int tl = fs_link_target_of_impl(ch, tgt, (int)sizeof(tgt));
+                    if (tl <= 0) stop = 1;
+                    else
+                    {
+                        const char* tail = b + k;
+                        int need = tl + (*tail ? 1 + str_len(tail) : 0);
+                        if (need >= nbcap || need >= (int)sizeof(r->buf)) return -1;
+                        int p2 = 0;
+                        for (int t = 0; t < tl; ++t) nb[p2++] = tgt[t];
+                        if (*tail) { nb[p2++] = '/'; for (const char* q = tail; *q; ++q) nb[p2++] = *q; }
+                        nb[p2] = 0;
+                        *ncwd = enc(c, loc);
+                        return 1;
+                    }
+                }
                 else if (cur->nodes[ch].mount_ctx > 0 && (more || cross_last)) { c = cur->nodes[ch].mount_ctx; act(c); loc = 0; }
                 else if (!more) stop = 1;
                 else if (cur->nodes[ch].type != FS_DIR) stop = 1;
@@ -2128,6 +2159,19 @@ static void route(const char* path, int cwd_gid, Route* r, int cross_last)
         if (stop) { r->rest = b + st; break; }
     }
     r->ctx = c; r->cwd = loc;
+    return 0;
+}
+
+static void route(const char* path, int cwd_gid, Route* r, int cross_last, int follow = 0)
+{
+    char nb[256]; int ncwd = -1; const char* p = path; int cw = cwd_gid;
+    for (int n = 0;; ++n)
+    {
+        int rc = route_step(p, cw, r, cross_last, follow, nb, (int)sizeof(nb), &ncwd);
+        if (rc == 0) return;
+        if (rc < 0 || n >= 40) { act(0); r->ctx = 0; r->cwd = -1; r->rest = "?"; return; }   /* ELOOP / name too long */
+        p = nb; cw = ncwd;
+    }
 }
 
 /* path of directory `loc` inside mount c, from that mount's root (no leading mount prefix) */
@@ -2150,7 +2194,7 @@ int fs_check_access_as(int id, uint32_t uid, uint32_t gid, uint32_t requested)
 { if (!gid_ok(id)) return -2; act(id >> 12); return fs_check_access_as_impl(id & 0xFFF, uid, gid, requested); }
 int fs_check_access(int id, uint32_t requested) { return fs_check_access_as(id, current_uid, current_gid, requested); }
 int fs_get_root() { return 0; }
-int fs_resolve(const char* path, int cwd) { Route r; route(path, cwd, &r, 1); int v = fs_resolve_impl(r.rest, r.cwd); return enc(r.ctx, v); }
+int fs_resolve(const char* path, int cwd) { Route r; route(path, cwd, &r, 1, 1); int v = fs_resolve_impl(r.rest, r.cwd); return enc(r.ctx, v); }
 int fs_resolve_nofollow(const char* path, int cwd) { Route r; route(path, cwd, &r, 1); int v = fs_resolve_nofollow_impl(r.rest, r.cwd); return enc(r.ctx, v); }
 int fs_symlink(const char* target, const char* linkpath, int cwd) { Route r; route(linkpath, cwd, &r, 0); int v = fs_symlink_impl(target, r.rest, r.cwd); return enc(r.ctx, v); }
 int fs_readlink(const char* path, int cwd, char* out, int cap) { Route r; route(path, cwd, &r, 1); return fs_readlink_impl(r.rest, r.cwd, out, cap); }
@@ -2169,12 +2213,12 @@ int fs_journal_crash_test(const char* path, int cwd) { Route r; route(path, cwd,
 int fs_mkdir(const char* path, int cwd) { Route r; route(path, cwd, &r, 0); int v = fs_mkdir_impl(r.rest, r.cwd); return enc(r.ctx, v); }
 int fs_touch(const char* path, int cwd) { Route r; route(path, cwd, &r, 0); int v = fs_touch_impl(r.rest, r.cwd); return enc(r.ctx, v); }
 int fs_mkdir_p(const char* path, int cwd) { Route r; route(path, cwd, &r, 0); int v = fs_mkdir_p_impl(r.rest, r.cwd); return enc(r.ctx, v); }
-int fs_write_data(const char* path, int cwd, const uint8_t* data, uint64_t size) { Route r; route(path, cwd, &r, 0); return fs_write_data_impl(r.rest, r.cwd, data, size); }
-int fs_write(const char* path, int cwd, const char* content) { Route r; route(path, cwd, &r, 0); return fs_write_impl(r.rest, r.cwd, content); }
-int fs_read_file(const char* path, int cwd, uint8_t* buffer, uint64_t capacity, uint64_t* out_size) { Route r; route(path, cwd, &r, 1); return fs_read_file_impl(r.rest, r.cwd, buffer, capacity, out_size); }
-int fs_read_file_for_update(const char* path, int cwd, uint8_t* buffer, uint64_t capacity, uint64_t* out_size) { Route r; route(path, cwd, &r, 1); return fs_read_file_for_update_impl(r.rest, r.cwd, buffer, capacity, out_size); }
-int fs_cat(const char* path, int cwd) { Route r; route(path, cwd, &r, 1); return fs_cat_impl(r.rest, r.cwd); }
-int fs_cat_numbered(const char* path, int cwd) { Route r; route(path, cwd, &r, 1); return fs_cat_numbered_impl(r.rest, r.cwd); }
+int fs_write_data(const char* path, int cwd, const uint8_t* data, uint64_t size) { Route r; route(path, cwd, &r, 0, 1); return fs_write_data_impl(r.rest, r.cwd, data, size); }
+int fs_write(const char* path, int cwd, const char* content) { Route r; route(path, cwd, &r, 0, 1); return fs_write_impl(r.rest, r.cwd, content); }
+int fs_read_file(const char* path, int cwd, uint8_t* buffer, uint64_t capacity, uint64_t* out_size) { Route r; route(path, cwd, &r, 1, 1); return fs_read_file_impl(r.rest, r.cwd, buffer, capacity, out_size); }
+int fs_read_file_for_update(const char* path, int cwd, uint8_t* buffer, uint64_t capacity, uint64_t* out_size) { Route r; route(path, cwd, &r, 1, 1); return fs_read_file_for_update_impl(r.rest, r.cwd, buffer, capacity, out_size); }
+int fs_cat(const char* path, int cwd) { Route r; route(path, cwd, &r, 1, 1); return fs_cat_impl(r.rest, r.cwd); }
+int fs_cat_numbered(const char* path, int cwd) { Route r; route(path, cwd, &r, 1, 1); return fs_cat_numbered_impl(r.rest, r.cwd); }
 int fs_rm(const char* path, int cwd) { Route r; route(path, cwd, &r, 1); return fs_rm_impl(r.rest, r.cwd); }
 int fs_rm_recursive(const char* path, int cwd) { Route r; route(path, cwd, &r, 1); return fs_rm_recursive_impl(r.rest, r.cwd); }
 int fs_rename(const char* from, const char* to, int cwd)
@@ -2211,7 +2255,8 @@ int fs_get_parent(int id)
 {
     if (!gid_ok(id)) return -1;
     int c = id >> 12;
-    if ((id & 0xFFF) == 0 && c > 0) return enc(ctxs[c].mp_ctx, ctxs[c].mp_local);
+    /* a mount root is named after its mount point (see fs_get_name), so its parent is the parent of that mount point */
+    if ((id & 0xFFF) == 0 && c > 0) { act(ctxs[c].mp_ctx); int pp = fs_get_parent_impl(ctxs[c].mp_local); act(c); return enc(ctxs[c].mp_ctx, pp); }
     act(c); return enc(c, fs_get_parent_impl(id & 0xFFF));
 }
 int fs_get_child_count(int id) { if (!gid_ok(id)) return 0; act(id >> 12); return fs_get_child_count_impl(id & 0xFFF); }
@@ -2222,12 +2267,13 @@ uint32_t fs_get_uid(int id) { if (!gid_ok(id)) return 0; act(id >> 12); return f
 uint32_t fs_get_gid(int id) { if (!gid_ok(id)) return 0; act(id >> 12); return fs_get_gid_impl(id & 0xFFF); }
 int fs_set_mode(int id, uint32_t mode) { if (!gid_ok(id)) return -1; act(id >> 12); return fs_set_mode_impl(id & 0xFFF, mode); }
 int fs_set_owner(int id, uint32_t uid, uint32_t gid) { if (!gid_ok(id)) return -1; act(id >> 12); return fs_set_owner_impl(id & 0xFFF, uid, gid); }
-int fs_set_owner_path(const char* path, int cwd, uint32_t uid, uint32_t gid) { Route r; route(path, cwd, &r, 1); return fs_set_owner_path_impl(r.rest, r.cwd, uid, gid); }
-int fs_stat_path(const char* path, int cwd, FsStat* out) { Route r; route(path, cwd, &r, 1); return fs_stat_path_impl(r.rest, r.cwd, out); }
-int fs_truncate(const char* path, int cwd, uint64_t size) { Route r; route(path, cwd, &r, 0); return fs_truncate_impl(r.rest, r.cwd, size); }
+int fs_set_owner_path(const char* path, int cwd, uint32_t uid, uint32_t gid) { Route r; route(path, cwd, &r, 1, 1); return fs_set_owner_path_impl(r.rest, r.cwd, uid, gid); }
+int fs_stat_path(const char* path, int cwd, FsStat* out) { Route r; route(path, cwd, &r, 1, 1); return fs_stat_path_impl(r.rest, r.cwd, out); }
+int fs_lstat_path(const char* path, int cwd, FsStat* out) { Route r; route(path, cwd, &r, 1); return fs_lstat_path_impl(r.rest, r.cwd, out); }
+int fs_truncate(const char* path, int cwd, uint64_t size) { Route r; route(path, cwd, &r, 0, 1); return fs_truncate_impl(r.rest, r.cwd, size); }
 uint64_t fs_total_sectors() { act(0); return fs_total_sectors_impl(); }
 uint64_t fs_used_sectors() { act(0); return fs_used_sectors_impl(); }
-int fs_set_mode_path(const char* path, int cwd, uint32_t mode) { Route r; route(path, cwd, &r, 1); return fs_set_mode_path_impl(r.rest, r.cwd, mode); }
+int fs_set_mode_path(const char* path, int cwd, uint32_t mode) { Route r; route(path, cwd, &r, 1, 1); return fs_set_mode_path_impl(r.rest, r.cwd, mode); }
 int fs_persistent() { return ctxs[0].mounted; }
 void fs_init() { fs_init_impl(); act(0); }
 

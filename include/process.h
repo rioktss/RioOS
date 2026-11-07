@@ -3,7 +3,7 @@
 
 #include "types.h"
 
-#define PROCESS_ARGS_SIZE 128
+#define PROCESS_ARGS_SIZE 1024   /* argument line, optionally followed by \x01 and NAME=value environment entries */
 
 enum ProcessState
 {
@@ -52,7 +52,7 @@ int process_pid_at(int slot);
 
 /* ---- multitasking metadata (fork/exec/wait, signals, job control) ---- */
 enum Signal { SIG_HUP = 1, SIG_INT = 2, SIG_QUIT = 3, SIG_KILL = 9, SIG_USR1 = 10, SIG_SEGV = 11,
-              SIG_USR2 = 12, SIG_PIPE = 13, SIG_TERM = 15, SIG_CHLD = 17, SIG_CONT = 18,
+              SIG_USR2 = 12, SIG_PIPE = 13, SIG_ALRM = 14, SIG_ILL = 4, SIG_BUS = 7, SIG_FPE = 8, SIG_TERM = 15, SIG_CHLD = 17, SIG_CONT = 18,
               SIG_STOP = 19, SIG_TSTP = 20 };
 
 int process_set_parent(int pid, int ppid);
@@ -70,8 +70,28 @@ int process_is_background(int pid);
 int process_set_stopped(int pid, int v);
 int process_is_stopped(int pid);
 int process_sig_raise(int pid, int sig);
-int process_sig_take(int pid);
-uint32_t process_sig_pending(int pid);
+int process_sig_raise_info(int pid, int sig, int sender, int code, uint64_t value);   /* siginfo: sender pid, si_code, si_value */
+int process_sig_info_get(int pid, int sig, int* sender, int* code, uint64_t* value);
+int process_sig_take_set(int pid, uint32_t set);   /* sigwait: lowest pending signal in `set`, blocked or not */
+int process_altstack_set(int pid, uint64_t sp, uint64_t size);
+int process_altstack_get(int pid, uint64_t* sp, uint64_t* size);
+uint64_t process_itimer_get(int pid, uint64_t now, uint64_t* interval_ms);
+uint64_t process_itimer_set(int pid, uint64_t value_ms, uint64_t interval_ms, uint64_t now);   /* returns previous remaining ms */
+int process_sig_take(int pid);               /* lowest pending, unblocked signal (KILL/STOP are never blocked) */
+uint32_t process_sig_pending(int pid);       /* pending and deliverable (not blocked) */
+uint32_t process_sig_pending_raw(int pid);   /* pending, including blocked */
+/* user signal handlers: handler 0 = default, 1 = ignore, else a user address */
+int process_sig_set_action(int pid, int sig, uint64_t handler, uint32_t amask, uint32_t flags, uint64_t restorer, uint64_t* old);
+uint64_t process_sig_handler(int pid, int sig, uint32_t* amask, uint32_t* flags);
+uint64_t process_sig_restorer(int pid);
+uint32_t process_sig_mask(int pid);
+int process_sig_set_mask(int pid, uint32_t mask);
+int process_sig_inherit(int parent, int child);   /* fork: handlers, mask */
+int process_sig_reset_on_exec(int pid);           /* exec: caught handlers -> default (ignored stay ignored) */
+int process_sig_clear_all(int pid);
+/* alarm(): returns the previous remaining milliseconds; ms == 0 cancels */
+uint64_t process_alarm_set(int pid, uint64_t ms, uint64_t now);
+void process_alarm_check(int pid, uint64_t now);
 int process_set_creds(int pid, uint32_t uid, uint32_t gid);
 uint32_t process_uid(int pid);
 uint32_t process_gid(int pid);

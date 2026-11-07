@@ -67,6 +67,23 @@ FILE* fopen(const char* path, const char* mode)
     return f;
 }
 
+FILE* fdopen(int fd, const char* mode)
+{
+    stdio_init();
+    if (fd < 0) { errno = EBADF; return 0; }
+    int m = 0, app = 0, plus = 0;
+    for (const char* p = mode; *p; ++p) if (*p == '+') plus = 1;
+    if (mode[0] == 'r') m = plus ? 3 : 1;
+    else if (mode[0] == 'w') m = plus ? 3 : 2;
+    else if (mode[0] == 'a') { m = plus ? 3 : 2; app = 1; }
+    else { errno = EINVAL; return 0; }
+    FILE* f = 0;
+    for (int i = 0; i < 8; ++i) if (files[i].fd < 0 && files[i].mode == 0) { f = &files[i]; break; }
+    if (!f) { errno = EMFILE; return 0; }
+    f->fd = fd; f->err = f->eof = 0; f->mode = m; f->rpos = f->rlen = f->wlen = 0; f->unget = -1; f->append = app; f->line = 0;
+    return f;
+}
+
 int fclose(FILE* f)
 {
     if (!f) return -1;
