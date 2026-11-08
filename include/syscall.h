@@ -1,3 +1,27 @@
+/*
+ * MIT License
+ *
+ * Copyright (c) 2026 Rio okta kusuma
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files, to deal in the Software
+ * without restriction, including without limitation the rights to use, copy,
+ * modify, merge, publish, distribute, sublicense, and/or sell copies of the
+ * Software, and to permit persons to whom the Software is furnished to do so,
+ * subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
 #ifndef SYSCALL_H
 #define SYSCALL_H
 
@@ -81,6 +105,8 @@ enum SyscallNumber
     SYS_SIGQUEUE   = 74,  /* sigqueue(pid, sig, value) */
     SYS_SIGALTSTACK= 75,  /* sigaltstack(const stack_t* new, stack_t* old) */
     SYS_SIGWAIT    = 76,  /* sigwait(set, timeout_ms | ~0 = forever, siginfo* out) -> signal / -EAGAIN / -EINTR */
+    SYS_HTTP_GET   = 78,  /* http_get(url, buf, cap, flags | cacert<<8?) see syscall.cpp: flags bit0 = insecure; x4 = cacert path or 0 -> body length or -errno */
+    SYS_SHA256     = 79,  /* sha256(data, len, out32) -> 0 */
     SYS_SETITIMER  = 77,  /* setitimer(value_ms, interval_ms) -> previous remaining ms (SIGALRM) */
     SYS_NET_TCP_ACCEPT = 54, /* tcp_accept(handle, uint64_t* peer(ip|port<<32) or 0, timeout_ms) -> new handle */
     SYS_SETUID     = 52,  /* setuid(uid, gid): root only (drops privilege irreversibly for non-root targets) */

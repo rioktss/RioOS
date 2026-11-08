@@ -1,3 +1,27 @@
+/*
+ * MIT License
+ *
+ * Copyright (c) 2026 Rio okta kusuma
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files, to deal in the Software
+ * without restriction, including without limitation the rights to use, copy,
+ * modify, merge, publish, distribute, sublicense, and/or sell copies of the
+ * Software, and to permit persons to whom the Software is furnished to do so,
+ * subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
 /* RioOS libc part 4: POSIX signals, execve family with environment, system/popen, posix_spawn, fcntl, msync. */
 #include "ulibc.h"
 #include "../../include/user_api.h"
@@ -20,6 +44,8 @@ static long rret(uint64_t v) { long r = (long)v; if (r < 0 && r > -4096) { errno
 #define RS_SIGALTSTACK 75
 #define RS_SIGWAIT 76
 #define RS_SETITIMER 77
+#define RS_HTTP_GET 78
+#define RS_SHA256 79
 extern int __rio_sa_restart;
 void __rio_sigreturn(void);
 __asm__(".text\n.global __rio_sigreturn\n__rio_sigreturn:\n mov x8, #67\n svc #0\n 1: b 1b\n");
@@ -547,3 +573,11 @@ int pclose(FILE* f)
 }
 
 } /* extern "C" */
+
+/* ---- network helpers for pkg ------------------------------------------- */
+/* HTTP(S) GET (certificate verified unless insecure): body length, or -1 with errno (ENOENT: non-2xx, EIO: transport/TLS, EMSGSIZE-like ERANGE: too big). */
+long http_get(const char* url, void* buf, size_t cap, int insecure, const char* cacert)
+{
+    return rret(user_syscall5(RS_HTTP_GET, (uint64_t)url, (uint64_t)buf, cap, insecure ? 1U : 0U, (uint64_t)cacert));
+}
+void sha256_buf(const void* data, size_t len, unsigned char out[32]) { (void)user_syscall3(RS_SHA256, (uint64_t)data, len, (uint64_t)out); }

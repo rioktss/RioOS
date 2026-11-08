@@ -1,3 +1,27 @@
+/*
+ * MIT License
+ *
+ * Copyright (c) 2026 Rio okta kusuma
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files, to deal in the Software
+ * without restriction, including without limitation the rights to use, copy,
+ * modify, merge, publish, distribute, sublicense, and/or sell copies of the
+ * Software, and to permit persons to whom the Software is furnished to do so,
+ * subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
 #include "env.h"
 #include "shell.h"
 #include "keyboard.h"
@@ -21,7 +45,7 @@ static const char* command_names[] = {
     "diskwrite","diskflush","apps","uname","whoami","net","ping","selftest","pages","tasks",
     "mount","stats","log","irq","grep","find","history","date","du","df","wc","chmod","env","export",
     "ifconfig","nslookup","httpget","dnsserver","smp","fbinfo",
-    "stat","chown","truncate","seq","basename","dirname","poweroff","reboot","head","tail","sort","uniq","cut","tr","tee","sleep","rmdir","free","which","dhcp","ping6","httpd","lspci","nvme","sata","umount","mkfs","fsck","fat","quota","awk","sed","xargs","rev","tac","nl","alias","unalias","printf","expr","more","less","hexdump","libctest","sync","ln","readlink","realpath","jtest","threads","thread-demo","unset","fds","sh","source","jobs","fg","bg","kill","let","test","true","false","read","useradd","userdel","passwd","id","users","return","nc","udp6","wget","telnet","usb","httpsget","curl","ntpdate","fw","gzip","gunzip","zcat","tar","diff","vi","pkg","cc"
+    "stat","chown","truncate","seq","basename","dirname","poweroff","reboot","head","tail","sort","uniq","cut","tr","tee","sleep","rmdir","free","which","dhcp","ping6","httpd","lspci","nvme","sata","umount","mkfs","fsck","fat","quota","awk","sed","xargs","rev","tac","nl","alias","unalias","printf","expr","more","less","hexdump","libctest","sync","ln","readlink","realpath","jtest","threads","thread-demo","unset","fds","sh","source","jobs","fg","bg","kill","let","test","true","false","read","useradd","userdel","passwd","id","users","return","nc","udp6","wget","telnet","usb","httpsget","curl","ntpdate","certs","ssh","scp","ftpd","fw","gzip","gunzip","zcat","tar","diff","vi","pkg","cc"
 };
 
 static void shell_prompt_text()
@@ -174,7 +198,7 @@ static void complete_command_or_file(char* input, int* length)
     static const char* const fw_sub[] = { "list", "add", "insert", "del", "flush", "default" };
     static const char* const dhcp_sub[] = { "status", "renew", "release" };
     static const char* const fat_sub[] = { "mkfs", "info", "ls", "cat", "get", "put", "mkdir", "rm" };
-    static const char* const pkg_sub[] = { "list", "install", "remove", "info", "files", "search", "verify", "build", "update" };
+    static const char* const pkg_sub[] = { "list", "install", "remove", "info", "files", "search", "verify", "build", "update", "upgrade", "owner", "remote", "mkindex" };
     static const char* const tar_opt[] = { "-c", "-x", "-t", "-v", "-f", "-C" };
     if (word_is(argv0, "help") && arg == 1) { cand_words(help_topics, 9); files = 0; }
     else if ((word_is(argv0, "man") || word_is(argv0, "which")) && arg == 1) { cand_words(command_names, (int)(sizeof(command_names) / sizeof(command_names[0]))); files = 0; }
@@ -184,7 +208,7 @@ static void complete_command_or_file(char* input, int* length)
     else if (word_is(argv0, "fat") && arg == 2) { cand_words(fat_sub, 8); files = 0; }
     else if (word_is(argv0, "fw") && arg == 1) { cand_words(fw_sub, 6); files = 0; }
     else if (word_is(argv0, "dhcp") && arg == 1) { cand_words(dhcp_sub, 3); files = 0; }
-    else if (word_is(argv0, "pkg") && arg == 1) { cand_words(pkg_sub, 9); files = 0; }
+    else if (word_is(argv0, "pkg") && arg == 1) { cand_words(pkg_sub, 13); files = 0; }
     else if (word_is(argv0, "tar") && arg == 1) { cand_words(tar_opt, 6); }
     else if (word_is(argv0, "su") && arg == 1) { cand_add("root", 0); cand_add("user", 0); files = 0; }
     else if ((word_is(argv0, "export") || word_is(argv0, "unset")) && arg == 1)

@@ -113,7 +113,7 @@ ASMFLAGS=(
 
 MODULES=(
     uart memory string fs vfs process sched_policy scheduler timer interrupt keyboard
-    commands version shell history env rtc exceptions syscall user mmu virtio_mmio virtio_input virtio_blk storage thread fd task mapping jobs sha256 script pci nvme ahci filters textutils shellext usb tls fat32
+    commands version shell history env rtc exceptions syscall user mmu virtio_mmio virtio_input virtio_blk storage thread fd task mapping jobs sha256 script pci nvme ahci filters textutils shellext usb tls crypto x509 trust ssh netserv fat32
     fb console console_font
     elf virtio_net netstack page_alloc fault diag security smp
     kernel
@@ -229,7 +229,7 @@ APP_ELFS=(build/user_init.elf)
 [[ -f build/nano.elf ]] && APP_ELFS+=(build/nano.elf)
 [[ -f build/calc.elf ]] && APP_ELFS+=(build/calc.elf)
 APP_ELFS+=("${EXTRA_ELFS[@]}" "${SO_FILES[@]}")
-"$HOST_TOOLS/mkfs_myfs" storage/disk.img "${APP_ELFS[@]}" >/dev/null
+"$HOST_TOOLS/mkfs_myfs" storage/disk.img "${APP_ELFS[@]}" "@/etc/ssl:storage/etc/ca-bundle.pem:certs.pem" >/dev/null
 vlog " -> storage/disk.img ready"
 
 step "4/9" "Compiling boot"
@@ -260,7 +260,7 @@ step "6/9" "Linking"
     build/commands.o build/version.o build/shell.o build/history.o build/env.o build/rtc.o build/exceptions.o build/syscall.o build/user.o build/mmu.o \
     build/virtio_mmio.o build/virtio_input.o build/virtio_blk.o build/storage.o build/elf.o build/virtio_net.o \
     build/netstack.o build/page_alloc.o build/fault.o build/diag.o build/security.o \
-    build/fb.o build/console.o build/console_font.o build/thread.o build/fd.o build/smp.o build/task.o build/mapping.o build/jobs.o build/sha256.o build/script.o build/pci.o build/nvme.o build/ahci.o build/filters.o build/textutils.o build/shellext.o build/usb.o build/tls.o build/fat32.o \
+    build/fb.o build/console.o build/console_font.o build/thread.o build/fd.o build/smp.o build/task.o build/mapping.o build/jobs.o build/sha256.o build/script.o build/pci.o build/nvme.o build/ahci.o build/filters.o build/textutils.o build/shellext.o build/usb.o build/tls.o build/crypto.o build/x509.o build/trust.o build/ssh.o build/netserv.o build/fat32.o \
     -o build/kernel.elf
 
 step "7/9" "Verifying ELF"
@@ -350,9 +350,18 @@ fi
     -o "$HOST_TOOLS/sha_host_test"
 "$HOST_TOOLS/sha_host_test" > /dev/null
 "$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -iquote include -DHOST_TEST \
-    tests/tls_host_test.cpp net/tls.cpp kernel/sha256.cpp \
+    tests/tls_host_test.cpp net/tls.cpp net/x509.cpp net/crypto.cpp kernel/sha256.cpp \
     -o "$HOST_TOOLS/tls_host_test"
 "$HOST_TOOLS/tls_host_test" > /dev/null
+"$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -iquote include -DHOST_TEST \
+    tests/crypto_host_test.cpp net/crypto.cpp kernel/sha256.cpp \
+    -o "$HOST_TOOLS/crypto_host_test"
+"$HOST_TOOLS/crypto_host_test" tests/crypto_vectors.txt > /dev/null
+python3 tests/gen_pki.py "$HOST_TOOLS/pki" > /dev/null 2>&1 && {
+"$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -iquote include -DHOST_TEST \
+    tests/x509_host_test.cpp net/x509.cpp net/crypto.cpp kernel/sha256.cpp \
+    -o "$HOST_TOOLS/x509_host_test"
+"$HOST_TOOLS/x509_host_test" "$HOST_TOOLS/pki" > /dev/null; } || echo "note: x509 host test skipped (python 'cryptography' module missing)"
 
 "$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -iquote include -DHOST_TEST \
     tests/console_host_test.cpp drivers/console.cpp drivers/console_font.cpp drivers/fb.cpp \

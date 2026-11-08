@@ -97,3 +97,10 @@ Round 6: host syscall test extended for syscalls 60-64; QEMU session added:
 Round 7: QEMU session added:
 - session 15: `thrtest` (31 pthread checks: create/join, mutex, cond, rwlock, barrier, semaphores, keys, cancel, pthread_kill, deadlock), `sigtest` (36 checks: siginfo, SA_RESTART, sigaltstack, SEGV handler, sigqueue, sigwait, itimer, nanosleep, setjmp), shell fixes (`$?`, `| read`, `usb selftest`)
 - every one of the 152 shell commands was run in QEMU by hand (see regression sessions 1-15 for the automated part)
+
+Round 8: host tests `crypto_host_test` (86 vectors from python `cryptography`), `x509_host_test` (85 checks, generated PKI), `tls_host_test`; `tests/qemu_net_tests.py` (needs root, /dev/net/tun, python `cryptography`, libssh; run by qemu_regression.py) attaches the guest to a TAP bridge and talks to real services:
+- tls: unknown CA, `-k`, `--cacert`, `certs add`, RSA-PSS and ECDSA servers, self-signed, wrong root, expired leaf, curl
+- ssh: exec/exit status/stderr, three host-key types, wrong password, known_hosts, StrictHostKeyChecking, `-R`, interactive shell, scp up/down/-r/700 KB/missing file
+- httpd: python http.client (keep-alive, HEAD, Range, listing, redirects, 400/404/405, traversal, 700 KB file); ftpd: python ftplib (per-user permissions, PASV and active mode, anonymous, `-d` jail, 300 KB transfer)
+- pkg: remote add/list/remove, update, install with dependency, upgrade from a second remote, sha256 mismatch rejected, missing index, HTTPS refused without CA / accepted after `certs add` / `-k`, `mkindex`
+

@@ -1,3 +1,28 @@
+/*
+ * MIT License
+ *
+ * Copyright (c) 2026 Rio okta kusuma
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files, to deal in the Software
+ * without restriction, including without limitation the rights to use, copy,
+ * modify, merge, publish, distribute, sublicense, and/or sell copies of the
+ * Software, and to permit persons to whom the Software is furnished to do so,
+ * subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+#include <string>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -137,6 +162,16 @@ int main(int argc,char**argv){
         const char* base = basename_of(host);
         const char* guest = base;
         int parent = bin;
+        if(host[0]=='@'){   /* @<guest dir>:<host file>:<guest name>  (e.g. @/etc/ssl:storage/etc/ca-bundle.pem:certs.pem) */
+            std::string spec(host+1); size_t c1=spec.find(':'), c2=spec.find(':',c1==std::string::npos?0:c1+1);
+            if(c1==std::string::npos||c2==std::string::npos){std::fprintf(stderr,"bad spec %s\n",host);std::fclose(f);return 1;}
+            std::string dir=spec.substr(0,c1), hostfile=spec.substr(c1+1,c2-c1-1), gname=spec.substr(c2+1);
+            int cur=root; size_t pos=0;
+            while(pos<dir.size()){ while(pos<dir.size()&&dir[pos]=='/')++pos; size_t e=dir.find('/',pos); if(e==std::string::npos)e=dir.size(); if(e>pos){ std::string part=dir.substr(pos,e-pos); if(!ensure_dir(ins,cur,part.c_str())){std::fprintf(stderr,"cannot create %s\n",dir.c_str());std::fclose(f);return 1;} cur=find_inode(ins,part.c_str(),cur);} pos=e; }
+            std::printf("Installing %s -> %s/%s\n",hostfile.c_str(),dir.c_str(),gname.c_str());
+            if(!fill_file(f,ins,bm,cur,gname.c_str(),hostfile.c_str(),true)){std::fprintf(stderr,"cannot install %s\n",hostfile.c_str());std::fclose(f);return 1;}
+            continue;
+        }
         if(std::strcmp(base,"user_init.elf")==0) guest="init.elf";
         std::printf("Installing %s -> /bin/%s\n", host, guest);
         if(!fill_file(f,ins,bm,parent,guest,host,true)){

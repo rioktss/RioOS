@@ -1,3 +1,27 @@
+/*
+ * MIT License
+ *
+ * Copyright (c) 2026 Rio okta kusuma
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files, to deal in the Software
+ * without restriction, including without limitation the rights to use, copy,
+ * modify, merge, publish, distribute, sublicense, and/or sell copies of the
+ * Software, and to permit persons to whom the Software is furnished to do so,
+ * subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
 #include "netstack.h"
 #include "virtio_net.h"
 #include "timer.h"
@@ -980,7 +1004,7 @@ static void tcp_input(const uint8_t* src6, uint32_t source_ip, uint32_t dest_ip,
         if (pending >= TCP_ACCEPT_QUEUE) return;
         uint32_t next_hop = ((source_ip & NET_MASK) == (NET_IP & NET_MASK)) ? source_ip : NET_GATEWAY;
         uint8_t hop_mac[6];
-        if (!src6 && arp_lookup(next_hop, hop_mac) != 0) { (void)send_arp(next_hop); return; }   /* client retransmits SYN */
+        if (!src6 && arp_lookup(next_hop, hop_mac) == 0) { (void)send_arp(next_hop); return; }   /* client retransmits SYN */
         for (uint32_t i = 0; i < TCP_SOCKET_COUNT; ++i)
         {
             TcpSocketState* child = &tcp_sockets[i];
@@ -1131,6 +1155,12 @@ int net_tcp_connect(int owner_pid, int socket_handle, uint32_t target_ip,
         timeout_ms == 0 || timeout_ms > NET_TCP_MAX_TIMEOUT_MS)
         return -22;
 
+    static int ephemeral_seeded = 0;
+    if (!ephemeral_seeded)
+    {   /* start at a clock-dependent port so a rebooted guest does not reuse the 4-tuples still in a peer's TIME_WAIT */
+        ephemeral_seeded = 1;
+        tcp_next_ephemeral = (uint16_t)(UDP_EPHEMERAL_FIRST + (uint32_t)(timer_millis() * 2654435761ULL >> 7) % ((uint32_t)UDP_EPHEMERAL_LAST - UDP_EPHEMERAL_FIRST + 1U));
+    }
     uint32_t attempts = (uint32_t)UDP_EPHEMERAL_LAST - UDP_EPHEMERAL_FIRST + 1U;
     while (attempts--)
     {
@@ -2474,6 +2504,8 @@ int net_ready()
 {
     return ready_state;
 }
+
+uint32_t net_local_ip() { return NET_IP; }
 
 void net_status()
 {

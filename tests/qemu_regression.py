@@ -7,7 +7,7 @@ Sessions: core/ELF/job-control/scripting/security/FS, storage backends (NVMe, AH
 SMP (-smp 4), network (DHCP, TCP server, IPv6, ping) against tests/qemu_fake_peer.py, shell extras, USB xHCI,
 network extras + HTTPS against tests/qemu_fake_peer2.py.
 """
-import os, pty, select, shutil, subprocess, sys, tempfile, time, tty
+import os, re, pty, select, shutil, subprocess, sys, tempfile, time, tty
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QEMU = sys.argv[1] if len(sys.argv) > 1 else shutil.which("qemu-system-aarch64") or "qemu-system-aarch64"
@@ -143,7 +143,7 @@ peer2 = subprocess.Popen([sys.executable, os.path.join(ROOT, "tests", "qemu_fake
 time.sleep(1.5)
 shutil.copy(os.path.join(ROOT, "storage", "disk.img"), os.path.join(TMP, "disk.img"))
 log = run(C("dhcp status", "dhcp renew", "wget 10.0.2.2:8081 /x.txt", "cat x.txt", "nc 10.0.2.2 2323 hi there", "nc -z 10.0.2.2 2323", "nc -z 10.0.2.2 9999",
-            "httpsget 10.0.2.2:8443 /hello.txt", "wget https://10.0.2.2:8443/hello.txt h2.txt", "cat h2.txt",
+            "httpsget -k 10.0.2.2:8443 /hello.txt", "wget -k https://10.0.2.2:8443/hello.txt h2.txt", "cat h2.txt",
             "udp6 send fe80::ff:fe00:1 5353 v6ping", "nc fe80::ff:fe00:1 2323 hi6", "nc -z fe80::ff:fe00:1 2323", "nc -l 7777"), wait=7, extra=[
     "-netdev", "dgram,id=n0,local.type=inet,local.host=127.0.0.1,local.port=7001,remote.type=inet,remote.host=127.0.0.1,remote.port=7002",
     "-device", "virtio-net-device,netdev=n0,mac=52:54:00:12:34:56"])
@@ -311,6 +311,16 @@ if "FAIL " in log:
 log = run(C("su", "123", "echo 'f(){ return 3; }' > /tmp/s1.sh", "echo 'f a; echo rc=$?' >> /tmp/s1.sh", "echo 'false; echo rc2=$?' >> /tmp/s1.sh", "source /tmp/s1.sh",
             "echo hello | read W", "echo W=$W", "usb selftest"), wait=2)
 check("shell-fixes", log, "rc=3", "rc2=1", "W=hello", "usb: no xHCI controller")
+
+# real-network tests (TLS verification, ssh/scp, httpd, ftpd, pkg over HTTP(S)); skipped when root / TAP / python-cryptography are missing
+if os.environ.get("RIOOS_SKIP_NETTESTS") != "1":
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "tests", "qemu_net_tests.py"), QEMU], capture_output=True, text=True)
+    out = r.stdout
+    m = re.search(r"net tests: (\d+) checks, (\d+) failed", out)
+    if m: total += int(m.group(1)); fails += int(m.group(2)); print("  net tests: %s checks, %s failed" % (m.group(1), m.group(2)))
+    elif out.startswith("SKIP"): print("  " + out.strip().splitlines()[0])
+    else: fails += 1; total += 1; print("  FAIL  net tests did not finish\n" + out[-600:])
+    if m and int(m.group(2)): print("\n".join(l for l in out.splitlines() if "FAIL" in l))
 
 shutil.rmtree(TMP, ignore_errors=True)
 print("\n%d checks, %d failed" % (total, fails))

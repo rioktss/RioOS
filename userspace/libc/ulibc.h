@@ -1,3 +1,27 @@
+/*
+ * MIT License
+ *
+ * Copyright (c) 2026 Rio okta kusuma
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files, to deal in the Software
+ * without restriction, including without limitation the rights to use, copy,
+ * modify, merge, publish, distribute, sublicense, and/or sell copies of the
+ * Software, and to permit persons to whom the Software is furnished to do so,
+ * subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
 #ifndef RIOOS_ULIBC_H
 #define RIOOS_ULIBC_H
 /* RioOS user-space C library (freestanding, AArch64, no FP). */
@@ -36,6 +60,9 @@ extern int errno;
 #define ESRCH 3
 #define EINTR 4
 #define EIO 5
+#ifndef EFBIG
+#define EFBIG 27
+#endif
 #define EBADF 9
 #define ECHILD 10
 #define EAGAIN 11
@@ -203,6 +230,8 @@ struct itimerval { struct timeval it_interval; struct timeval it_value; };
 #define CLOCK_MONOTONIC 1
 int setitimer(int which, const struct itimerval* nv, struct itimerval* old);
 int getitimer(int which, struct itimerval* cur);
+long http_get(const char* url, void* buf, size_t cap, int insecure, const char* cacert);   /* HTTP(S) GET, TLS verified unless insecure; body length or -1 */
+void sha256_buf(const void* data, size_t len, unsigned char out[32]);
 int nanosleep(const struct timespec* req, struct timespec* rem);
 int gettimeofday(struct timeval* tv, void* tz);
 int clock_gettime(int clk, struct timespec* ts);

@@ -28,5 +28,6 @@ exec "$QEMU" \
     -kernel "$KERNEL" \
     -drive if=none,format=raw,file="$DISK",id=vd0 \
     -device virtio-blk-device,drive=vd0 \
-    -netdev user,id=n1,ipv4=on,ipv6=off \
+    -netdev user,id=n1,ipv4=on,ipv6=off,hostfwd=tcp::8080-:8080,hostfwd=tcp::2121-:21 \
     -device virtio-net-device,netdev=n1
+    

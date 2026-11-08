@@ -1,3 +1,27 @@
+/*
+ * MIT License
+ *
+ * Copyright (c) 2026 Rio okta kusuma
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files, to deal in the Software
+ * without restriction, including without limitation the rights to use, copy,
+ * modify, merge, publish, distribute, sublicense, and/or sell copies of the
+ * Software, and to permit persons to whom the Software is furnished to do so,
+ * subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
 #include "commands.h"
 #include "jobs.h"
 #include "filters.h"
@@ -6,6 +30,9 @@
 #include "pci.h"
 #include "usb.h"
 #include "tls.h"
+#include "x509.h"
+#include "ssh.h"
+#include "netserv.h"
 #include "nvme.h"
 #include "ahci.h"
 #include "storage.h"
@@ -658,51 +685,6 @@ static void command_ping6(const char* argument)
 }
 
 /* httpd <port> [requests]: tiny HTTP/1.0 server over the TCP listen/accept API. */
-static void command_httpd(const char* argument)
-{
-    char buf[48]; str_copy(buf, argument ? argument : "", sizeof(buf));
-    char* w[3]; int n = split_words(buf, w, 3);
-    if (!net_ready() || n < 1) { uart_puts("usage: httpd <port> [requests]\r\n"); return; }
-    int port = parse_uint(w[0], -1); int limit = n > 1 ? parse_uint(w[1], -1) : 1;
-    if (port <= 0 || port > 65535 || limit <= 0 || limit > 100) { uart_puts("httpd: bad arguments\r\n"); return; }
-    int ls = net_tcp_socket(0);
-    if (ls < 0 || net_tcp_listen(0, ls, (uint16_t)port) != 0) { uart_puts("httpd: cannot listen\r\n"); if (ls > 0) net_tcp_close(0, ls); return; }
-    uart_puts("httpd: listening on port "); print_u64((uint64_t)port); uart_puts(" ("); print_u64((uint64_t)limit); uart_puts(" request(s); Ctrl-C aborts)\r\n");
-    int served = 0, idle = 0;
-    while (served < limit && idle < 60)
-    {
-        uint32_t pip; uint16_t pport;
-        int c = net_tcp_accept(0, ls, &pip, &pport, 1000U);
-        if (c < 0) { ++idle; int ch = uart_try_getc(); if (ch == 3) break; continue; }
-        idle = 0;
-        char req[512]; int got = net_tcp_recv(0, c, req, sizeof(req) - 1, 2000U);
-        if (got < 0) got = 0;
-        req[got] = 0;
-        char path[96] = "/"; int pp = 0;
-        if (req[0] == 'G' && req[1] == 'E' && req[2] == 'T' && req[3] == ' ')
-        { int i = 4; while (req[i] && req[i] != ' ' && req[i] != '\r' && pp < 95) path[pp++] = req[i++]; path[pp] = 0; }
-        static uint8_t body[2048]; uint64_t sz = 0; const char* status = "200 OK";
-        if (str_equal(path, "/") || pp == 0)
-        { const char* m = "Hello from RioOS httpd\n"; sz = (uint64_t)str_len(m); for (uint64_t i = 0; i < sz; ++i) body[i] = (uint8_t)m[i]; }
-        else if (fs_read_file(path, vfs_cwd(), body, sizeof(body), &sz) != 0)
-        { const char* m = "not found\n"; status = "404 Not Found"; sz = (uint64_t)str_len(m); for (uint64_t i = 0; i < sz; ++i) body[i] = (uint8_t)m[i]; }
-        char hdr[128]; int hp = 0;
-        const char* a = "HTTP/1.0 "; for (int i = 0; a[i]; ++i) hdr[hp++] = a[i];
-        for (int i = 0; status[i]; ++i) hdr[hp++] = status[i];
-        const char* b = "\r\nContent-Length: "; for (int i = 0; b[i]; ++i) hdr[hp++] = b[i];
-        char num[12]; int nn = 0; uint64_t v = sz; do { num[nn++] = (char)('0' + v % 10); v /= 10; } while (v);
-        while (nn) hdr[hp++] = num[--nn];
-        const char* d = "\r\nConnection: close\r\n\r\n"; for (int i = 0; d[i]; ++i) hdr[hp++] = d[i];
-        (void)net_tcp_send(0, c, hdr, (uint32_t)hp, 3000U);
-        for (uint64_t off = 0; off < sz; ) { uint32_t chunk = sz - off > 1024 ? 1024U : (uint32_t)(sz - off); if (net_tcp_send(0, c, body + off, chunk, 3000U) <= 0) break; off += chunk; }
-        (void)net_tcp_close(0, c);
-        ++served;
-        uart_puts("httpd: served "); uart_puts(path); uart_puts("\r\n");
-    }
-    (void)net_tcp_close(0, ls);
-    uart_puts("httpd: stopped\r\n");
-}
-
 static int g_sleep_abort = 0;
 static int sleep_key_filter(int c) { if (c == 3) { g_sleep_abort = 1; return 1; } return 0; }
 
@@ -1019,9 +1001,10 @@ static const ManualEntry manual_entries[] =
     {"udp6", "UDP over IPv6 link-local", "udp6 send <ipv6> <port> <text> | udp6 listen <port> [count]", "send waits 2.5 s for a reply; listen prints datagrams and answers 'ack6:<data>'"},
     {"telnet", "interactive TCP terminal", "telnet <host> [port]", "default port 23; Ctrl-] quits; answers telnet option negotiation with WONT/DONT"},
     {"wget", "download over HTTP or HTTPS", "wget <http[s]://host[:port]/path | host[:port] [path]> [outfile]", "GET up to 1 MiB saved to a file (default: last path part or index.html); https uses TLS 1.3 (AES-128-GCM, X25519) WITHOUT certificate verification"},
-    {"httpsget", "fetch an HTTPS page (TLS 1.3)", "httpsget <host[:port]> [path] | httpsget https://host/path", "prints the first 4096 bytes of the body; server certificate is NOT validated (encrypted but unauthenticated)"},
+    {"httpsget", "fetch an HTTPS page (TLS 1.3)", "httpsget <host[:port]> [path] | httpsget https://host/path", "prints the first 4096 bytes of the body; the server certificate chain and host name are verified against /etc/ssl/certs.pem (+ certs add); --cacert <file> trusts one extra CA, -k/--insecure skips verification"},
     {"ping6", "ICMPv6 echo to a link-local address", "ping6 <ipv6>", "uses NDP neighbor discovery"},
-    {"httpd", "tiny HTTP server (TCP listen/accept)", "httpd <port> [requests]", "serves files from the filesystem; / is a greeting"},
+    {"httpd", "HTTP file server (GET/HEAD, ranges, keep-alive, directory listings)", "httpd <port> [requests] [-d docroot] [-q]", "serves files below the document root (default /; with / and no index.html the path / is a greeting); index.html, directory listings, 301/403/404/405/416, Content-Type by extension, Range requests, HTTP/1.1 keep-alive; requests 0 = until Ctrl-C, default 1; one connection at a time; no HTTPS"},
+    {"ftpd", "FTP server (passive/active, login with local accounts)", "ftpd [-p port] [-d root] [-n sessions] [-a]", "login with a RioOS account (permissions of that user apply); USER PASS PWD CWD CDUP TYPE PASV EPSV PORT LIST NLST RETR STOR APPE DELE MKD RMD RNFR RNTO SIZE MDTM REST FEAT QUIT; -a adds a read-only anonymous login; files up to 4 MiB; one session at a time; plain FTP (no TLS)"},
     {"usb", "xHCI USB controller / HID devices", "usb [selftest]", "lists devices on the xHCI root hub; keyboards type into the shell, mice are tracked (start QEMU with -device qemu-xhci -device usb-kbd)"},
     {"lspci", "list PCIe devices", "lspci", "bus 0 via ECAM; shows class and assigned BARs"},
     {"nvme", "NVMe disk status", "nvme [selftest]", "selftest is read-only on the root disk, read/write on others"},
@@ -1032,7 +1015,7 @@ static const ManualEntry manual_entries[] =
     {"zcat", "print a .gz file", "zcat <file.gz>", "same as gzip -dc; works in pipes"},
     {"diff", "compare two files or directories (user program)", "diff [-u|-U N] [-q -i -w -b -r -s] <a> <b>", "normal and unified output; -q only report; -i ignore case; -w ignore all blanks; -b ignore blank changes; -r recurse; -s report identical; exit 0 same / 1 differ / 2 error"},
     {"vi", "modal text editor (user program)", "vi [-R] [file]", "normal: h j k l arrows 0 ^ $ w b e gg G {n}G x X D dd dw d$ cc cw C yy yw p P u ^R . o O i a I A r R J ~ s S / ? n N ^F ^B, counts. ex: :w [f] :q :q! :wq :x :N :$ :d :r f :e! :s/a/b/[g] :%s/a/b/g :set nu|nonu. ZZ saves and quits. Screen 80x24."},
-    {"pkg", "package manager for .rpk packages (user program)", "pkg list|info|files|install|remove|upgrade|search|verify|owner|build|update", "pkg build [-z] <dir> <out.rpk> (dir holds PKGINFO: name= version= desc= depends=a,b>=1 conflicts= provides=, plus a file tree rooted at /); pkg install <file|name> [-f] resolves dependencies from /var/cache/pkg; database /var/lib/pkg; pkg remove refuses while others depend on it; pkg verify checks size+CRC. Root needed to write system paths"},
+    {"pkg", "package manager for .rpk packages (user program)", "pkg list|info|files|install|remove|upgrade|search|verify|owner|build|update|remote|mkindex", "pkg build [-z] <dir> <out.rpk> (dir holds PKGINFO: name= version= desc= depends=a,b>=1 conflicts= provides=, plus a file tree rooted at /); pkg install <file|name> [-f] resolves dependencies from /var/cache/pkg; database /var/lib/pkg; pkg remove refuses while others depend on it; pkg verify checks size+CRC. Root needed to write system paths. Network: pkg remote add <http(s)://host/dir> [-k] [--cacert f] (list|remove), pkg update fetches <url>/INDEX (lines 'name version file.rpk sha256 | desc'), install/upgrade/search then download missing or newer packages and dependencies, each checked against the index sha256 (HTTPS certificates are verified; -k disables that); pkg mkindex <dir> writes such an INDEX. Packages up to 1 MB"},
     {"cc", "C compiler + virtual machine (user program)", "cc [-S] [-c] [-o out.rbc] [-s steps] [-D name[=val]] file.c [args] | cc -x prog.rbc [args]", "compiles a C subset to bytecode and runs it: int/long/char/unsigned/void, pointers, arrays, enum, typedef, #define (also with arguments), #ifdef, functions, recursion, all statements incl. switch, string literals, initializers, malloc/free, printf/sprintf/snprintf/scanf/puts/putchar/getchar, str*/mem*, atoi, rand. Not supported: float/double, struct/union, goto, #if expressions. Bounds-checked memory, step limit (-s). -S prints bytecode, -c only checks, -o writes an image"},
     {"help", "list commands by category", "help [category|all]", "categories: files text shell system users storage network dev libc; details of one command: man <command>"},
     {"man", "manual page of a command", "man <command>", "shows summary, usage and notes; 'help' lists all commands"},
@@ -1098,6 +1081,9 @@ static const ManualEntry manual_entries[] =
     {"libctest", "libc part 2 self-test (user program)", "libctest", "FILE stdio, sscanf, strtok_r, strcasecmp, bsearch, integer math; prints N/N passed"},
     {"fat", "FAT32 volumes on a raw device (not VFS-mounted)", "fat <dev> mkfs [label] | info | ls [path] | cat <p> | get <p> <file> | put <file> <p> | mkdir <p> | rm <p>", "root only; dev ram0 ram1 nvme0n1 sda; reads long names, new names must be 8.3; files up to 1 MiB; works on images made by other OSes"},
     {"curl", "HTTP/HTTPS client", "curl [-s] [-i|-I] [-L] [-o file] [-X METHOD] [-H 'K: V'] [-d data] <url>", "GET/POST/HEAD, custom headers, follows up to 4 redirects with -L, -i/-I show headers, -o saves the body; https uses TLS 1.3 without certificate verification"},
+    {"ssh", "secure shell client (SSH-2)", "ssh [-p port] [-t|-T] [-o StrictHostKeyChecking=yes|no|accept-new] [user@]host [command]", "curve25519 key exchange, aes128-ctr + hmac-sha2-256, password login, host keys ssh-ed25519/rsa-sha2/ecdsa-nistp256 remembered in ~/.ssh_known_hosts; without a command opens a shell on a pty (~. at line start quits); with a command runs it and returns its exit status in $?; ssh -R host forgets a stored host key"},
+    {"scp", "copy files over SSH", "scp [-P port] [-r] [-q] <src> <dst>", "one side is [user@]host:path (upload or download); -r copies directories; files are limited to 4 MiB; password login only"},
+    {"certs", "TLS trust store (CA certificates)", "certs [list|count|add <pem>|verify <pem chain> [host]]", "the trust store is /etc/ssl/certs.pem; add (root) appends CA certificates; verify checks a PEM chain (leaf first) against the store, signatures, dates and the optional host name"},
     {"ntpdate", "set the clock from an NTP server", "ntpdate [-q] <server>", "SNTP over UDP 123; -q only queries and prints the offset; setting the RTC needs root"},
     {"fw", "IPv4 packet filter (firewall)", "fw [list] | fw add|insert <allow|deny> <in|out|both> <tcp|udp|icmp|any> [ip[/bits]|any] [port|any] | fw del <n> | fw flush | fw default <in|out> <allow|deny>", "ordered rules, first match wins, then the per-direction default policy; inbound rules apply to new connections only (SYN, new UDP flow, echo request); DHCP and DNS are exempt; changing rules needs root"},
     {"fsck", "check the filesystem", "fsck [-r] [mountpoint]", "reports inodes/sectors, structure and bitmap; -r (root) repairs a leaked/missing bitmap"},
@@ -2120,10 +2106,14 @@ static const HelpSection help_sections[] = {
 {"network", "NETWORK",
  "  net  ifconfig  dhcp [status|renew|release]  dnsserver <ip>  nslookup <host>\r\n"
  "  ping <ip>  ping6 <ipv6>                    ICMP echo over IPv4 / IPv6\r\n"
- "  httpget <host> [path]   wget <url> [file]   httpsget <host> [path]   HTTP/HTTPS (TLS 1.3)\r\n"
+ "  httpget <host> [path]   wget <url> [file]   httpsget <host> [path]   HTTP/HTTPS (TLS 1.3, certificates verified; -k skips, --cacert f)\r\n"
+ "  certs [list|add <pem>|verify <pem>]        CA trust store (/etc/ssl/certs.pem)\r\n"
+ "  ssh [-p n] [-t] [-o StrictHostKeyChecking=yes|no] user@host [cmd]   ssh -R host   SSH-2 client\r\n"
+ "  scp [-r] [-P n] <src> <dst>                copy files over SSH (user@host:path)\r\n"
+ "  ftpd [-p port] [-n sessions] [-a] [-d dir]  FTP server (PASV/EPSV/PORT, per-user permissions)\r\n"
  "  curl [-s -i -I -L -o f -X M -H h -d data] <url>   full HTTP client\r\n"
  "  nc [-z] <host> <port> [text]  nc -l <port>   TCP client/server (IPv4 + IPv6)\r\n"
- "  udp6 send|listen ...   telnet <host> [port]   httpd <port> [n]   tiny web server\r\n"
+ "  udp6 send|listen ...   telnet <host> [port]   httpd [port] [n] [-d dir] [-q]   web server (HTTP/1.1, Range)\r\n"
  "  ntpdate [-q] <server>                      set the clock over NTP\r\n"
  "  fw [list]  fw add|insert <allow|deny> <in|out|both> <tcp|udp|icmp|any> [ip[/n]] [port]\r\n"
  "  fw del <n>  fw flush  fw default <in|out> <allow|deny>      firewall (root changes rules)\r\n"},
@@ -3493,6 +3483,36 @@ static void command_telnet(const char* argument)
     uart_puts(closed ? "\r\nConnection closed by foreign host.\r\n" : "\r\ntelnet: connection closed.\r\n");
 }
 
+/* TLS verification options shared by wget / httpsget / curl:  -k | --insecure   and   --cacert <file> */
+static int g_tls_insecure = 0;
+static char g_tls_cacert[160];
+static int strip_tls_opts(char** w, int n)
+{
+    int o = 0; g_tls_insecure = 0; g_tls_cacert[0] = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        if (str_equal(w[i], "-k") || str_equal(w[i], "--insecure")) { g_tls_insecure = 1; continue; }
+        if (str_equal(w[i], "--cacert") && i + 1 < n) { str_copy(g_tls_cacert, w[++i], sizeof(g_tls_cacert)); continue; }
+        w[o++] = w[i];
+    }
+    return o;
+}
+static int tls_connect_checked(int sk, const char* host, const char* who)
+{
+    tls_set_verify(!g_tls_insecure);
+    tls_set_extra_ca(g_tls_cacert);
+    int rc = tls_connect(sk, host);
+    if (rc != 0)
+    {
+        uart_puts(who); uart_puts(": TLS handshake failed ("); print_u64((uint64_t)(-rc)); uart_puts(")");
+        const char* e = tls_last_error(); if (e && e[0]) { uart_puts(": "); uart_puts(e); }
+        uart_puts("\r\n");
+        if (e && e[0] && !g_tls_insecure) { uart_puts(who); uart_puts(": the server could not be verified; add its CA with 'certs add <file>' / --cacert <file>, or use -k to skip verification\r\n"); }
+    }
+    return rc;
+}
+
+static int g_http_quiet = 0;
 /* HTTP(S) GET into a freshly allocated buffer (caller kfree()s). Returns body length or <0. */
 static int http_fetch(const char* host, int port, const char* path, int use_tls, uint8_t** out_body, int* out_status, const char* who)
 {
@@ -3503,8 +3523,8 @@ static int http_fetch(const char* host, int port, const char* path, int use_tls,
     if (net_tcp_connect(0, sk, ip, (uint16_t)port, 5000U) != 0) { uart_puts(who); uart_puts(": connection failed\r\n"); net_tcp_close(0, sk); return -1; }
     if (use_tls)
     {
-        int rc = tls_connect(sk, host);
-        if (rc != 0) { uart_puts(who); uart_puts(": TLS handshake failed ("); print_u64((uint64_t)(-rc)); uart_puts(")\r\n"); net_tcp_close(0, sk); return -1; }
+        int rc = tls_connect_checked(sk, host, who);
+        if (rc != 0) { net_tcp_close(0, sk); return -1; }
     }
     char req[512]; uint32_t rl = 0; req[0] = 0;
     http_append(req, sizeof(req), &rl, "GET "); http_append(req, sizeof(req), &rl, path);
@@ -3534,7 +3554,7 @@ static int http_fetch(const char* host, int port, const char* path, int use_tls,
     char status[48]; uint32_t sl = 0;
     while (sl < 47 && sl < total && body[sl] != '\r' && body[sl] != '\n') { status[sl] = (char)body[sl]; ++sl; }
     status[sl] = 0;
-    uart_puts(status); uart_puts("\r\n");
+    if (!g_http_quiet) { uart_puts(status); uart_puts("\r\n"); }
     *out_status = (sl > 9 && status[9] >= '0' && status[9] <= '9') ? (status[9] - '0') : 0;
     uint32_t blen = total - hdr;
     for (uint32_t i = 0; i < blen; ++i) body[i] = body[hdr + i];
@@ -3562,12 +3582,34 @@ static int parse_url_args(char** w, int n, char* host, int host_cap, int* port, 
     return 0;
 }
 
-/* wget <url | host[:port] [path]> [outfile] : HTTP/1.0 or HTTPS (TLS 1.3, certificate NOT verified) download. */
+
+/* Kernel-side HTTP(S) GET for user programs (pkg): verified TLS unless insecure. Returns body length or -errno. */
+int net_http_get_url(const char* url, int insecure, const char* cacert, uint8_t* out, uint32_t cap)
+{
+    char buf[300]; str_copy(buf, url, sizeof(buf)); char* w[2] = { buf, 0 };
+    char host[128], path[200]; int port, tls, next;
+    if (!net_ready()) return -100;
+    if (!(buf[0]=='h'&&buf[1]=='t'&&buf[2]=='t'&&buf[3]=='p')) return -22;
+    if (parse_url_args(w, 1, host, sizeof(host), &port, path, sizeof(path), &tls, &next) != 0) return -22;
+    g_tls_insecure = insecure ? 1 : 0; str_copy(g_tls_cacert, cacert ? cacert : "", sizeof(g_tls_cacert));
+    uint8_t* body = 0; int status = 0; g_http_quiet = 1;
+    int blen = http_fetch(host, port, path, tls, &body, &status, "pkg");
+    g_http_quiet = 0; g_tls_insecure = 0; g_tls_cacert[0] = 0;
+    if (blen < 0) return -5;
+    if (status != 2) { kfree(body); return -2; }          /* non-2xx: treated as "not found" */
+    if ((uint32_t)blen > cap) { kfree(body); return -27; }
+    for (int i = 0; i < blen; ++i) out[i] = body[i];
+    kfree(body);
+    return blen;
+}
+
+/* wget <url | host[:port] [path]> [outfile] : HTTP/1.0 or HTTPS (TLS 1.3, certificate verified unless -k) download. */
 static void command_wget(const char* argument)
 {
     char buf[400]; str_copy(buf, argument ? argument : "", sizeof(buf));
-    char* w[8]; int n = split_words(buf, w, 8);
-    if (n < 1) { uart_puts("usage: wget <http[s]://host[:port]/path | host[:port] [path]> [outfile]\r\n"); return; }
+    char* w[10]; int n = split_words(buf, w, 10);
+    n = strip_tls_opts(w, n);
+    if (n < 1) { uart_puts("usage: wget [-k] [--cacert file] <http[s]://host[:port]/path | host[:port] [path]> [outfile]\r\n"); return; }
     if (!net_ready()) { uart_puts("wget: network not ready\r\n"); return; }
     char host[128], path[200]; int port, tls, next;
     if (parse_url_args(w, n, host, sizeof(host), &port, path, sizeof(path), &tls, &next) != 0) { uart_puts("wget: bad URL\r\n"); return; }
@@ -3587,8 +3629,9 @@ static void command_wget(const char* argument)
 static void command_httpsget(const char* argument)
 {
     char buf[400]; str_copy(buf, argument ? argument : "", sizeof(buf));
-    char* w[8]; int n = split_words(buf, w, 8);
-    if (n < 1) { uart_puts("usage: httpsget <host[:port]> [path]   (certificate is NOT verified)\r\n"); return; }
+    char* w[10]; int n = split_words(buf, w, 10);
+    n = strip_tls_opts(w, n);
+    if (n < 1) { uart_puts("usage: httpsget [-k] [--cacert file] <host[:port]> [path]   (certificate is verified unless -k)\r\n"); return; }
     if (!net_ready()) { uart_puts("httpsget: network not ready\r\n"); return; }
     char host[128], path[200]; int port, tls, next;
     if (parse_url_args(w, n, host, sizeof(host), &port, path, sizeof(path), &tls, &next) != 0) { uart_puts("httpsget: bad URL\r\n"); return; }
@@ -3635,8 +3678,8 @@ static int curl_request(const char* host, int port, const char* path, int tls, c
     if (net_tcp_connect(0, sk, ip, (uint16_t)port, 5000U) != 0) { uart_puts("curl: connection failed\r\n"); net_tcp_close(0, sk); return -1; }
     if (tls)
     {
-        int rc = tls_connect(sk, host);
-        if (rc != 0) { uart_puts("curl: TLS handshake failed ("); print_u64((uint64_t)(-rc)); uart_puts(")\r\n"); net_tcp_close(0, sk); return -1; }
+        int rc = tls_connect_checked(sk, host, "curl");
+        if (rc != 0) { net_tcp_close(0, sk); return -1; }
     }
     char req[1024]; uint32_t rl = 0; req[0] = 0;
     http_append(req, sizeof(req), &rl, method); http_append(req, sizeof(req), &rl, " "); http_append(req, sizeof(req), &rl, path);
@@ -3693,15 +3736,386 @@ static int curl_find_header(const uint8_t* b, uint32_t hl, const char* name, cha
     return 0;
 }
 
+/* certs [list | add <pem> | verify <pem chain> [host] | path] : TLS trust store (/etc/ssl/certs.pem) */
+static void command_certs(const char* argument)
+{
+    char buf[300]; str_copy(buf, argument ? argument : "", sizeof(buf));
+    char* w[6]; int n = split_words(buf, w, 6);
+    const char* sub = n > 0 ? w[0] : "list";
+    if (str_equal(sub, "list") || str_equal(sub, "count"))
+    {
+        int c = tls_trust_reload();
+        if (c < 0) c = 0;
+        uart_puts("trust store: /etc/ssl/certs.pem, "); print_u64((uint64_t)c); uart_puts(" certificate(s)\r\n");
+        if (str_equal(sub, "list")) for (int i = 0; i < c; ++i) { char nm[96]; if (x509_trust_name(i, nm, sizeof(nm)) < 0) nm[0] = 0; print_u64((uint64_t)(i + 1)); uart_puts(". "); uart_puts(nm[0] ? nm : "(unnamed)"); uart_puts("\r\n"); }
+        return;
+    }
+    if (str_equal(sub, "add") && n == 2)
+    {
+        if (!security_is_root()) { uart_puts("certs: only root can change the trust store\r\n"); return; }
+        uint8_t* b = (uint8_t*)kmalloc(65536);
+        if (!b) { uart_puts("certs: out of memory\r\n"); return; }
+        uint64_t sz = 0;
+        if (fs_read_file(w[1], vfs_cwd(), b, 65535, &sz) != 0 || sz == 0) { uart_puts("certs: cannot read file (missing or over 64 KiB)\r\n"); kfree(b); return; }
+        uint8_t der[4096]; uint32_t off = 0, used = 0; int added = 0;
+        while (off < sz && x509_pem_to_der(b + off, (uint32_t)(sz - off), der, sizeof(der), &used) > 0) { ++added; off += used; }
+        if (added == 0) { uart_puts("certs: no PEM certificate found in "); uart_puts(w[1]); uart_puts("\r\n"); kfree(b); return; }
+        uint64_t cur = 0; uint8_t* all = (uint8_t*)kmalloc(600000);
+        if (!all) { uart_puts("certs: out of memory\r\n"); kfree(b); return; }
+        if (fs_read_file("/etc/ssl/certs.pem", vfs_cwd(), all, 520000, &cur) != 0) cur = 0;
+        if (cur + sz + 2 > 590000) { uart_puts("certs: trust store is full\r\n"); kfree(b); kfree(all); return; }
+        if (cur && all[cur - 1] != '\n') all[cur++] = '\n';
+        for (uint64_t i = 0; i < sz; ++i) all[cur + i] = b[i];
+        cur += sz; if (all[cur - 1] != '\n') all[cur++] = '\n';
+        (void)fs_mkdir_p("/etc/ssl", fs_get_root());
+        int rc = fs_write_data("/etc/ssl/certs.pem", vfs_cwd(), all, cur);
+        kfree(b); kfree(all);
+        if (rc < 0) { uart_puts("certs: cannot write /etc/ssl/certs.pem\r\n"); return; }
+        uart_puts("certs: added "); print_u64((uint64_t)added); uart_puts(" certificate(s); store now has "); print_u64((uint64_t)tls_trust_reload()); uart_puts("\r\n");
+        return;
+    }
+    if (str_equal(sub, "verify") && n >= 2)
+    {
+        uint8_t* b = (uint8_t*)kmalloc(65536);
+        if (!b) { uart_puts("certs: out of memory\r\n"); return; }
+        uint64_t sz = 0;
+        if (fs_read_file(w[1], vfs_cwd(), b, 65535, &sz) != 0 || sz == 0) { uart_puts("certs: cannot read file\r\n"); kfree(b); return; }
+        static uint8_t der[8][4096]; const uint8_t* cp[8]; uint32_t cl[8]; int cn = 0; uint32_t off = 0, used = 0;
+        while (cn < 8 && off < sz) { int r = x509_pem_to_der(b + off, (uint32_t)(sz - off), der[cn], 4096, &used); if (r <= 0) break; cp[cn] = der[cn]; cl[cn] = (uint32_t)r; ++cn; off += used; }
+        kfree(b);
+        if (cn == 0) { uart_puts("certs: no PEM certificate found\r\n"); return; }
+        if (tls_trust_reload() <= 0) { uart_puts("certs: trust store is empty\r\n"); return; }
+        X509Key key; const char* err = "";
+        int rc = x509_verify_chain(cp, cl, cn, n > 2 ? w[2] : 0, rtc_get_epoch(), &key, &err);
+        if (rc == 0) { uart_puts("certs: chain of "); print_u64((uint64_t)cn); uart_puts(" certificate(s) is valid\r\n"); }
+        else { uart_puts("certs: verification FAILED: "); uart_puts(err); uart_puts("\r\n"); }
+        return;
+    }
+    uart_puts("usage: certs [list | count | add <pem file> | verify <pem chain file> [host]]\r\n");
+}
+
+/* ---- ssh / scp ------------------------------------------------------------------------ */
+struct SshTarget { char user[48]; char host[96]; char path[200]; int has_host; };
+
+/* "[user@]host:path" (colon before any slash) or "[user@]host" */
+static int ssh_split_target(const char* s, SshTarget* t, int need_colon)
+{
+    t->user[0] = 0; t->host[0] = 0; t->path[0] = 0; t->has_host = 0;
+    const char* at = 0; const char* colon = 0;
+    for (const char* p = s; *p; ++p) { if (*p == '/') break; if (*p == '@' && !at && !colon) at = p; if (*p == ':' ) { colon = p; break; } }
+    if (need_colon && !colon) return 0;
+    const char* hs = at ? at + 1 : s;
+    if (at && (int)(at - s) < (int)sizeof(t->user)) { int n = (int)(at - s); for (int i = 0; i < n; ++i) t->user[i] = s[i]; t->user[n] = 0; }
+    const char* he = colon ? colon : s + str_len(s);
+    int hl = (int)(he - hs); if (hl <= 0 || hl >= (int)sizeof(t->host)) return 0;
+    for (int i = 0; i < hl; ++i) t->host[i] = hs[i]; t->host[hl] = 0;
+    if (colon) str_copy(t->path, colon + 1, sizeof(t->path));
+    t->has_host = 1; return 1;
+}
+
+static int ssh_prompt_connect(const SshTarget* t, int port, int strict, const char* who, int* sk_out)
+{
+    if (!net_ready()) { uart_puts(who); uart_puts(": network not ready\r\n"); return -1; }
+    int sk = tcp_open_any(t->host, port, 6000U, who, 0);
+    if (sk < 0) { uart_puts(who); uart_puts(": connection failed\r\n"); return -1; }
+    char user[48]; str_copy(user, t->user[0] ? t->user : security_username(), sizeof(user));
+    char pw[128];
+    uart_puts(user); uart_putc('@'); uart_puts(t->host); uart_puts("'s password: ");
+    if (security_read_password(pw, sizeof(pw)) < 0) { net_tcp_close(0, sk); uart_puts("\r\n"); return -1; }
+    SshOpts o; o.host = t->host; o.port = (uint32_t)port; o.user = user; o.password = pw; o.strict = strict;
+    int rc = ssh_connect(sk, &o);
+    for (int i = 0; i < (int)sizeof(pw); ++i) pw[i] = 0;
+    if (rc != 0) { uart_puts(who); uart_puts(": "); uart_puts(ssh_error()); uart_puts("\r\n"); net_tcp_close(0, sk); return -1; }
+    *sk_out = sk; return 0;
+}
+
+static int ssh_parse_o(const char* opt, int* strict)
+{
+    if (opt[0] == 'S' && str_equal(opt, "StrictHostKeyChecking=yes")) { *strict = 1; return 1; }
+    if (str_equal(opt, "StrictHostKeyChecking=no")) { *strict = 2; return 1; }
+    if (str_equal(opt, "StrictHostKeyChecking=accept-new") || str_equal(opt, "StrictHostKeyChecking=ask")) { *strict = 0; return 1; }
+    return 0;
+}
+
+static void command_ssh(const char* argument)
+{
+    char buf[400]; str_copy(buf, argument ? argument : "", sizeof(buf));
+    char* w[24]; int n = split_words(buf, w, 24);
+    int port = 22, strict = 0, force_tty = 0, no_tty = 0, i = 0;
+    for (; i < n && w[i][0] == '-' && w[i][1]; ++i)
+    {
+        if (str_equal(w[i], "-p") && i + 1 < n) port = parse_uint(w[++i], -1);
+        else if (str_equal(w[i], "-t")) force_tty = 1;
+        else if (str_equal(w[i], "-T")) no_tty = 1;
+        else if (str_equal(w[i], "-o") && i + 1 < n) { if (!ssh_parse_o(w[++i], &strict)) { uart_puts("ssh: unsupported option "); uart_puts(w[i]); uart_puts("\r\n"); return; } }
+        else if (str_equal(w[i], "-R") && i + 1 < n)
+        {
+            SshTarget t; if (!ssh_split_target(w[i + 1], &t, 0)) { uart_puts("ssh: bad host\r\n"); return; }
+            if (ssh_forget_host(t.host, (uint32_t)port) == 0) { uart_puts("ssh: removed host key of "); uart_puts(t.host); uart_puts("\r\n"); } else uart_puts("ssh: no host key stored for that host\r\n");
+            return;
+        }
+        else { i = -1; break; }
+    }
+    if (i < 0 || i >= n || port <= 0 || port > 65535) { uart_puts("usage: ssh [-p port] [-t|-T] [-o StrictHostKeyChecking=yes|no|accept-new] [user@]host [command]\r\n       ssh -R [-p port] host      (forget a stored host key)\r\n"); return; }
+    SshTarget t; if (!ssh_split_target(w[i], &t, 0)) { uart_puts("ssh: bad host\r\n"); return; }
+    /* the command is everything after the host word, kept verbatim */
+    char cmd[300]; cmd[0] = 0;
+    for (int k = i + 1; k < n; ++k) { if (cmd[0]) str_copy(cmd + str_len(cmd), " ", 2); str_copy(cmd + str_len(cmd), w[k], (int)sizeof(cmd) - str_len(cmd)); }
+    int sk;
+    if (ssh_prompt_connect(&t, port, strict, "ssh", &sk) != 0) return;
+    int pty = cmd[0] ? force_tty : !no_tty;
+    if (ssh_open_channel(cmd[0] ? cmd : 0, pty) != 0) { uart_puts("ssh: "); uart_puts(ssh_error()); uart_puts("\r\n"); ssh_close(); return; }
+    ctrl_break_seen = 0;
+    uint8_t rb[1024]; int fin = 0; int line_start = 1; int tilde = 0; int aborted = 0;
+    while (!fin)
+    {
+        if (cmd[0]) { uart_poll_job_keys(ctrl_break_filter); if (ctrl_break_seen) { aborted = 1; break; } }
+        else
+        {
+            int c;
+            while ((c = uart_try_getc()) >= 0)
+            {
+                if (line_start && c == '~') { tilde = 1; line_start = 0; continue; }
+                if (tilde) { tilde = 0; if (c == '.') { fin = 2; break; } uint8_t t2 = '~'; ssh_send(&t2, 1); }
+                uint8_t ch = (uint8_t)c; if (ssh_send(&ch, 1) != 0) { fin = 1; break; }
+                line_start = (c == '\r' || c == '\n');
+            }
+            if (fin) break;
+        }
+        int g = ssh_recv(rb, sizeof(rb), 40U);
+        if (g == 0) break;
+        if (g == -2) { uart_puts("\r\nssh: "); uart_puts(ssh_error()); uart_puts("\r\n"); fin = 1; break; }
+        if (g < 0) continue;
+        for (int k = 0; k < g; ++k)
+        {
+            if (!pty && rb[k] == '\n') uart_putc('\r');
+            if (!pty && rb[k] == '\r') continue;
+            uart_putc((char)rb[k]);
+        }
+    }
+    int st = ssh_exit_status();
+    ssh_close();
+    if (aborted) { uart_puts("\r\nssh: interrupted\r\n"); script_set_status(130); }
+    else if (fin == 2) { uart_puts("\r\nConnection to "); uart_puts(t.host); uart_puts(" closed.\r\n"); script_set_status(0); }
+    else if (cmd[0] || st > 0) script_set_status(st < 0 ? 0 : st);
+    else { uart_puts("\r\nConnection to "); uart_puts(t.host); uart_puts(" closed.\r\n"); }
+}
+
+/* scp helpers */
+static int scp_read_exact(uint8_t* b, uint32_t n)
+{
+    uint32_t got = 0; uint64_t t0 = timer_millis();
+    while (got < n)
+    {
+        uart_poll_job_keys(ctrl_break_filter); if (ctrl_break_seen) return -1;
+        int r = ssh_recv(b + got, n - got, 200U);
+        if (r == 0 || r == -2) return -1;
+        if (r < 0) { if (timer_millis() - t0 > 30000) return -1; continue; }
+        got += (uint32_t)r; t0 = timer_millis();
+    }
+    return 0;
+}
+static int scp_ack(const char* who)           /* 0 ok, <0 failed */
+{
+    uint8_t c; if (scp_read_exact(&c, 1) != 0) { uart_puts(who); uart_puts(": lost connection\r\n"); return -1; }
+    if (c == 0) return 0;
+    char msg[160]; int m = 0; uint8_t d;
+    while (m < 150 && scp_read_exact(&d, 1) == 0 && d != '\n') msg[m++] = (char)d;
+    msg[m] = 0; uart_puts(who); uart_puts(": remote: "); uart_puts(msg); uart_puts("\r\n");
+    return -1;
+}
+static int scp_readline(char* out, int cap)
+{
+    int n = 0; uint8_t c;
+    for (;;) { if (scp_read_exact(&c, 1) != 0) return -1; if (c == '\n') break; if (n < cap - 1) out[n++] = (char)c; }
+    out[n] = 0; return n;
+}
+static void scp_octal(uint32_t v, char* out) { out[0] = (char)('0' + ((v >> 9) & 7)); out[1] = (char)('0' + ((v >> 6) & 7)); out[2] = (char)('0' + ((v >> 3) & 7)); out[3] = (char)('0' + (v & 7)); out[4] = 0; }
+static void scp_quote(const char* in, char* out, int cap)
+{
+    int n = 0; out[n++] = '\'';
+    for (; *in && n < cap - 6; ++in) { if (*in == '\'') { out[n++] = '\''; out[n++] = '\\'; out[n++] = '\''; out[n++] = '\''; } else out[n++] = *in; }
+    out[n++] = '\''; out[n] = 0;
+}
+static void scp_report(const char* name, uint64_t size, int quiet)
+{
+    if (quiet) return;
+    uart_puts(name); uart_puts("   100%   "); print_u64(size); uart_puts(" bytes\r\n");
+}
+
+static int scp_send_path(const char* path, int recursive, int quiet, int depth)
+{
+    FsStat st; if (fs_stat_path(path, vfs_cwd(), &st) != 0) { uart_puts("scp: "); uart_puts(path); uart_puts(": no such file or directory\r\n"); return -1; }
+    int id = fs_resolve(path, vfs_cwd());
+    const char* base = id >= 0 ? fs_get_name(id) : path; if (!base || !base[0]) base = "file";
+    char name[100]; str_copy(name, base, sizeof(name));
+    char mode[6]; scp_octal(st.mode & 0777U, mode);
+    char hdr[220]; int h = 0;
+    if (st.type == FS_DIR)
+    {
+        if (!recursive) { uart_puts("scp: "); uart_puts(path); uart_puts(": not a regular file (use -r)\r\n"); return -1; }
+        if (depth > 8) { uart_puts("scp: directory tree too deep\r\n"); return -1; }
+        hdr[h++] = 'D'; for (int i = 0; i < 4; ++i) hdr[h++] = mode[i]; hdr[h++] = ' '; hdr[h++] = '0'; hdr[h++] = ' ';
+        for (const char* p = name; *p; ++p) hdr[h++] = *p; hdr[h++] = '\n';
+        if (ssh_send((const uint8_t*)hdr, (uint32_t)h) != 0 || scp_ack("scp") != 0) return -1;
+        int cnt = fs_get_child_count(id);
+        for (int k = 0; k < cnt; ++k)
+        {
+            int c = fs_get_child(id, k); if (c < 0) continue;
+            char sub[300]; str_copy(sub, path, sizeof(sub)); int l = str_len(sub); if (l && sub[l - 1] != '/') { sub[l++] = '/'; sub[l] = 0; }
+            str_copy(sub + l, fs_get_name(c), (int)sizeof(sub) - l);
+            if (scp_send_path(sub, recursive, quiet, depth + 1) != 0) return -1;
+        }
+        if (ssh_send((const uint8_t*)"E\n", 2) != 0 || scp_ack("scp") != 0) return -1;
+        return 0;
+    }
+    if (st.type != FS_FILE) { uart_puts("scp: "); uart_puts(path); uart_puts(": not a regular file\r\n"); return -1; }
+    uint8_t* data = (uint8_t*)kmalloc(st.size + 1);
+    if (!data) { uart_puts("scp: out of memory\r\n"); return -1; }
+    uint64_t got = 0;
+    if (fs_read_file(path, vfs_cwd(), data, st.size, &got) != 0) { uart_puts("scp: cannot read "); uart_puts(path); uart_puts("\r\n"); kfree(data); return -1; }
+    hdr[h++] = 'C'; for (int i = 0; i < 4; ++i) hdr[h++] = mode[i]; hdr[h++] = ' ';
+    { char num[24]; int nn = 0; uint64_t v = got; char rev[24]; int rn = 0; do { rev[rn++] = (char)('0' + v % 10); v /= 10; } while (v); while (rn) num[nn++] = rev[--rn]; for (int i = 0; i < nn; ++i) hdr[h++] = num[i]; }
+    hdr[h++] = ' '; for (const char* p = name; *p; ++p) hdr[h++] = *p; hdr[h++] = '\n';
+    int rc = 0;
+    if (ssh_send((const uint8_t*)hdr, (uint32_t)h) != 0 || scp_ack("scp") != 0) rc = -1;
+    if (!rc && got) { /* send in slices so Ctrl-C and window updates stay responsive */
+        for (uint64_t off = 0; off < got && !rc; ) { uint32_t n = (uint32_t)(got - off > 16384 ? 16384 : got - off); if (ssh_send(data + off, n) != 0) rc = -1; off += n; uart_poll_job_keys(ctrl_break_filter); if (ctrl_break_seen) rc = -1; } }
+    if (!rc) { uint8_t z = 0; if (ssh_send(&z, 1) != 0 || scp_ack("scp") != 0) rc = -1; }
+    kfree(data);
+    if (!rc) scp_report(name, got, quiet);
+    return rc;
+}
+
+static int scp_parse_c(const char* line, uint32_t* mode, uint64_t* size, const char** name)
+{
+    const char* p = line + 1; uint32_t m = 0;
+    while (*p >= '0' && *p <= '7') m = m * 8 + (uint32_t)(*p++ - '0');
+    if (*p++ != ' ') return -1;
+    uint64_t sz = 0; if (*p < '0' || *p > '9') return -1;
+    while (*p >= '0' && *p <= '9') sz = sz * 10 + (uint64_t)(*p++ - '0');
+    if (*p++ != ' ' || !*p) return -1;
+    *mode = m; *size = sz; *name = p; return 0;
+}
+static int scp_safe_name(const char* n)
+{
+    if (!n[0] || str_equal(n, ".") || str_equal(n, "..")) return 0;
+    for (; *n; ++n) if (*n == '/') return 0;
+    return 1;
+}
+
+static int scp_receive(const char* dst, int recursive, int quiet)
+{
+    char dirs[10][300]; int depth = 0;
+    FsStat ds; int dst_is_dir = fs_stat_path(dst, vfs_cwd(), &ds) == 0 && ds.type == FS_DIR;
+    str_copy(dirs[0], dst, sizeof(dirs[0]));
+    uint8_t z = 0; if (ssh_send(&z, 1) != 0) return -1;
+    int files = 0; char line[400];
+    for (;;)
+    {
+        uint8_t c; uint64_t t0 = timer_millis(); int r;
+        for (;;)
+        {
+            uart_poll_job_keys(ctrl_break_filter); if (ctrl_break_seen) return -1;
+            r = ssh_recv(&c, 1, 200U);
+            if (r != -1) break;
+            if (timer_millis() - t0 > 30000) { uart_puts("scp: timeout\r\n"); return -1; }
+        }
+        if (r <= 0) return files ? 0 : (uart_puts("scp: no data from the server\r\n"), -1);
+        if (c == 0x01 || c == 0x02) { char msg[160]; int m = 0; uint8_t d; while (m < 150 && scp_read_exact(&d, 1) == 0 && d != '\n') msg[m++] = (char)d; msg[m] = 0; uart_puts("scp: remote: "); uart_puts(msg); uart_puts("\r\n"); return -1; }
+        line[0] = (char)c;
+        if (scp_readline(line + 1, (int)sizeof(line) - 1) < 0) return -1;
+        if (c == 'T') { if (ssh_send(&z, 1) != 0) return -1; continue; }
+        if (c == 'E') { if (depth > 0) --depth; if (ssh_send(&z, 1) != 0) return -1; if (depth == 0 && recursive) { /* wait for the remote to finish */ } continue; }
+        if (c != 'C' && c != 'D') { uart_puts("scp: protocol error\r\n"); return -1; }
+        uint32_t mode; uint64_t size; const char* name;
+        if (scp_parse_c(line, &mode, &size, &name) != 0 || !scp_safe_name(name)) { uart_puts("scp: unsafe or malformed name from the server\r\n"); return -1; }
+        char target[320];
+        if (depth == 0 && !dst_is_dir) str_copy(target, dirs[0], sizeof(target));       /* new name for the file / top directory */
+        else { str_copy(target, dirs[depth], sizeof(target)); int l = str_len(target); if (l && target[l - 1] != '/') { target[l++] = '/'; target[l] = 0; } str_copy(target + l, name, (int)sizeof(target) - l); }
+        if (c == 'D')
+        {
+            if (!recursive) { uart_puts("scp: server sent a directory (use -r)\r\n"); return -1; }
+            if (depth >= 9) { uart_puts("scp: directory tree too deep\r\n"); return -1; }
+            FsStat s2; int exists = fs_stat_path(target, vfs_cwd(), &s2) == 0;
+            if (!exists && fs_mkdir(target, vfs_cwd()) < 0) { uart_puts("scp: cannot create directory "); uart_puts(target); uart_puts("\r\n"); return -1; }
+            ++depth; str_copy(dirs[depth], target, sizeof(dirs[depth]));
+            if (ssh_send(&z, 1) != 0) return -1;
+            continue;
+        }
+        if (size > 4U * 1024U * 1024U) { uart_puts("scp: file too large for this file system (4 MiB limit)\r\n"); return -1; }
+        uint8_t* data = (uint8_t*)kmalloc(size + 1);
+        if (!data) { uart_puts("scp: out of memory\r\n"); return -1; }
+        if (ssh_send(&z, 1) != 0) { kfree(data); return -1; }
+        if (size && scp_read_exact(data, (uint32_t)size) != 0) { uart_puts("scp: transfer interrupted\r\n"); kfree(data); return -1; }
+        uint8_t fin; if (scp_read_exact(&fin, 1) != 0 || fin != 0) { uart_puts("scp: transfer failed\r\n"); kfree(data); return -1; }
+        int wr = fs_write_data(target, vfs_cwd(), data, size);
+        kfree(data);
+        if (wr < 0) { uart_puts("scp: cannot write "); uart_puts(target); uart_puts("\r\n"); return -1; }
+        (void)fs_set_mode_path(target, vfs_cwd(), mode & 0777U);
+        if (ssh_send(&z, 1) != 0) return -1;
+        ++files; scp_report(name, size, quiet);
+    }
+}
+
+static void command_scp(const char* argument)
+{
+    char buf[500]; str_copy(buf, argument ? argument : "", sizeof(buf));
+    char* w[16]; int n = split_words(buf, w, 16);
+    int port = 22, recursive = 0, quiet = 0, strict = 0, i = 0;
+    for (; i < n && w[i][0] == '-' && w[i][1]; ++i)
+    {
+        if (str_equal(w[i], "-P") && i + 1 < n) port = parse_uint(w[++i], -1);
+        else if (str_equal(w[i], "-r")) recursive = 1;
+        else if (str_equal(w[i], "-q")) quiet = 1;
+        else if (str_equal(w[i], "-o") && i + 1 < n) { if (!ssh_parse_o(w[++i], &strict)) { uart_puts("scp: unsupported option "); uart_puts(w[i]); uart_puts("\r\n"); return; } }
+        else { i = -1; break; }
+    }
+    if (i < 0 || n - i != 2 || port <= 0 || port > 65535) { uart_puts("usage: scp [-P port] [-r] [-q] [-o StrictHostKeyChecking=...] <src> <dst>   (exactly one of them is [user@]host:path)\r\n"); return; }
+    SshTarget a, b; int ra = ssh_split_target(w[i], &a, 1), rb = ssh_split_target(w[i + 1], &b, 1);
+    if (ra == rb) { uart_puts("scp: exactly one of source and destination must be remote ([user@]host:path)\r\n"); return; }
+    const SshTarget* rem = ra ? &a : &b; const char* local = ra ? w[i + 1] : w[i];
+    int sk; if (ssh_prompt_connect(rem, port, strict, "scp", &sk) != 0) return;
+    char qp[260]; scp_quote(rem->path[0] ? rem->path : ".", qp, sizeof(qp));
+    char cmd[300]; str_copy(cmd, ra ? "scp -f " : "scp -t ", sizeof(cmd)); if (recursive) str_copy(cmd + str_len(cmd), "-r ", 4); str_copy(cmd + str_len(cmd), qp, (int)sizeof(cmd) - str_len(cmd));
+    if (ssh_open_channel(cmd, 0) != 0) { uart_puts("scp: "); uart_puts(ssh_error()); uart_puts("\r\n"); ssh_close(); return; }
+    ctrl_break_seen = 0; int rc;
+    if (ra) rc = scp_receive(local, recursive, quiet);
+    else
+    {
+        rc = scp_ack("scp");
+        if (rc == 0) rc = scp_send_path(local, recursive, quiet, 0);
+    }
+    if (ctrl_break_seen) uart_puts("scp: interrupted\r\n");
+    ssh_send_eof(); ssh_close();
+    script_set_status(rc == 0 ? 0 : 1);
+}
+
 static void command_curl(const char* argument)
 {
     char line[600]; str_copy(line, argument ? argument : "", sizeof(line));
     char* w[24]; int n = cw_tokens(line, w, 24);
     int silent = 0, show_hdr = 0, head = 0, follow = 0; const char* outfile = 0; const char* method = 0; const char* data = 0; const char* url = 0;
     char hdrs[400]; hdrs[0] = 0;
+    g_tls_insecure = 0; g_tls_cacert[0] = 0;
     for (int i = 0; i < n; ++i)
     {
+        if (w[i][0] == '-' && w[i][1] && w[i][1] != '-' && w[i][2])            /* clustered flags: -sk, -sI, -sL ... */
+        {
+            int all_flags = 1; for (const char* q = w[i] + 1; *q; ++q) if (*q != 's' && *q != 'k' && *q != 'i' && *q != 'I' && *q != 'L') all_flags = 0;
+            if (all_flags)
+            {
+                for (const char* q = w[i] + 1; *q; ++q)
+                {
+                    if (*q == 's') silent = 1; else if (*q == 'k') g_tls_insecure = 1; else if (*q == 'i') show_hdr = 1;
+                    else if (*q == 'I') { head = 1; show_hdr = 1; } else follow = 1;
+                }
+                continue;
+            }
+        }
         if (str_equal(w[i], "-s")) silent = 1;
+        else if (str_equal(w[i], "-k") || str_equal(w[i], "--insecure")) g_tls_insecure = 1;
+        else if (str_equal(w[i], "--cacert") && i + 1 < n) str_copy(g_tls_cacert, w[++i], sizeof(g_tls_cacert));
         else if (str_equal(w[i], "-i")) show_hdr = 1;
         else if (str_equal(w[i], "-I")) { head = 1; show_hdr = 1; }
         else if (str_equal(w[i], "-L")) follow = 1;
@@ -3713,7 +4127,7 @@ static void command_curl(const char* argument)
         else if (!url) url = w[i];
         else { uart_puts("curl: only one URL is supported\r\n"); return; }
     }
-    if (!url) { uart_puts("usage: curl [-s] [-i|-I] [-L] [-o file] [-X METHOD] [-H 'K: V'] [-d data] <url>\r\n"); return; }
+    if (!url) { uart_puts("usage: curl [-s] [-k] [--cacert file] [-i|-I] [-L] [-o file] [-X METHOD] [-H 'K: V'] [-d data] <url>\r\n"); return; }
     if (!net_ready()) { uart_puts("curl: network not ready\r\n"); return; }
     if (!method) method = head ? "HEAD" : (data ? "POST" : "GET");
     char host[96], path[200]; int port, tls, next; char* uw[1] = { (char*)url };
@@ -4270,10 +4684,14 @@ static void execute_command_inner(
     if (str_equal(command, "wget")) { command_wget(argument); return; }
     if (str_equal(command, "curl")) { command_curl(argument); return; }
     if (str_equal(command, "ntpdate")) { command_ntpdate(argument); return; }
+    if (str_equal(command, "certs")) { command_certs(argument); return; }
+    if (str_equal(command, "ssh")) { command_ssh(argument); return; }
+    if (str_equal(command, "scp")) { command_scp(argument); return; }
     if (str_equal(command, "fw")) { command_fw(argument); return; }
     if (str_equal(command, "httpsget")) { command_httpsget(argument); return; }
     if (str_equal(command, "ping6")) { command_ping6(argument); return; }
     if (str_equal(command, "httpd")) { command_httpd(argument); return; }
+    if (str_equal(command, "ftpd")) { command_ftpd(argument); return; }
     if (str_equal(command, "lspci")) { command_lspci(); return; }
     if (str_equal(command, "usb")) { command_usb(argument); return; }
     if (str_equal(command, "nvme")) { command_nvme(argument); return; }

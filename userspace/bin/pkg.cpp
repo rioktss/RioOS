@@ -1,3 +1,27 @@
+/*
+ * MIT License
+ *
+ * Copyright (c) 2026 Rio okta kusuma
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files, to deal in the Software
+ * without restriction, including without limitation the rights to use, copy,
+ * modify, merge, publish, distribute, sublicense, and/or sell copies of the
+ * Software, and to permit persons to whom the Software is furnished to do so,
+ * subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
 #include "tarlib.h"
 /* pkg: package manager for .rpk packages (ustar tar, optionally gzip, with a PKGINFO entry).
    pkg list | info <name|file.rpk> | files <name> | install [-f] <file.rpk|name>... | remove [-f] <name>... | upgrade
@@ -36,6 +60,7 @@ static int vercmp(const char* a, const char* b)
         if (x != y) return x < y ? -1 : 1;
         if (*a == '.' || *a == '-') ++a; if (*b == '.' || *b == '-') ++b;
         if (*a && !(*a >= '0' && *a <= '9') && *a != '.') { if (*b == *a) { ++a; ++b; continue; } return *a < *b ? -1 : 1; }
+        if (*b && !(*b >= '0' && *b <= '9') && *b != '.') return *a < *b ? -1 : 1;   /* never loop on a trailing non-numeric part */
     }
     return 0;
 }
@@ -121,6 +146,114 @@ static int repo_find(const char* name, char* out, size_t cap)
         { if (!found || vercmp(nm + nl + 1, best + nl + 1) > 0) { strncpy(best, nm, sizeof(best) - 1); best[sizeof(best) - 1] = 0; } found = 1; }
     }
     free(b); if (found) snprintf(out, cap, REPO "/%s", best); return found;
+}
+
+/* ---- network repositories --------------------------------------------------------------
+   /etc/pkg/remotes : one repository per line: "<url> [-k] [--cacert <file>]"   (url = http[s]://host[:port]/dir)
+   <url>/INDEX      : lines "name version file.rpk sha256hex | description"   (made by 'pkg mkindex <dir>')
+   /var/lib/pkg/REMOTE : merged, validated copy written by 'pkg update' ("name version file sha256 N | desc", N = remote number)
+   Every download is checked against the sha256 of the index; HTTPS certificates are verified (kernel TLS) unless -k. */
+#define REMOTES "/etc/pkg/remotes"
+#define RIDX DB "/REMOTE"
+#define NET_MAX (1024 * 1024)
+struct Remote { char url[200]; int insecure; char ca[100]; };
+static int remotes_load(Remote* r, int max)
+{
+    FILE* f = fopen(REMOTES, "r"); if (!f) return 0; int n = 0; char ln[400];
+    while (n < max && fgets(ln, sizeof(ln), f))
+    {
+        trim_line(ln); size_t l = strlen(ln); while (l && ln[l - 1] == '\n') ln[--l] = 0; trim_line(ln);
+        char* tok = strtok(ln, " "); if (!tok || tok[0] == '#') continue;
+        memset(&r[n], 0, sizeof(Remote)); strncpy(r[n].url, tok, sizeof(r[n].url) - 1);
+        while ((tok = strtok(0, " ")))
+        {
+            if (!strcmp(tok, "-k")) r[n].insecure = 1;
+            else if (!strcmp(tok, "--cacert") && (tok = strtok(0, " "))) strncpy(r[n].ca, tok, sizeof(r[n].ca) - 1);
+        }
+        ++n;
+    }
+    fclose(f); return n;
+}
+static int remotes_save(const Remote* r, int n)
+{
+    mkdirs_abs("/etc/pkg"); FILE* f = fopen(REMOTES, "w"); if (!f) return -1;
+    for (int i = 0; i < n; ++i) { fprintf(f, "%s", r[i].url); if (r[i].insecure) fprintf(f, " -k"); if (r[i].ca[0]) fprintf(f, " --cacert %s", r[i].ca); fprintf(f, "\n"); }
+    fclose(f); return 0;
+}
+static int url_ok(const char* u) { return !strncmp(u, "http://", 7) || !strncmp(u, "https://", 8); }
+static int is_sha(const char* h) { if (strlen(h) != 64) return 0; for (int i = 0; i < 64; ++i) if (!isxdigit((unsigned char)h[i]) || isupper((unsigned char)h[i])) return 0; return 1; }
+static void to_hex(const unsigned char* d, char* o) { static const char* x = "0123456789abcdef"; for (int i = 0; i < 32; ++i) { o[2 * i] = x[d[i] >> 4]; o[2 * i + 1] = x[d[i] & 15]; } o[64] = 0; }
+static int safe_file(const char* n) { size_t l = strlen(n); if (l < 5 || l > 90 || strcmp(n + l - 4, ".rpk") || strstr(n, "..")) return 0; for (; *n; ++n) if (!(islower((unsigned char)*n) || isdigit((unsigned char)*n) || *n == '-' || *n == '_' || *n == '.' || *n == '+')) return 0; return 1; }
+static void join_url(const Remote* r, const char* file, char* out, size_t cap)
+{ size_t l = strlen(r->url); while (l && r->url[l - 1] == '/') --l; snprintf(out, cap, "%.*s/%s", (int)l, r->url, file); }
+static long remote_get(const Remote* r, const char* file, unsigned char* buf, size_t cap)
+{ char u[320]; join_url(r, file, u, sizeof(u)); return http_get(u, buf, cap, r->insecure, r->ca[0] ? r->ca : 0); }
+
+static int remote_update(void)
+{
+    Remote rs[8]; int nr = remotes_load(rs, 8); if (!nr) return 0;
+    FILE* out = fopen(RIDX, "w"); if (!out) { printf("pkg: cannot write " RIDX "\n"); return 1; }
+    unsigned char* buf = (unsigned char*)malloc(NET_MAX + 1); int rc = 0, total = 0;
+    for (int i = 0; i < nr; ++i)
+    {
+        long n = remote_get(&rs[i], "INDEX", buf, 262144);
+        if (n < 0) { printf("pkg: %s: cannot fetch INDEX (%s)\n", rs[i].url, errno == ENOENT ? "not found" : errno == EIO ? "connection or TLS verification failed" : "error"); rc = 1; continue; }
+        buf[n] = 0; int cnt = 0;
+        for (char* ln = (char*)buf; *ln;)
+        {
+            char* e = ln; while (*e && *e != '\n') ++e; if (*e) *e++ = 0; char* cur = ln; ln = e; trim_line(cur);
+            char name[64], ver[32], file[100], sha[80];
+            if (!cur[0] || cur[0] == '#') continue;
+            char* bar = strstr(cur, " | "); char desc[160]; desc[0] = 0; if (bar) { *bar = 0; strncpy(desc, bar + 3, sizeof(desc) - 1); desc[sizeof(desc) - 1] = 0; }
+            if (sscanf(cur, "%63s %31s %99s %79s", name, ver, file, sha) != 4 || !valid_name(name) || !safe_file(file) || !is_sha(sha)) { printf("pkg: %s: ignoring bad INDEX line\n", rs[i].url); continue; }
+            fprintf(out, "%s %s %s %s %d | %s\n", name, ver, file, sha, i, desc); ++cnt;
+        }
+        printf("%s: %d package(s)\n", rs[i].url, cnt); total += cnt;
+    }
+    fclose(out); free(buf); printf("remote index updated: %d package(s) from %d repositor%s\n", total, nr, nr == 1 ? "y" : "ies"); return rc;
+}
+/* best (highest version) entry of 'name' in the remote index */
+static int remote_best(const char* name, char* ver, char* file, char* sha, int* ri)
+{
+    FILE* f = fopen(RIDX, "r"); if (!f) return 0; char ln[400]; int found = 0;
+    while (fgets(ln, sizeof(ln), f))
+    {
+        char n[64], v[32], fl[100], h[80]; int r;
+        if (sscanf(ln, "%63s %31s %99s %79s %d", n, v, fl, h, &r) != 5 || strcmp(n, name)) continue;
+        if (!found || vercmp(v, ver) > 0) { strcpy(ver, v); strcpy(file, fl); strcpy(sha, h); *ri = r; found = 1; }
+    }
+    fclose(f); return found;
+}
+/* download + verify + store in the local repository; returns 1 with the path in out */
+static int remote_fetch(const char* name, char* out, size_t cap)
+{
+    char ver[32], file[100], sha[80]; int ri; ver[0] = 0;
+    if (!remote_best(name, ver, file, sha, &ri)) return 0;
+    Remote rs[8]; int nr = remotes_load(rs, 8); if (ri < 0 || ri >= nr) { printf("pkg: remote list changed, run 'pkg update'\n"); return 0; }
+    unsigned char* buf = (unsigned char*)malloc(NET_MAX); printf("downloading %s %s from %s ...\n", name, ver, rs[ri].url);
+    long n = remote_get(&rs[ri], file, buf, NET_MAX);
+    if (n < 0) { printf("pkg: download of %s failed (%s)\n", file, errno == ENOENT ? "not found on the server" : errno == EFBIG ? "package larger than 1 MB" : "connection or TLS verification failed"); free(buf); return 0; }
+    unsigned char dg[32]; char hx[65]; sha256_buf(buf, (size_t)n, dg); to_hex(dg, hx);
+    if (strcmp(hx, sha)) { printf("pkg: CHECKSUM MISMATCH for %s (index %s, got %s): package rejected\n", file, sha, hx); free(buf); return 0; }
+    snprintf(out, cap, REPO "/%s", file); FILE* f = fopen(out, "w");
+    if (!f || fwrite(buf, 1, (size_t)n, f) != (size_t)n) { printf("pkg: cannot store %s\n", out); if (f) fclose(f); free(buf); return 0; }
+    fclose(f); free(buf); printf("verified sha256 %.16s... (%ld bytes)\n", hx, n); return 1;
+}
+/* local repository first, then the network */
+static int repo_find_net(const char* name, char* out, size_t cap)
+{
+    if (repo_find(name, out, cap))
+    {   /* a newer package may exist remotely */
+        char ver[32], file[100], sha[80]; int ri; ver[0] = 0;
+        if (remote_best(name, ver, file, sha, &ri))
+        {
+            char lp[256]; snprintf(lp, sizeof(lp), "%s", out); const char* b = strrchr(lp, '/'); b = b ? b + 1 : lp; size_t nl = strlen(name);
+            char lv[48]; lv[0] = 0; if (!strncmp(b, name, nl) && b[nl] == '-') { strncpy(lv, b + nl + 1, sizeof(lv) - 1); lv[sizeof(lv) - 1] = 0; size_t ll = strlen(lv); if (ll > 4 && !strcmp(lv + ll - 4, ".rpk")) lv[ll - 4] = 0; }
+            if (lv[0] && vercmp(ver, lv) > 0) { char np[256]; if (remote_fetch(name, np, sizeof(np))) { snprintf(out, cap, "%s", np); return 1; } }
+        }
+        return 1;
+    }
+    return remote_fetch(name, out, cap);
 }
 static int owner_of(const char* path, char* owner, size_t cap)
 {
@@ -208,8 +341,8 @@ static int do_install(const char* arg, int depth, int is_dep)
     if (depth > 8) { printf("pkg: dependency chain too deep\n"); return 1; }
     char path[256]; int via_repo = 0;
     if (strchr(arg, '/') || (strlen(arg) > 4 && !strcmp(arg + strlen(arg) - 4, ".rpk"))) snprintf(path, sizeof(path), "%s", arg);
-    else if (repo_find(arg, path, sizeof(path))) via_repo = 1;
-    else { printf("pkg: package '%s' not found in " REPO "\n", arg); return 1; }
+    else if (repo_find_net(arg, path, sizeof(path))) via_repo = 1;
+    else { printf("pkg: package '%s' not found in " REPO " or on any remote (try 'pkg update')\n", arg); return 1; }
     unsigned long an; unsigned char* a = open_pkg(path, &an); if (!a) { printf("pkg: cannot read package %s\n", path); return 1; }
     char text[4096]; Info in;
     if (pkg_info_from(a, an, &in, text, sizeof(text)) || !valid_name(in.name) || !in.version[0]) { printf("pkg: %s: missing or invalid PKGINFO (need name and version)\n", path); free(a); return 1; }
@@ -226,7 +359,7 @@ static int do_install(const char* arg, int depth, int is_dep)
     {
         char by[64]; if (satisfied(&d, by, sizeof(by))) continue;
         if (!valid_name(d.name)) { printf("pkg: bad dependency '%s'\n", d.name); free(a); return 1; }
-        char rp[256]; if (repo_find(d.name, rp, sizeof(rp)))
+        char rp[256]; if (repo_find_net(d.name, rp, sizeof(rp)))
         { printf("installing dependency %s for %s\n", d.name, in.name); if (do_install(d.name, depth + 1, 1)) { free(a); return 1; } if (satisfied(&d, by, sizeof(by))) continue; }
         printf("pkg: %s needs %s%s%s which is not installed and not in the repository\n", in.name, d.name, d.op[0] ? d.op : "", d.ver); free(a); return 1;
     }
@@ -293,7 +426,8 @@ static void usage()
            "  install [-f] <file|name>  install (name = from " REPO "); dependencies are installed automatically\n  remove [-f] <name>        uninstall (refuses when other packages need it)\n"
            "  upgrade                   upgrade installed packages to newer versions found in " REPO "\n  search <text>             search installed and repository packages\n"
            "  verify [name]             check installed files against recorded size/CRC\n  owner <path>              which package owns a file\n"
-           "  build [-z] <dir> <out>    build a package from <dir> (must hold PKGINFO)\n  update                    rebuild the repository index (" DB "/INDEX)\n"
+           "  build [-z] <dir> <out>    build a package from <dir> (must hold PKGINFO)\n  update                    rebuild the local index (" DB "/INDEX) and fetch the indexes of all remotes\n"
+           "  remote add <url> [-k] [--cacert <file>] | remove <url> | list     network repositories (http:// or https://, checksummed)\n  mkindex <dir>             write <dir>/INDEX (with sha256) for the .rpk files in <dir>, to serve over HTTP(S)\n"
            "PKGINFO: name=  version=  desc=  depends=a,b>=1.0  conflicts=  provides=\n");
 }
 int main(int argc, char** argv)
@@ -338,7 +472,7 @@ int main(int argc, char** argv)
         for (char* ln = names; *ln;)
         {
             char* nl = ln; while (*nl && *nl != '\n') ++nl; if (*nl) *nl++ = 0; Info cur; char rp[256];
-            if (installed(ln, &cur) && repo_find(ln, rp, sizeof(rp)))
+            if (installed(ln, &cur) && repo_find_net(ln, rp, sizeof(rp)))
             { unsigned long an; unsigned char* a = open_pkg(rp, &an); Info n2; char tx[4096]; if (a && !pkg_info_from(a, an, &n2, tx, sizeof(tx)) && vercmp(n2.version, cur.version) > 0) { printf("upgrading %s %s -> %s\n", ln, cur.version, n2.version); if (do_install(rp, 0, 0)) rc = 1; ++up; } free(a); }
             ln = nl;
         }
@@ -359,7 +493,9 @@ int main(int argc, char** argv)
             if (a && !pkg_info_from(a, an, &in, tx, sizeof(tx)) && (strcasestr(in.name, term) || strcasestr(in.desc, term))) { Info cur; printf("[%s] %-18s %-8s %s\n", installed(in.name, &cur) ? "installed" : "available", in.name, in.version, in.desc); ++hits; }
             free(a);
         }
-        free(b); if (!hits) printf("no matches for '%s'\n", term); return hits ? 0 : 1;
+        free(b);
+        { FILE* rf = fopen(RIDX, "r"); char ln[400]; while (rf && fgets(ln, sizeof(ln), rf)) { char n[64], v[32], fl[100], h[80]; int r; if (sscanf(ln, "%63s %31s %99s %79s %d", n, v, fl, h, &r) != 5) continue; char* bar = strstr(ln, " | "); const char* ds = bar ? bar + 3 : ""; if (strcasestr(n, term) || strcasestr(ds, term)) { Info cur; printf("[%s] %-18s %-8s %s", installed(n, &cur) ? "installed" : "remote", n, v, ds); if (!bar || !strchr(ds, '\n')) printf("\n"); ++hits; } } if (rf) fclose(rf); }
+        if (!hits) printf("no matches for '%s'\n", term); return hits ? 0 : 1;
     }
     if (!strcmp(cmd, "owner"))
     {
@@ -403,6 +539,47 @@ int main(int argc, char** argv)
         FILE* f = fopen(out, "w"); if (!f || fwrite(o, 1, on, f) != on) { printf("pkg: cannot write %s\n", out); return 1; } fclose(f);
         printf("built %s %s -> %s (%d files, %lu bytes)\n", in.name, in.version, out, count, on); return errors ? 1 : 0;
     }
+    if (!strcmp(cmd, "remote"))
+    {
+        Remote rs[8]; int nr = remotes_load(rs, 8);
+        const char* sub = ai < argc ? argv[ai] : "list";
+        if (!strcmp(sub, "list")) { if (!nr) printf("no remotes (pkg remote add <url>)\n"); for (int i = 0; i < nr; ++i) printf("%d: %s%s%s%s\n", i, rs[i].url, rs[i].insecure ? "  [certificate NOT verified]" : "", rs[i].ca[0] ? "  cacert " : "", rs[i].ca); return 0; }
+        if (!strcmp(sub, "add"))
+        {
+            if (ai + 1 >= argc) { usage(); return 2; } Remote nw; memset(&nw, 0, sizeof(nw));
+            if (!url_ok(argv[ai + 1]) || strlen(argv[ai + 1]) > 190) { printf("pkg: remote must be http://... or https://...\n"); return 1; }
+            strncpy(nw.url, argv[ai + 1], sizeof(nw.url) - 1);
+            for (int i = ai + 2; i < argc; ++i) { if (!strcmp(argv[i], "-k")) nw.insecure = 1; else if (!strcmp(argv[i], "--cacert") && i + 1 < argc) strncpy(nw.ca, argv[++i], sizeof(nw.ca) - 1); else { usage(); return 2; } }
+            for (int i = 0; i < nr; ++i) if (!strcmp(rs[i].url, nw.url)) { rs[i] = nw; remotes_save(rs, nr); printf("remote updated: %s\n", nw.url); return 0; }
+            if (nr >= 8) { printf("pkg: at most 8 remotes\n"); return 1; }
+            rs[nr++] = nw; if (remotes_save(rs, nr)) { printf("pkg: cannot write " REMOTES " (root needed)\n"); return 1; } printf("remote added: %s (run 'pkg update')\n", nw.url); return 0;
+        }
+        if (!strcmp(sub, "remove"))
+        {
+            if (ai + 1 >= argc) { usage(); return 2; } int k = -1; for (int i = 0; i < nr; ++i) if (!strcmp(rs[i].url, argv[ai + 1])) k = i;
+            if (k < 0) { printf("pkg: no such remote\n"); return 1; } for (int i = k; i + 1 < nr; ++i) rs[i] = rs[i + 1]; --nr;
+            if (remotes_save(rs, nr)) { printf("pkg: cannot write " REMOTES "\n"); return 1; } unlink(RIDX); printf("remote removed (run 'pkg update')\n"); return 0;
+        }
+        usage(); return 2;
+    }
+    if (!strcmp(cmd, "mkindex"))
+    {
+        if (ai >= argc) { usage(); return 2; } const char* dir = argv[ai];
+        char* b = (char*)malloc(65536); long n = readdir_text(dir, b, 65535); if (n < 0) { printf("pkg: cannot read %s\n", dir); return 1; } b[n] = 0;
+        char ip[300]; snprintf(ip, sizeof(ip), "%s/INDEX", dir); FILE* o = fopen(ip, "w"); if (!o) { printf("pkg: cannot write %s\n", ip); return 1; } int cnt = 0;
+        for (char* ln = b; *ln;)
+        {
+            char* e = ln; while (*e && *e != '\n') ++e; if (*e) *e++ = 0; char* nm = ln + 1; while (*nm == ' ') ++nm; while (*nm >= '0' && *nm <= '9') ++nm; while (*nm == ' ') ++nm; ln = e;
+            if (!safe_file(nm)) continue;
+            char path[400]; snprintf(path, sizeof(path), "%s/%s", dir, nm); unsigned long an; unsigned char* raw = tar_slurp(path, &an);
+            unsigned long pn; unsigned char* a = open_pkg(path, &pn); Info in; char tx[4096];
+            if (raw && a && !pkg_info_from(a, pn, &in, tx, sizeof(tx)) && valid_name(in.name) && in.version[0])
+            { unsigned char dg[32]; char hx[65]; sha256_buf(raw, an, dg); to_hex(dg, hx); fprintf(o, "%s %s %s %s | %s\n", in.name, in.version, nm, hx, in.desc); ++cnt; }
+            else printf("pkg: skipping unreadable %s\n", nm);
+            free(a); free(raw);
+        }
+        fclose(o); free(b); printf("wrote %s: %d package(s)\n", ip, cnt); return 0;
+    }
     if (!strcmp(cmd, "update"))
     {
         char* b = (char*)malloc(65536); long n = readdir_text(REPO, b, 65535); if (n < 0) n = 0; b[n] = 0;
@@ -419,7 +596,7 @@ int main(int argc, char** argv)
         qsort(lines, (size_t)nlines, sizeof(char*), cmp_names);
         FILE* f = fopen(DB "/INDEX", "w"); if (!f) { printf("pkg: cannot write index\n"); return 1; }
         for (int i = 0; i < nlines; ++i) { fwrite(lines[i], 1, strlen(lines[i]), f); fwrite("\n", 1, 1, f); free(lines[i]); }
-        fclose(f); free(b); printf("index updated: %d packages in " REPO "\n", nlines); return 0;
+        fclose(f); free(b); printf("index updated: %d packages in " REPO "\n", nlines); return remote_update();
     }
     printf("pkg: unknown command '%s'\n", cmd); usage(); return 2;
 }

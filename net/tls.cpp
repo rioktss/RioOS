@@ -1,4 +1,30 @@
+/*
+ * MIT License
+ *
+ * Copyright (c) 2026 Rio okta kusuma
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files, to deal in the Software
+ * without restriction, including without limitation the rights to use, copy,
+ * modify, merge, publish, distribute, sublicense, and/or sell copies of the
+ * Software, and to permit persons to whom the Software is furnished to do so,
+ * subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
 #include "tls.h"
+#include "x509.h"
+#include "rtc.h"
 #include "netstack.h"
 #include "sha256.h"
 #include "uart.h"
@@ -275,6 +301,11 @@ struct TlsSess
     uint8_t rbuf[16640]; uint32_t rpos, rlen;
 };
 static TlsSess S;
+static int g_verify = 1;
+static const char* g_err = "";
+void tls_set_verify(int on) { g_verify = on; }
+int tls_verify_enabled() { return g_verify; }
+const char* tls_last_error() { return g_err; }
 static uint8_t recbuf[16640 + 64];
 static uint8_t plain[16640 + 64];
 static uint8_t hsbuf[20000];
@@ -294,6 +325,9 @@ static void random_bytes(uint8_t* out, uint32_t n)
         for (uint32_t k = 0; k < 32 && i + k < n; ++k) out[i + k] = h[k];
     }
 }
+void tls_random(uint8_t* out, uint32_t n) { random_bytes(out, n); }
+void tls_aes128_expand(uint8_t rk[176], const uint8_t key[16]) { aes_key((Aes*)rk, key); }
+void tls_aes128_encrypt_block(const uint8_t rk[176], const uint8_t in[16], uint8_t out[16]) { aes_block((const Aes*)rk, in, out); }
 
 static int read_exact(uint8_t* buf, uint32_t n)
 {
@@ -379,6 +413,13 @@ int tls_active() { return S.open; }
 int tls_connect(int tcp_socket, const char* hostname)
 {
     S.sock = tcp_socket; S.open = 0; S.cseq = S.sseq = 0; S.rpos = S.rlen = 0;
+    g_err = "";
+    X509Key leaf_key; int have_cert = 0, have_cv = 0;
+    if (g_verify)
+    {
+        int tc = tls_trust_reload();
+        if (tc <= 0) { g_err = "no trusted CA certificates (/etc/ssl/certs.pem missing; use 'certs add' or -k)"; return -40; }
+    }
     uint8_t priv[32], pub[32], rnd[32], sid[32];
     random_bytes(priv, 32); random_bytes(rnd, 32); random_bytes(sid, 32);
     tls_x25519_base(pub, priv);
@@ -397,8 +438,8 @@ int tls_connect(int tcp_socket, const char* hostname)
     be16(h + n, 0); n += 2; be16(h + n, hl + 5); n += 2; be16(h + n, hl + 3); n += 2; h[n++] = 0; be16(h + n, hl); n += 2;
     for (uint32_t i = 0; i < hl; ++i) h[n++] = (uint8_t)hostname[i];
     be16(h + n, 10); n += 2; be16(h + n, 4); n += 2; be16(h + n, 2); n += 2; be16(h + n, 0x001d); n += 2;
-    be16(h + n, 13); n += 2; be16(h + n, 14); n += 2; be16(h + n, 12); n += 2;
-    { static const uint16_t sa[6] = {0x0403, 0x0804, 0x0805, 0x0806, 0x0401, 0x0503}; for (int i = 0; i < 6; ++i) { be16(h + n, sa[i]); n += 2; } }
+    be16(h + n, 13); n += 2; be16(h + n, 16); n += 2; be16(h + n, 14); n += 2;
+    { static const uint16_t sa[7] = {0x0403, 0x0503, 0x0804, 0x0805, 0x0806, 0x0807, 0x0401}; for (int i = 0; i < 7; ++i) { be16(h + n, sa[i]); n += 2; } }
     be16(h + n, 43); n += 2; be16(h + n, 3); n += 2; h[n++] = 2; h[n++] = 3; h[n++] = 4;
     be16(h + n, 51); n += 2; be16(h + n, 38); n += 2; be16(h + n, 36); n += 2; be16(h + n, 0x001d); n += 2; be16(h + n, 32); n += 2;
     for (int i = 0; i < 32; ++i) h[n++] = pub[i];
@@ -471,8 +512,45 @@ int tls_connect(int tcp_socket, const char* hostname)
             uint32_t ml = ((uint32_t)hsbuf[off + 1] << 16) | ((uint32_t)hsbuf[off + 2] << 8) | hsbuf[off + 3];
             if (have - off < 4 + ml) break;
             uint8_t mt = hsbuf[off];
+            if (mt == 11 && g_verify)
+            {
+                /* Certificate: ctx_len(1) ctx list_len(3) { cert_len(3) cert ext_len(2) ext }* */
+                const uint8_t* b = hsbuf + off + 4; uint32_t bl = ml;
+                if (bl < 4 || b[0] + 4U > bl) { g_err = "malformed Certificate message"; return -41; }
+                uint32_t q = 1U + b[0];
+                uint32_t ll = ((uint32_t)b[q] << 16) | ((uint32_t)b[q + 1] << 8) | b[q + 2]; q += 3;
+                if (q + ll > bl) { g_err = "malformed Certificate message"; return -41; }
+                const uint8_t* cp[8]; uint32_t cl[8]; int cn = 0; uint32_t end2 = q + ll;
+                while (q + 3 <= end2 && cn < 8)
+                {
+                    uint32_t l1 = ((uint32_t)b[q] << 16) | ((uint32_t)b[q + 1] << 8) | b[q + 2]; q += 3;
+                    if (q + l1 + 2 > end2) { g_err = "malformed Certificate message"; return -41; }
+                    cp[cn] = b + q; cl[cn] = l1; ++cn; q += l1;
+                    uint32_t e1 = ((uint32_t)b[q] << 8) | b[q + 1]; q += 2 + e1;
+                }
+                if (cn == 0) { g_err = "server sent no certificate"; return -42; }
+                int vr = x509_verify_chain(cp, cl, cn, hostname, rtc_get_epoch(), &leaf_key, &g_err);
+                if (vr != 0) return -43;
+                have_cert = 1;
+            }
+            else if (mt == 15 && g_verify)
+            {
+                if (!have_cert || ml < 4) { g_err = "CertificateVerify without a verified certificate"; return -44; }
+                uint16_t scheme = (uint16_t)(((uint16_t)hsbuf[off + 4] << 8) | hsbuf[off + 5]);
+                uint32_t sl2 = ((uint32_t)hsbuf[off + 6] << 8) | hsbuf[off + 7];
+                if (sl2 + 4 > ml) { g_err = "malformed CertificateVerify"; return -44; }
+                uint8_t content[64 + 34 + 32];
+                for (int i = 0; i < 64; ++i) content[i] = 0x20;
+                static const char lbl[] = "TLS 1.3, server CertificateVerify";
+                for (int i = 0; i < 33; ++i) content[64 + i] = (uint8_t)lbl[i];
+                content[97] = 0;
+                { Sha256Ctx c = th; sha256_final(&c, content + 98); }
+                if (x509_verify_signature(&leaf_key, scheme, content, 130, hsbuf + off + 8, sl2) != 0) { g_err = "server handshake signature is invalid"; return -45; }
+                have_cv = 1;
+            }
             if (mt == 20)
             {
+                if (g_verify && !have_cv) { g_err = "server did not authenticate itself (no certificate/signature)"; return -46; }
                 { Sha256Ctx c = th; sha256_final(&c, thash); }
                 uint8_t fk[32], mac[32];
                 tls_hkdf_expand_label(s_hs, "finished", 0, 0, fk, 32);

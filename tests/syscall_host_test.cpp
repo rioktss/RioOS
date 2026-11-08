@@ -1,3 +1,27 @@
+/*
+ * MIT License
+ *
+ * Copyright (c) 2026 Rio okta kusuma
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files, to deal in the Software
+ * without restriction, including without limitation the rights to use, copy,
+ * modify, merge, publish, distribute, sublicense, and/or sell copies of the
+ * Software, and to permit persons to whom the Software is furnished to do so,
+ * subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
 #include "syscall.h"
 #include "fs.h"
 #include "vfs.h"
@@ -42,6 +66,8 @@ int net_tcp_close(int, int) { return 0; }
 void net_tcp_close_all_for(int) {}
 int net_tcp_listen(int, int, uint16_t) { return -38; }
 int net_tcp_accept(int, int, uint32_t*, uint16_t*, uint32_t) { return -38; }
+int net_http_get_url(const char*, int, const char*, uint8_t*, uint32_t) { return -38; }
+void sha256(const void*, uint64_t, uint8_t out[32]) { for (int i = 0; i < 32; ++i) out[i] = 0; }
 
 /* Fake single-file filesystem: only "/storage/home/hello" exists after a write. */
 static uint8_t fake_file[4096]; static uint64_t fake_size = 0; static int fake_exists = 0;

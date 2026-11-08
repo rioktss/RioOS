@@ -1,3 +1,27 @@
+/*
+ * MIT License
+ *
+ * Copyright (c) 2026 Rio okta kusuma
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files, to deal in the Software
+ * without restriction, including without limitation the rights to use, copy,
+ * modify, merge, publish, distribute, sublicense, and/or sell copies of the
+ * Software, and to permit persons to whom the Software is furnished to do so,
+ * subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
 #include "syscall.h"
 #include "uart.h"
 #include "keyboard.h"
@@ -17,6 +41,7 @@
 #include "task.h"
 #include "elf.h"
 #include "rtc.h"
+#include "sha256.h"
 #ifndef HOST_TEST
 #include "mapping.h"
 #endif
@@ -1141,6 +1166,34 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
                 o->signo = got; o->err = 0; o->code = code; o->pid = sender; o->value = value; o->addr = 0;
             }
             result = (uint64_t)got;
+            break;
+        }
+
+        case SYS_HTTP_GET:
+        {
+            /* x0 url, x1 buf, x2 cap, x3 flags (bit0 insecure), x4 cacert path or 0 */
+            if (!from_user) { result = (uint64_t)-38; break; }
+            char url[256]; char ca[SYSCALL_PATH_MAX]; int ok = 1;
+            for (uint64_t i = 0; ok; ++i)
+            {
+                if (i >= sizeof(url) || !frame->x[0] || !syscall_user_pointer_ok((const char*)(frame->x[0] + i), 1)) { ok = 0; break; }
+                url[i] = ((const char*)frame->x[0])[i]; if (!url[i]) break;
+            }
+            if (ok && frame->x[4] && copy_path((const char*)frame->x[4], ca, from_user) != 0) ok = 0;
+            if (!ok) { result = (uint64_t)-14; break; }
+            if (!frame->x[1] || frame->x[2] == 0 || frame->x[2] > 1048576ULL || !syscall_user_pointer_ok_write((void*)frame->x[1], frame->x[2])) { result = (uint64_t)-14; break; }
+            result = (uint64_t)(int64_t)net_http_get_url(url, (int)(frame->x[3] & 1U), frame->x[4] ? ca : 0, (uint8_t*)frame->x[1], (uint32_t)frame->x[2]);
+            break;
+        }
+
+        case SYS_SHA256:
+        {
+            if (!from_user) { result = (uint64_t)-38; break; }
+            if (frame->x[1] > 0x40000000ULL || (frame->x[1] && !syscall_user_pointer_ok((const void*)frame->x[0], frame->x[1])) ||
+                !frame->x[2] || !syscall_user_pointer_ok_write((void*)frame->x[2], 32)) { result = (uint64_t)-14; break; }
+            uint8_t dg[32]; sha256((const void*)frame->x[0], frame->x[1], dg);
+            for (int i = 0; i < 32; ++i) ((uint8_t*)frame->x[2])[i] = dg[i];
+            result = 0;
             break;
         }
 

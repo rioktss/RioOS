@@ -1,3 +1,27 @@
+/*
+ * MIT License
+ *
+ * Copyright (c) 2026 Rio okta kusuma
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files, to deal in the Software
+ * without restriction, including without limitation the rights to use, copy,
+ * modify, merge, publish, distribute, sublicense, and/or sell copies of the
+ * Software, and to permit persons to whom the Software is furnished to do so,
+ * subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
 #include "tls.h"
 #include <cstdint>
 #include <cstdio>
@@ -8,6 +32,8 @@ static int fails = 0;
 #define CHECK(c) do { if (!(c)) { std::printf("TLS HOST TEST FAIL line %d: %s\n", __LINE__, #c); ++fails; } } while (0)
 static void unhex(const char* h, uint8_t* o) { for (size_t i = 0; h[2*i]; ++i) { unsigned v; std::sscanf(h + 2*i, "%2x", &v); o[i] = (uint8_t)v; } }
 uint64_t timer_millis() { return 1; }
+uint64_t rtc_get_epoch() { return 1800000000ULL; }
+int tls_trust_reload() { return 0; }
 int net_tcp_recv(int, int, void*, uint32_t, uint32_t) { return -1; }
 int net_tcp_send(int, int, const void*, uint32_t, uint32_t) { return -1; }
 int main()
