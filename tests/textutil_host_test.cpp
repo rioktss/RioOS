@@ -35,7 +35,7 @@ static int run(const char* cmd, const char* input, char* result, size_t cap)
 {
     char line[256]; strncpy(line, cmd, sizeof(line) - 1); line[sizeof(line) - 1] = 0;
     char* argv[12]; int argc = 0;
-    for (char* p = strtok(line, " "); p && argc < 12; p = strtok(0, " ")) argv[argc++] = p;
+    char* sp_ = nullptr; for (char* p = strtok_r(line, " ", &sp_); p && argc < 12; p = strtok_r(nullptr, " ", &sp_)) argv[argc++] = p;
     uint64_t n = 0;
     int rc = textutil_filter(argc, argv, (const uint8_t*)input, strlen(input), outbuf, sizeof(outbuf), &n);
     if (n >= cap) n = cap - 1;

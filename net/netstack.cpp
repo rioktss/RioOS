@@ -1725,7 +1725,7 @@ uint32_t net_dns_server()
     return dns_server_ip;
 }
 
-int net_dns_resolve(const char* hostname, uint32_t* out_ip, uint32_t timeout_ms)
+static int dns_resolve_via(uint32_t server_ip, const char* hostname, uint32_t* out_ip, uint32_t timeout_ms)
 {
     if (!ready_state) return -19;
     if (!hostname || !out_ip || timeout_ms == 0 || timeout_ms > NET_UDP_MAX_TIMEOUT_MS)
@@ -1778,7 +1778,7 @@ int net_dns_resolve(const char* hostname, uint32_t* out_ip, uint32_t timeout_ms)
     int rc = net_udp_bind(0, socket_handle, 0);
     if (rc == 0)
     {
-        int sent = net_udp_sendto(0, socket_handle, dns_server_ip, DNS_PORT, query, query_length);
+        int sent = net_udp_sendto(0, socket_handle, server_ip, DNS_PORT, query, query_length);
         rc = sent < 0 ? sent : 0;
     }
 
@@ -1800,7 +1800,7 @@ int net_dns_resolve(const char* hostname, uint32_t* out_ip, uint32_t timeout_ms)
             rc = received;
             break;
         }
-        if (source_ip != dns_server_ip || source_port != DNS_PORT) continue;
+        if (source_ip != server_ip || source_port != DNS_PORT) continue;
         rc = dns_parse_a_response(response, (uint32_t)received, query_id, &result_ip);
         resolved = rc == 0;
         break;
@@ -1808,6 +1808,22 @@ int net_dns_resolve(const char* hostname, uint32_t* out_ip, uint32_t timeout_ms)
     if (rc == 0 && !resolved) rc = -110;
     if (rc == 0) *out_ip = result_ip;
     (void)net_udp_close(0, socket_handle);
+    return rc;
+}
+
+/* Resolve with the configured server first; when it gives no usable answer (no reply, SERVFAIL, REFUSED: e.g. the
+   emulator's DNS proxy has no host resolver behind it) retry with public resolvers. NXDOMAIN is final. */
+int net_dns_resolve(const char* hostname, uint32_t* out_ip, uint32_t timeout_ms)
+{
+    int rc = dns_resolve_via(dns_server_ip, hostname, out_ip, timeout_ms);
+    if (rc == 0 || rc == -2 || rc == -22 || rc == -19) return rc;
+    static const uint32_t fallback[2] = { 0x08080808U, 0x01010101U };   /* 8.8.8.8, 1.1.1.1 */
+    for (int i = 0; i < 2; ++i)
+    {
+        if (fallback[i] == dns_server_ip) continue;
+        int r2 = dns_resolve_via(fallback[i], hostname, out_ip, timeout_ms);
+        if (r2 == 0 || r2 == -2) return r2;
+    }
     return rc;
 }
 

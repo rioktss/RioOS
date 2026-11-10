@@ -127,6 +127,7 @@ int url_path(const char* in, char* out, int cap)
 
 void html_escape(Out* o, const char* s) { for (; *s; ++s) { if (*s == '<') o_s(o, "&lt;"); else if (*s == '>') o_s(o, "&gt;"); else if (*s == '&') o_s(o, "&amp;"); else if (*s == '"') o_s(o, "&quot;"); else o_c(o, *s); } }
 
+static uint32_t g_pasv_lo = 30000, g_pasv_n = 2000;   /* passive data port range (ftpd -P lo-hi) */
 static int g_http10 = 0;   /* answer HTTP/1.0 requests with an HTTP/1.0 status line */
 struct HttpCfg { char root[96]; int hello_fallback; int quiet; };
 
@@ -456,7 +457,7 @@ int ftp_session(int c, const char* root, int allow_anon, uint32_t peer_ip)
                 {
                     if (f.pasv_sock >= 0) { net_tcp_close(0, f.pasv_sock); f.pasv_sock = -1; }
                     int s = net_tcp_socket(0); uint16_t port = 0;
-                    for (int tries = 0; s >= 0 && tries < 20; ++tries) { port = (uint16_t)(30000 + (timer_millis() / 7 + (uint64_t)tries * 37) % 2000); if (net_tcp_listen(0, s, port) == 0) break; port = 0; }
+                    for (int tries = 0; s >= 0 && tries < 40; ++tries) { port = (uint16_t)(g_pasv_lo + (timer_millis() / 7 + (uint64_t)tries) % g_pasv_n); if (net_tcp_listen(0, s, port) == 0) break; port = 0; }
                     if (s < 0 || !port) { if (s >= 0) net_tcp_close(0, s); ftp_say_n(&f, 425, "Cannot open passive port"); }
                     else
                     {
@@ -603,9 +604,17 @@ void command_ftpd(const char* argument)
         else if (str_equal(w[i], "-n") && i + 1 < n) sessions = parse_num(w[++i], -1);
         else if (str_equal(w[i], "-d") && i + 1 < n) { str_copy(root, w[++i], sizeof(root)); int l = str_len(root); while (l > 1 && root[l - 1] == '/') root[--l] = 0; }
         else if (str_equal(w[i], "-a")) anon = 1;
+        else if (str_equal(w[i], "-P") && i + 1 < n)
+        {   /* -P lo-hi (or a single port): fixed passive data port range, so an emulator/NAT can forward it */
+            const char* a = w[++i]; const char* dash = a; while (*dash && *dash != '-') ++dash;
+            char lo_s[12]; int ll = 0; while (a + ll < dash && ll < 11) { lo_s[ll] = a[ll]; ++ll; } lo_s[ll] = 0; int lo = parse_num(lo_s, -1);
+            int hi = *dash == '-' ? parse_num(dash + 1, -1) : lo;
+            if (lo < 1024 || hi < lo || hi > 65535) { port = -1; break; }
+            g_pasv_lo = (uint32_t)lo; g_pasv_n = (uint32_t)(hi - lo + 1);
+        }
         else { port = -1; break; }
     }
-    if (!net_ready() || port <= 0 || port > 65535 || sessions < 0 || root[0] != '/') { uart_puts("usage: ftpd [-p port] [-d root] [-n sessions] [-a]   (-a allows read-only anonymous login; default: run until Ctrl-C)\r\n"); return; }
+    if (!net_ready() || port <= 0 || port > 65535 || sessions < 0 || root[0] != '/') { uart_puts("usage: ftpd [-p port] [-d root] [-n sessions] [-a] [-P lo-hi]   (-P fixes the passive data ports; -a allows read-only anonymous login; default: run until Ctrl-C)\r\n"); return; }
     { FsStat st; if (fs_stat_path(root, vfs_cwd(), &st) != 0 || st.type != FS_DIR) { uart_puts("ftpd: root is not a directory\r\n"); return; } }
     int ls = net_tcp_socket(0);
     if (ls < 0 || net_tcp_listen(0, ls, (uint16_t)port) != 0) { uart_puts("ftpd: cannot listen\r\n"); if (ls >= 0) net_tcp_close(0, ls); return; }

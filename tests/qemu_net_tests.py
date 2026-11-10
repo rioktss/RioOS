@@ -201,11 +201,16 @@ def s_ftpd(pki, www, sshw, have_ssh):
             try: f.retrbinary("RETR /../../etc/rootonly.txt", lambda b: None); res["jail_etc"] = False
             except ftplib.error_perm: res["jail_etc"] = True
             f.quit()
+            if not wait_port(GUEST, 2121, 60): res["fail"] = "third listener missing"; return
+            f = ftplib.FTP(); f.connect(GUEST, 2121, timeout=15); f.login("root", "123")
+            r = f.sendcmd("EPSV"); res["pasv_port"] = int(r.split("|||")[1].split("|")[0]); f.close()
+            f = ftplib.FTP(); f.connect(GUEST, 2121, timeout=15); f.login("root", "123"); lines = []; f.retrlines("NLST /home/user/ftp", lines.append); res["pfix_nlst"] = lines; f.quit()
         except Exception as e: res["fail"] = repr(e)
     t = threading.Thread(target=client); t.start()
     guest += [("ftpd -n 4 -a -d /", 25 + 10), ("echo ftpd1-done", 3)]
     # the anonymous check above reads a path under /home/user: root is "/" so absolute paths work
     guest += [("ftpd -n 2 -d /home/user/ftp/jail", 25), ("echo ftpd2-done", 3)]
+    guest += [("ftpd -p 2121 -n 3 -P 31000-31003", 25), ("echo ftpd3-done", 3)]
     log = run(guest)
     t.join(5)
     check("ftpd: no client error", "fail" not in res, res.get("fail", ""))
@@ -222,6 +227,8 @@ def s_ftpd(pki, www, sshw, have_ssh):
     check("ftpd RNFR/RNTO", res.get("rename") is True)
     check("ftpd DELE", res.get("delete") is True)
     check("ftpd MKD/RMD", res.get("rmd") is True)
+    check("ftpd -P keeps the passive data port inside the given range", 31000 <= res.get("pasv_port", 0) <= 31003, str(res.get("pasv_port")))
+    check("ftpd on a custom port (-p 2121) serves files", "pub.txt" in " ".join(res.get("pfix_nlst", [])), str(res.get("pfix_nlst")))
     check("ftpd CDUP", res.get("cdup", ("", ""))[1] == "/home", str(res.get("cdup")))
     check("ftpd CWD to missing dir -> 550", res.get("cwdbad") is True)
     check("ftpd uses the logged-in user's permissions (550 on root-only file)", res.get("perm") is True)

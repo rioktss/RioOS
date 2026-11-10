@@ -12,6 +12,15 @@
 # pointer is over the window). The serial console also stays attached to this
 # host terminal, so boot messages remain visible here.
 set -euo pipefail
+
+# Optional port forwards host->guest for httpd/ftpd/ssh servers, e.g.
+#   RIOOS_FWD="tcp::8080-:8080,tcp::2121-:21" bash linux/run-terminal.sh
+# (comma separated hostfwd rules; unset = no forwards, so no host port can clash)
+NETFWD=""
+if [ -n "${RIOOS_FWD:-}" ]; then
+    IFS=',' read -ra _fw <<< "$RIOOS_FWD"
+    for _r in "${_fw[@]}"; do NETFWD="${NETFWD},hostfwd=${_r}"; done
+fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
@@ -83,7 +92,7 @@ exec "$QEMU" \
     -device ramfb \
     -drive "if=none,format=raw,file=$DISK,id=vd0" \
     -device virtio-blk-device,drive=vd0 \
-    -netdev user,id=n1,ipv4=on,ipv6=off \
+    -netdev "user,id=n1,ipv4=on,ipv6=off${NETFWD}" \
     -device virtio-net-device,netdev=n1 \
     -device virtio-keyboard-device \
     -device virtio-tablet-device

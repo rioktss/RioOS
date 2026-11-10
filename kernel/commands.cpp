@@ -1004,7 +1004,7 @@ static const ManualEntry manual_entries[] =
     {"httpsget", "fetch an HTTPS page (TLS 1.3)", "httpsget <host[:port]> [path] | httpsget https://host/path", "prints the first 4096 bytes of the body; the server certificate chain and host name are verified against /etc/ssl/certs.pem (+ certs add); --cacert <file> trusts one extra CA, -k/--insecure skips verification"},
     {"ping6", "ICMPv6 echo to a link-local address", "ping6 <ipv6>", "uses NDP neighbor discovery"},
     {"httpd", "HTTP file server (GET/HEAD, ranges, keep-alive, directory listings)", "httpd <port> [requests] [-d docroot] [-q]", "serves files below the document root (default /; with / and no index.html the path / is a greeting); index.html, directory listings, 301/403/404/405/416, Content-Type by extension, Range requests, HTTP/1.1 keep-alive; requests 0 = until Ctrl-C, default 1; one connection at a time; no HTTPS"},
-    {"ftpd", "FTP server (passive/active, login with local accounts)", "ftpd [-p port] [-d root] [-n sessions] [-a]", "login with a RioOS account (permissions of that user apply); USER PASS PWD CWD CDUP TYPE PASV EPSV PORT LIST NLST RETR STOR APPE DELE MKD RMD RNFR RNTO SIZE MDTM REST FEAT QUIT; -a adds a read-only anonymous login; files up to 4 MiB; one session at a time; plain FTP (no TLS)"},
+    {"ftpd", "FTP server (passive/active, login with local accounts)", "ftpd [-p port] [-d root] [-n sessions] [-a] [-P lo-hi]", "login with a RioOS account (permissions of that user apply); USER PASS PWD CWD CDUP TYPE PASV EPSV PORT LIST NLST RETR STOR APPE DELE MKD RMD RNFR RNTO SIZE MDTM REST FEAT QUIT; -a adds a read-only anonymous login; -P lo-hi fixes the passive data ports (default 30000-31999) so QEMU hostfwd can forward them, e.g. RIOOS_FWD=\"tcp::2121-:21,tcp::30000-:30000\" with ftpd -P 30000; files up to 4 MiB; one session at a time; plain FTP (no TLS)"},
     {"usb", "xHCI USB controller / HID devices", "usb [selftest]", "lists devices on the xHCI root hub; keyboards type into the shell, mice are tracked (start QEMU with -device qemu-xhci -device usb-kbd)"},
     {"lspci", "list PCIe devices", "lspci", "bus 0 via ECAM; shows class and assigned BARs"},
     {"nvme", "NVMe disk status", "nvme [selftest]", "selftest is read-only on the root disk, read/write on others"},
@@ -2110,7 +2110,7 @@ static const HelpSection help_sections[] = {
  "  certs [list|add <pem>|verify <pem>]        CA trust store (/etc/ssl/certs.pem)\r\n"
  "  ssh [-p n] [-t] [-o StrictHostKeyChecking=yes|no] user@host [cmd]   ssh -R host   SSH-2 client\r\n"
  "  scp [-r] [-P n] <src> <dst>                copy files over SSH (user@host:path)\r\n"
- "  ftpd [-p port] [-n sessions] [-a] [-d dir]  FTP server (PASV/EPSV/PORT, per-user permissions)\r\n"
+ "  ftpd [-p port] [-n sessions] [-a] [-d dir] [-P lo-hi]  FTP server (PASV/EPSV/PORT, per-user permissions)\r\n"
  "  curl [-s -i -I -L -o f -X M -H h -d data] <url>   full HTTP client\r\n"
  "  nc [-z] <host> <port> [text]  nc -l <port>   TCP client/server (IPv4 + IPv6)\r\n"
  "  udp6 send|listen ...   telnet <host> [port]   httpd [port] [n] [-d dir] [-q]   web server (HTTP/1.1, Range)\r\n"
