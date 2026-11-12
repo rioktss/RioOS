@@ -152,6 +152,60 @@ def s_httpd(pki, www, sshw, have_ssh):
         r = res.get("big", (0, b"")); check("httpd 700 KB file identical", r[0] == 200 and hashlib.sha256(r[1]).hexdigest() == hashlib.sha256(open(sshw + "/root/big.bin", "rb").read()).hexdigest(), str(r[:1]))
     check("httpd stops after the request budget", "httpd-done" in after(log, "echo httpd-done"), after(log, "httpd 8081 22 -d /home/user/www -q")[-300:])
 
+def s_sock(pki, www, sshw, have_ssh):
+    """BSD sockets (socket/connect/accept/poll/shutdown/SO_*) against real host peers."""
+    res = {}
+    def tcp_half_close_server():
+        srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); srv.bind((HOST, 9301)); srv.listen(4); srv.settimeout(200)
+        try:
+            c, _ = srv.accept(); c.settimeout(30); data = b""
+            while True:
+                d = c.recv(100)
+                if not d: break
+                data += d
+            res["srv_got"] = data
+            c.sendall(b"got:" + data); c.close()
+        except Exception as e: res["srv_err"] = repr(e)
+    def udp_echo():
+        u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind((HOST, 9302)); u.settimeout(200)
+        try:
+            for i in (1, 2):
+                d, a = u.recvfrom(100); u.sendto(b"echo:" + d.split(b"-")[1], a)
+        except Exception as e: res["udp_err"] = repr(e)
+    def guest_server_client():
+        if not wait_port(GUEST, 9303, 240): res["gs_fail"] = "no listener"; return
+        time.sleep(0.5)
+        try:
+            c = socket.create_connection((GUEST, 9303), 15); c.sendall(b"from-client!"); c.settimeout(20); res["gs_reply"] = c.recv(100); c.close()
+        except Exception as e: res["gs_fail"] = repr(e)
+    def loop_clients():
+        if not wait_port(GUEST, 9304, 240): res["loop_fail"] = "no listener"; return
+        time.sleep(0.5)
+        try:
+            cs = [socket.create_connection((GUEST, 9304), 15) for _ in range(3)]
+            for i, c in enumerate(cs): c.sendall(b"msg%d" % i)
+            res["loop_echo"] = []
+            for c in cs: c.settimeout(20); res["loop_echo"].append(c.recv(100))
+            for c in cs: c.close()
+        except Exception as e: res["loop_fail"] = repr(e)
+    threads = [threading.Thread(target=f, daemon=True) for f in (tcp_half_close_server, udp_echo, guest_server_client, loop_clients)]
+    for t in threads: t.start()
+    guest = [("su", 2), ("123", 2), ("dhcp", 4), ("socktest client %s 9301" % HOST, 20), ("socktest udp %s 9302" % HOST, 12),
+             ("socktest server 9303", 30), ("socktest loop 9304", 40), ("echo sock-done", 1)]
+    log = run(guest)
+    for t in threads: t.join(5)
+    c = after(log, "socktest client %s 9301" % HOST)
+    check("sock tcp client: all guest checks pass", "socktest done fails=0" in c, c[-700:])
+    check("sock tcp half-close: host saw EOF after shutdown(WR) with full payload", res.get("srv_got") == b"hello world", str(res))
+    u = after(log, "socktest udp %s 9302" % HOST)
+    check("sock udp sendto/recvfrom/connect: all guest checks pass", "socktest done fails=0" in u, u[-500:])
+    sv = after(log, "socktest server 9303")
+    check("sock server bind/listen/poll/accept: all guest checks pass", "socktest done fails=0" in sv, sv[-500:])
+    check("sock server: host client got the reply", res.get("gs_reply") == b"echo:from-client!", str(res))
+    lp = after(log, "socktest loop 9304")
+    check("sock poll event loop (3 nonblocking clients): guest checks pass", "socktest done fails=0" in lp, lp[-500:])
+    check("sock event loop echoed every client", res.get("loop_echo") == [b"msg0", b"msg1", b"msg2"], str(res))
+
 def s_ftpd(pki, www, sshw, have_ssh):
     guest = [("su", 2), ("123", 2), ("dhcp", 4), ("useradd tbob", 2), ("pw1", 2), ("pw1", 3), ("mkdir /home/tbob", 1), ("chown tbob /home/tbob", 1), ("echo rootonly > /etc/rootonly.txt", 1), ("chmod 600 /etc/rootonly.txt", 1),
              ("mkdir ftp", 1), ("echo anon-readable > ftp/pub.txt", 1), ("mkdir ftp/jail", 1), ("echo inside > ftp/jail/in.txt", 1)]
@@ -383,6 +437,6 @@ def s_ssh(pki, www, sshw, have_ssh):
     check("ssh interactive shell", "hi there" in a("ssh -p 2201 -t %s" % H) or "hi there" in a("hi there"), a("ssh -p 2201 -t %s" % H))
     check("ssh session finished", "ssh-done" in a("echo ssh-done"), "")
 
-SESSIONS = {"tls": s_tls, "ssh": s_ssh, "httpd": s_httpd, "ftpd": s_ftpd, "pkg": s_pkg}
+SESSIONS = {"tls": s_tls, "ssh": s_ssh, "httpd": s_httpd, "ftpd": s_ftpd, "pkg": s_pkg, "sock": s_sock}
 if len(sys.argv) > 2: SESSIONS = {k: v for k, v in SESSIONS.items() if k in sys.argv[2:]}
 if __name__ == "__main__": main()

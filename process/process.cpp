@@ -64,6 +64,8 @@ struct Process
     uint32_t uid;
     uint32_t gid;
     uint64_t start_ms;
+    int cwd;             /* filesystem node of the working directory, -1 = shell's */
+    uint32_t umask_bits;
     char args[PROCESS_ARGS_SIZE];
 };
 
@@ -112,6 +114,8 @@ static void reset_mt_fields(Process* p)
     p->uid = 0;
     p->gid = 0;
     p->start_ms = 0;
+    p->cwd = -1;
+    p->umask_bits = 022;
     p->args[0] = '\0';
 }
 
@@ -688,6 +692,21 @@ void process_alarm_check(int pid, uint64_t now)
     }
     process_irq_restore(f);
 }
+int process_cwd(int pid) { PROC_GET(processes[slot].cwd, -1) }
+int process_set_cwd(int pid, int node)
+{
+    uint64_t f = process_irq_save(); int slot = find_slot_locked(pid);
+    if (slot >= 0) processes[slot].cwd = node;
+    process_irq_restore(f); return slot >= 0 ? 0 : -1;
+}
+uint32_t process_umask(int pid) { PROC_GET(processes[slot].umask_bits, 022U) }
+int process_set_umask(int pid, uint32_t m)
+{
+    uint64_t f = process_irq_save(); int slot = find_slot_locked(pid);
+    if (slot >= 0) processes[slot].umask_bits = m & 0777U;
+    process_irq_restore(f); return slot >= 0 ? 0 : -1;
+}
+
 int process_set_creds(int pid, uint32_t uid, uint32_t gid)
 {
     uint64_t f = process_irq_save(); int slot = find_slot_locked(pid);

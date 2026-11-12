@@ -1969,7 +1969,7 @@ static void command_smp_status(const char* argument)
             int rc = smp_run_on(cpu, lo, hi, &got);
             uart_puts("CPU "); print_u64(cpu); uart_puts(": sum[");
             print_u64(lo); uart_puts(","); print_u64(hi); uart_puts(") = "); print_u64(got);
-            uart_puts(rc == 0 && got == want ? "  OK\r\n" : "  FAIL\r\n");
+            uart_puts(rc == 0 && got == want ? "  OK\r\n" : "  FAIL rc="); if (!(rc == 0 && got == want)) { print_u64((uint64_t)(-rc)); uart_puts("\r\n"); }
             if (rc != 0 || got != want) ok = 0;
         }
         uart_puts(ok ? "smp test: PASS\r\n" : "smp test: FAIL\r\n");

@@ -56,6 +56,10 @@ enum ProcessKind
 
 void process_init();
 int process_create(const char* name);
+int process_cwd(int pid);                     /* working-directory node, -1 = inherit the shell's */
+int process_set_cwd(int pid, int node);
+uint32_t process_umask(int pid);
+int process_set_umask(int pid, uint32_t mask);
 /* process_destroy returns -2 for built-ins, -3 for a RUNNING record, -1 if missing. */
 int process_destroy(int pid);
 int process_count();

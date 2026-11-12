@@ -53,7 +53,7 @@ static uint32_t cur_mask = NET_MASK_DEFAULT;
 #define MAX_FRAME 1600U
 #define ARP_CACHE_SIZE 8
 #define NET_ETH_HDR 14U
-#define UDP_SOCKET_COUNT 8U
+#define UDP_SOCKET_COUNT 16U
 #define UDP_QUEUE_DEPTH 4U
 #define UDP_EPHEMERAL_FIRST 49152U
 #define UDP_EPHEMERAL_LAST 65535U
@@ -61,7 +61,7 @@ static uint32_t cur_mask = NET_MASK_DEFAULT;
 #define DNS_PORT 53U
 #define UDP_HEADER_SIZE 8U
 #define UDP_FRAME_MAX (sizeof(EthernetHeader) + sizeof(Ipv4Header) + UDP_HEADER_SIZE + NET_UDP_MAX_PAYLOAD)
-#define TCP_SOCKET_COUNT 8U
+#define TCP_SOCKET_COUNT 32U
 #define TCP_ACCEPT_QUEUE 4U
 #define TCP_RX_BUFFER_SIZE NET_TCP_MAX_IO
 #define TCP_SEGMENT_MAX 536U
@@ -173,6 +173,7 @@ struct TcpSocketState
     int owner_pid;
     uint8_t state;
     uint8_t peer_closed;
+    uint8_t fin_sent;                   /* shutdown(SHUT_WR) done */
     uint16_t local_port;
     uint16_t remote_port;
     uint32_t remote_ip;
@@ -1013,6 +1014,7 @@ static void tcp_input(const uint8_t* src6, uint32_t source_ip, uint32_t dest_ip,
             child->owner_pid = listener->owner_pid;
             child->state = TCP_STATE_SYN_RCVD;
             child->peer_closed = 0;
+            child->fin_sent = 0;
             child->local_port = dest_port;
             child->remote_port = source_port;
             child->remote_ip = src6 ? 0U : source_ip;
@@ -1035,7 +1037,7 @@ static void tcp_input(const uint8_t* src6, uint32_t source_ip, uint32_t dest_ip,
     if (flags & TCP_FLAG_RST)
     {
         if (socket->parent) { socket->used = 0; socket->state = TCP_STATE_CLOSED; socket->parent = 0; return; }
-        socket->state = TCP_STATE_RESET;
+        if (!socket->peer_closed) socket->state = TCP_STATE_RESET;   /* RST after the peer's FIN: the stream already ended cleanly */
         socket->peer_closed = 1;
         return;
     }
@@ -1132,6 +1134,7 @@ int net_tcp_socket(int owner_pid)
         socket->owner_pid = owner_pid;
         socket->state = TCP_STATE_CLOSED;
         socket->peer_closed = 0;
+        socket->fin_sent = 0;
         socket->local_port = 0;
         socket->remote_port = 0;
         socket->remote_ip = 0;
@@ -1275,6 +1278,7 @@ int net_tcp_send(int owner_pid, int socket_handle, const void* data,
         return -22;
     if (socket->state != TCP_STATE_ESTABLISHED && socket->state != TCP_STATE_CLOSE_WAIT)
         return socket->state == TCP_STATE_RESET ? -104 : -107;
+    if (socket->fin_sent) return -32;
     if (length == 0) return 0;
 
     const uint8_t* input = (const uint8_t*)data;
@@ -1341,7 +1345,7 @@ int net_tcp_recv(int owner_pid, int socket_handle, void* data,
                 output[i] = socket->rx_buffer[(socket->rx_head + i) % TCP_RX_BUFFER_SIZE];
             socket->rx_head = (uint16_t)((socket->rx_head + copy_length) % TCP_RX_BUFFER_SIZE);
             socket->rx_count = (uint16_t)(socket->rx_count - copy_length);
-            if (socket->state == TCP_STATE_ESTABLISHED || socket->state == TCP_STATE_CLOSE_WAIT)
+            if (!socket->peer_closed && (socket->state == TCP_STATE_ESTABLISHED || socket->state == TCP_STATE_CLOSE_WAIT))
                 (void)tcp_send_segment(socket, TCP_FLAG_ACK, socket->snd_nxt,
                                        socket->rcv_nxt, 0, 0);
             return (int)copy_length;
@@ -1360,7 +1364,7 @@ int net_tcp_close(int owner_pid, int socket_handle)
     TcpSocketState* socket = tcp_get_socket(owner_pid, socket_handle);
     if (!socket) return -9;
     int rc = 0;
-    if (socket->state == TCP_STATE_ESTABLISHED || socket->state == TCP_STATE_CLOSE_WAIT)
+    if (!socket->fin_sent && (socket->state == TCP_STATE_ESTABLISHED || socket->state == TCP_STATE_CLOSE_WAIT))
     {
         uint32_t sequence = socket->snd_nxt;
         rc = tcp_send_segment(socket, TCP_FLAG_FIN | TCP_FLAG_ACK, sequence,
@@ -1394,12 +1398,67 @@ int net_tcp_close(int owner_pid, int socket_handle)
     socket->owner_pid = -1;
     socket->state = TCP_STATE_CLOSED;
     socket->peer_closed = 0;
+    socket->fin_sent = 0;
     socket->local_port = 0;
     socket->remote_port = 0;
     socket->remote_ip = 0;
     socket->rx_head = socket->rx_count = 0;
     socket->parent = 0; socket->accept_count = 0;
     return rc;
+}
+
+/* ---- readiness / half-close / info helpers used by the unified fd layer (poll bits follow Linux: IN 1, OUT 4, ERR 8, HUP 16) ---- */
+int net_tcp_poll(int owner_pid, int socket_handle)
+{
+    TcpSocketState* socket = tcp_get_socket(owner_pid, socket_handle);
+    if (!socket) return 0x20;
+    (void)net_poll_once();
+    int m = 0;
+    if (socket->state == TCP_STATE_LISTEN) return socket->accept_count > 0 ? 1 : 0;
+    if (socket->rx_count != 0) m |= 1;
+    if (socket->peer_closed) m |= 1;
+    if (socket->state == TCP_STATE_ESTABLISHED || socket->state == TCP_STATE_CLOSE_WAIT) { if (!socket->fin_sent) m |= 4; }
+    if (socket->state == TCP_STATE_RESET) m |= 1 | 8 | 16;
+    if (socket->state == TCP_STATE_CLOSED) m |= 4 | 16;
+    if (socket->peer_closed && socket->fin_sent) m |= 16;
+    return m;
+}
+
+int net_udp_poll(int owner_pid, int socket_handle)
+{
+    UdpSocketState* socket = udp_get_socket(owner_pid, socket_handle);
+    if (!socket) return 0x20;
+    (void)net_poll_once();
+    return (socket->queue_count != 0 ? 1 : 0) | 4;
+}
+
+int net_tcp_shutdown_wr(int owner_pid, int socket_handle)
+{
+    TcpSocketState* socket = tcp_get_socket(owner_pid, socket_handle);
+    if (!socket) return -9;
+    if (socket->state != TCP_STATE_ESTABLISHED && socket->state != TCP_STATE_CLOSE_WAIT) return -107;
+    if (socket->fin_sent) return 0;
+    int rc = tcp_send_segment(socket, TCP_FLAG_FIN | TCP_FLAG_ACK, socket->snd_nxt, socket->rcv_nxt, 0, 0);
+    if (rc != 0) return rc;
+    ++socket->snd_nxt;
+    socket->fin_sent = 1;
+    return 0;
+}
+
+int net_tcp_info(int owner_pid, int socket_handle, uint32_t* remote_ip, uint16_t* remote_port, uint16_t* local_port)
+{
+    TcpSocketState* socket = tcp_get_socket(owner_pid, socket_handle);
+    if (!socket) return -9;
+    if (remote_ip) *remote_ip = socket->remote_ip;
+    if (remote_port) *remote_port = socket->remote_port;
+    if (local_port) *local_port = socket->local_port;
+    return socket->state == TCP_STATE_ESTABLISHED || socket->state == TCP_STATE_CLOSE_WAIT ? 1 : 0;
+}
+
+int net_udp_local_port(int owner_pid, int socket_handle)
+{
+    UdpSocketState* socket = udp_get_socket(owner_pid, socket_handle);
+    return socket ? (int)socket->local_port : -9;
 }
 
 void net_tcp_close_all_for(int owner_pid)

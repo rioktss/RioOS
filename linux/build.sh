@@ -113,7 +113,7 @@ ASMFLAGS=(
 
 MODULES=(
     uart memory string fs vfs process sched_policy scheduler timer interrupt keyboard
-    commands version shell history env rtc exceptions syscall user mmu virtio_mmio virtio_input virtio_blk storage thread fd task mapping jobs sha256 script pci nvme ahci filters textutils shellext usb tls crypto x509 trust ssh netserv fat32
+    commands version shell history env rtc exceptions syscall user mmu virtio_mmio virtio_input virtio_blk storage thread fd tty task mapping jobs sha256 script pci nvme ahci filters textutils shellext usb tls crypto x509 trust ssh netserv fat32
     fb console console_font
     elf virtio_net netstack page_alloc fault diag security smp
     kernel
@@ -192,6 +192,9 @@ mkdir -p build/bin
 "$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/ulibc3.cpp -o build/bin/ulibc3.o
 "$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/ulibc4.cpp -o build/bin/ulibc4.o
 "$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/ulibc5.cpp -o build/bin/ulibc5.o
+"$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/ulibc6.cpp -o build/bin/ulibc6.o
+"$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/ulibc7.cpp -o build/bin/ulibc7.o
+"$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/ulibc8.cpp -o build/bin/ulibc8.o
 "$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/ulibm.cpp -o build/bin/ulibm.o
 "$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/softfloat.cpp -o build/bin/softfloat.o
 "$CXX" "${UCXXFLAGS[@]}" -c userspace/libc/deflate.cpp -o build/bin/deflate.o
@@ -201,7 +204,7 @@ for src in userspace/bin/*.cpp; do
     name="$(basename "$src" .cpp)"
     "$CXX" "${UCXXFLAGS[@]}" -c "$src" -o "build/bin/$name.o"
     "$LD" -T userspace/user_init.ld -nostdlib -z max-page-size=0x1000 \
-        build/bin/crt0.o build/bin/"$name".o build/bin/ulibc.o build/bin/ulibc2.o build/bin/ulibc3.o build/bin/ulibc4.o build/bin/ulibc5.o build/bin/ulibm.o build/bin/softfloat.o build/bin/deflate.o build/bin/dl.o -o "build/bin/$name.elf"
+        build/bin/crt0.o build/bin/"$name".o build/bin/ulibc.o build/bin/ulibc2.o build/bin/ulibc3.o build/bin/ulibc4.o build/bin/ulibc5.o build/bin/ulibc6.o build/bin/ulibc7.o build/bin/ulibc8.o build/bin/ulibm.o build/bin/softfloat.o build/bin/deflate.o build/bin/dl.o -o "build/bin/$name.elf"
     EXTRA_ELFS+=("build/bin/$name.elf")
     vlog " -> build/bin/$name.elf ready"
 done
@@ -237,6 +240,7 @@ step "4/9" "Compiling boot"
 "$CLANG" "${ASMFLAGS[@]}" -c boot/exceptions.S -o build/exception_vectors.o
 "$CLANG" "${ASMFLAGS[@]}" -c process/user_entry.S -o build/user_entry.o
 "$CLANG" "${ASMFLAGS[@]}" -c process/ctx_switch.S -o build/ctx_switch.o
+"$CLANG" "${ASMFLAGS[@]}" -c process/fpu.S -o build/fpu.o
 
 step "5/9" "Compiling kernel (${#MODULES[@]} modules)"
 for f in "${MODULES[@]}"; do
@@ -254,13 +258,13 @@ done
 
 step "6/9" "Linking"
 "$LD" -T boot/linker.ld -nostdlib -z max-page-size=0x1000 \
-    build/boot.o build/exception_vectors.o build/user_entry.o build/ctx_switch.o \
+    build/boot.o build/exception_vectors.o build/user_entry.o build/ctx_switch.o build/fpu.o \
     build/kernel.o build/uart.o build/memory.o build/string.o build/fs.o build/vfs.o \
     build/process.o build/sched_policy.o build/scheduler.o build/timer.o build/interrupt.o build/keyboard.o \
     build/commands.o build/version.o build/shell.o build/history.o build/env.o build/rtc.o build/exceptions.o build/syscall.o build/user.o build/mmu.o \
     build/virtio_mmio.o build/virtio_input.o build/virtio_blk.o build/storage.o build/elf.o build/virtio_net.o \
     build/netstack.o build/page_alloc.o build/fault.o build/diag.o build/security.o \
-    build/fb.o build/console.o build/console_font.o build/thread.o build/fd.o build/smp.o build/task.o build/mapping.o build/jobs.o build/sha256.o build/script.o build/pci.o build/nvme.o build/ahci.o build/filters.o build/textutils.o build/shellext.o build/usb.o build/tls.o build/crypto.o build/x509.o build/trust.o build/ssh.o build/netserv.o build/fat32.o \
+    build/fb.o build/console.o build/console_font.o build/thread.o build/fd.o build/tty.o build/smp.o build/task.o build/mapping.o build/jobs.o build/sha256.o build/script.o build/pci.o build/nvme.o build/ahci.o build/filters.o build/textutils.o build/shellext.o build/usb.o build/tls.o build/crypto.o build/x509.o build/trust.o build/ssh.o build/netserv.o build/fat32.o \
     -o build/kernel.elf
 
 step "7/9" "Verifying ELF"
@@ -327,7 +331,7 @@ fi
 "$HOST_TOOLS/env_host_test" > /dev/null
 
 "$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -iquote include -DHOST_TEST \
-    tests/fd_host_test.cpp kernel/fd.cpp fs/fs.cpp kernel/string.cpp kernel/rtc.cpp \
+    tests/fd_host_test.cpp tests/fd_net_stubs.cpp kernel/fd.cpp fs/fs.cpp kernel/string.cpp kernel/rtc.cpp \
     -o "$HOST_TOOLS/fd_host_test"
 "$HOST_TOOLS/fd_host_test" > /dev/null
 

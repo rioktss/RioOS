@@ -52,6 +52,8 @@ int thread_state_of(int thread);   /* SchedState value */
 extern "C" void thread_user_preempt();        /* IRQ-from-EL0 hook: switch if the slice expired */
 void thread_set_user_tasks(int count);
 int thread_user_tasks();
+void thread_fp_copy_live_to(int thread);   /* fork: snapshot the live FP/SIMD registers into a new thread */
+void thread_fp_reset_live();               /* exec: clear the live FP/SIMD registers */
 void thread_wait_ms(uint64_t ms);  /* sleep (user threads) or yield-wait (shell) */
 void thread_yield();
 void thread_sleep_ms(uint64_t ms);

@@ -15,6 +15,7 @@ This package makes the RioOS build/run workflow portable across:
 - `macos/` — the same four Bash entry points with macOS Cocoa display defaults
 - `windows/` — `build.ps1`, `run.ps1`, `run-terminal.ps1`
 - `docs/PORTABLE_BUILD.md` — this documentation
+- `termux/build.sh`, `macos/build.sh`, `windows/build.ps1` simply delegate to `linux/build.sh` (needs bash)
 
 ## Important
 

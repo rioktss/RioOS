@@ -25,6 +25,9 @@
 #include "fd.h"
 #include "fs.h"
 #include "uart.h"
+#include "netstack.h"
+#include "tty.h"
+#include "timer.h"
 
 #define FD_KIND_NONE 0
 #define FD_KIND_STDIN 1
@@ -33,6 +36,18 @@
 #define FD_KIND_FILE 4
 #define FD_KIND_PIPE_READ 5
 #define FD_KIND_PIPE_WRITE 6
+#define FD_KIND_SOCK_TCP 7
+#define FD_KIND_SOCK_UDP 8
+#define FD_KIND_EVENT 9
+#define FD_KIND_UNIX 10
+#define FD_KIND_TIMER 11
+
+#define POLL_IN 1
+#define POLL_OUT 4
+#define POLL_ERR 8
+#define POLL_HUP 16
+#define POLL_NVAL 32
+#define SOCK_OWNER_BASE 0x20000
 
 #define FD_SEEK_SET 0
 #define FD_SEEK_CUR 1
@@ -67,6 +82,11 @@ struct OpenFile
     int cwd;
     uint64_t offset;
     int pipe_id;
+    int aux;            /* net handle / event index / unix socket index */
+    int aux2;           /* bound port (TCP), connected flag (UDP) */
+    int owner;          /* net owner key for socket objects */
+    uint32_t peer_ip;   /* connected UDP peer */
+    uint16_t peer_port;
     char path[128];
 };
 
@@ -81,6 +101,45 @@ struct PipeState
     uint8_t data[FD_PIPE_CAPACITY];
 };
 
+
+/* ---- timerfd ---- */
+#define TF_MAX 16
+struct TimerFd { int used; uint64_t interval_ms; uint64_t next_ms; uint64_t expirations; };
+static TimerFd timerfds[TF_MAX];
+
+/* ---- flock (advisory, per open file description) ---- */
+#define FL_MAX 64
+struct FLock { int used; int node; int ex; int obj; };
+static FLock flocks[FL_MAX];
+
+/* ---- eventfd ---- */
+#define EV_MAX 32
+struct EventState { int used; int semaphore; uint64_t counter; };
+static EventState events[EV_MAX];
+
+/* ---- AF_UNIX sockets (stream + datagram), socketpair, named listeners, SCM_RIGHTS ---- */
+#define UX_MAX 32
+#define UX_RING 8192
+#define UX_BACKLOG 8
+#define UX_FDQ 8
+#define UX_DGRAM_MAX 2048
+struct UnixSock
+{
+    int used;
+    int type;            /* 1 stream, 2 datagram */
+    int state;           /* 0 fresh, 1 listening, 2 connected */
+    int peer;            /* index of connected peer or -1 */
+    int peer_closed;
+    int wr_shut;
+    int attached;        /* has an OpenFile (false for queued, not-yet-accepted server ends) */
+    char path[108];
+    uint32_t rd, wr, size;
+    uint64_t tot_w, tot_r;
+    int backlog[UX_BACKLOG]; int nback;
+    int fdq_obj[UX_FDQ]; uint64_t fdq_end[UX_FDQ]; int nfdq;
+    uint8_t ring[UX_RING];
+};
+static UnixSock usocks[UX_MAX];
 static FdTable tables[FD_PROCESS_TABLES];
 static OpenFile open_files[FD_OPEN_FILES];
 static PipeState pipes[FD_PIPE_MAX];
@@ -224,6 +283,11 @@ static void clear_object(int object)
     open_files[object].cwd = -1;
     open_files[object].offset = 0;
     open_files[object].pipe_id = -1;
+    open_files[object].aux = -1;
+    open_files[object].aux2 = 0;
+    open_files[object].owner = -1;
+    open_files[object].peer_ip = 0;
+    open_files[object].peer_port = 0;
     open_files[object].path[0] = '\0';
 }
 
@@ -237,6 +301,53 @@ static void maybe_destroy_pipe(int pipe_id)
         pipes[pipe_id].write_pos = 0;
         pipes[pipe_id].size = 0;
     }
+}
+
+
+static void release_object(int object);
+
+static void ux_drop_fdq(UnixSock* u)
+{
+    int objs[UX_FDQ]; int n = u->nfdq;
+    for (int i = 0; i < n; ++i) objs[i] = u->fdq_obj[i];
+    u->nfdq = 0;
+    for (int i = 0; i < n; ++i) release_object(objs[i]);
+}
+
+static void ux_free(int idx)
+{
+    if (idx < 0 || idx >= UX_MAX || !usocks[idx].used) return;
+    UnixSock* u = &usocks[idx];
+    int peer = u->peer;
+    if (peer >= 0 && usocks[peer].used) { usocks[peer].peer = -1; usocks[peer].peer_closed = 1; }
+    if (u->state == 1)
+    {
+        for (int i = 0; i < u->nback; ++i)
+        {
+            int srv = u->backlog[i];
+            if (srv < 0 || !usocks[srv].used) continue;
+            int cl = usocks[srv].peer;
+            if (cl >= 0 && usocks[cl].used) { usocks[cl].peer = -1; usocks[cl].peer_closed = 1; }
+            usocks[srv].used = 0;
+        }
+        u->nback = 0;
+    }
+    u->used = 0;
+    ux_drop_fdq(u);
+}
+
+static int ux_alloc(int type)
+{
+    for (int i = 0; i < UX_MAX; ++i)
+    {
+        if (usocks[i].used) continue;
+        UnixSock* u = &usocks[i];
+        u->used = 1; u->type = type; u->state = 0; u->peer = -1; u->peer_closed = 0; u->wr_shut = 0;
+        u->attached = 0; u->path[0] = 0; u->rd = u->wr = u->size = 0; u->tot_w = u->tot_r = 0;
+        u->nback = 0; u->nfdq = 0;
+        return i;
+    }
+    return -1;
 }
 
 static void release_object(int object)
@@ -255,6 +366,12 @@ static void release_object(int object)
         if (file->kind == FD_KIND_PIPE_WRITE && pipes[pipe_id].writers > 0)
             --pipes[pipe_id].writers;
     }
+    if (file->kind == FD_KIND_SOCK_TCP && file->aux > 0) (void)net_tcp_close(file->owner, file->aux);
+    else if (file->kind == FD_KIND_SOCK_UDP && file->aux > 0) (void)net_udp_close(file->owner, file->aux);
+    else if (file->kind == FD_KIND_EVENT && file->aux >= 0 && file->aux < EV_MAX) events[file->aux].used = 0;
+    else if (file->kind == FD_KIND_TIMER && file->aux >= 0 && file->aux < TF_MAX) timerfds[file->aux].used = 0;
+    else if (file->kind == FD_KIND_FILE) { for (int i = 0; i < FL_MAX; ++i) { if (flocks[i].used && flocks[i].obj == object) flocks[i].used = 0; } }
+    if (file->kind == FD_KIND_UNIX) { int ux = file->aux; clear_object(object); ux_free(ux); maybe_destroy_pipe(pipe_id); return; }
     clear_object(object);
     maybe_destroy_pipe(pipe_id);
 }
@@ -296,6 +413,10 @@ void fd_init()
         }
     }
     for (int i = 0; i < FD_OPEN_FILES; ++i) clear_object(i);
+    for (int i = 0; i < EV_MAX; ++i) events[i].used = 0;
+    for (int i = 0; i < TF_MAX; ++i) timerfds[i].used = 0;
+    for (int i = 0; i < FL_MAX; ++i) flocks[i].used = 0;
+    for (int i = 0; i < UX_MAX; ++i) usocks[i].used = 0;
     for (int i = 0; i < FD_PIPE_MAX; ++i)
     {
         pipes[i].used = 0;
@@ -376,7 +497,9 @@ int fd_open(const char* path, uint32_t flags, int cwd)
     if (!path || !path[0] || string_length(path) >= (int)sizeof(open_files[0].path))
         return -22;
     const int want_cloexec = (flags & 0x1000U) != 0;   /* O_CLOEXEC */
-    flags &= ~0x1000U;
+    const int want_excl = (flags & 0x2000U) != 0;      /* O_EXCL (with O_CREAT: fail when the file exists) */
+    flags &= ~0x3000U;
+    if (want_excl && !(flags & FD_O_CREAT)) return -22;
     if ((flags & ~(FD_O_CREAT | FD_O_TRUNC | FD_O_APPEND | 3U)) != 0 ||
         access_mode(flags) == 3U)
         return -22;
@@ -388,6 +511,7 @@ int fd_open(const char* path, uint32_t flags, int cwd)
     if (object < 0) return -24;
 
     int id = fs_resolve(path, cwd);
+    if (id >= 0 && want_excl) return -17;
     if (id < 0)
     {
         if (!(flags & FD_O_CREAT)) return -2;
@@ -497,6 +621,675 @@ int fd_pipe(int descriptors[2])
     return 0;
 }
 
+static OpenFile* file_of(int descriptor);
+static int new_object_fd(int kind, uint32_t flags, int aux, int owner, int cloexec);
+#ifndef SOCK_NONBLOCK_FLAG
+#define SOCK_TYPE_MASK 0xF
+#define SOCK_NONBLOCK_FLAG 0x800
+#define SOCK_CLOEXEC_FLAG 0x1000
+#endif
+
+static void tf_update(TimerFd* tf)
+{
+    if (!tf->next_ms) return;
+    uint64_t now = timer_millis();
+    if (now < tf->next_ms) return;
+    if (tf->interval_ms)
+    {
+        uint64_t n = 1 + (now - tf->next_ms) / tf->interval_ms;
+        tf->expirations += n;
+        tf->next_ms += n * tf->interval_ms;
+    }
+    else { tf->expirations += 1; tf->next_ms = 0; }
+}
+
+int fd_timerfd_create(int flags)
+{
+    int idx = -1;
+    for (int i = 0; i < TF_MAX; ++i) if (!timerfds[i].used) { idx = i; break; }
+    if (idx < 0) return -24;
+    timerfds[idx].used = 1; timerfds[idx].interval_ms = 0; timerfds[idx].next_ms = 0; timerfds[idx].expirations = 0;
+    int d = new_object_fd(FD_KIND_TIMER, FD_O_RDWR | ((flags & SOCK_NONBLOCK_FLAG) ? FD_O_NONBLOCK : 0), idx, -1, (flags & SOCK_CLOEXEC_FLAG) != 0);
+    if (d < 0) timerfds[idx].used = 0;
+    return d;
+}
+
+/* first_ms == 0 disarms. old[0] = remaining ms, old[1] = interval ms (both may be NULL) */
+int fd_timerfd_settime(int descriptor, uint64_t first_ms, uint64_t interval_ms, uint64_t* old)
+{
+    OpenFile* f = file_of(descriptor);
+    if (!f || f->kind != FD_KIND_TIMER) return f ? -22 : -9;
+    TimerFd* tf = &timerfds[f->aux];
+    tf_update(tf);
+    if (old) { uint64_t now = timer_millis(); old[0] = tf->next_ms && tf->next_ms > now ? tf->next_ms - now : 0; old[1] = tf->interval_ms; }
+    tf->expirations = 0;
+    tf->interval_ms = interval_ms;
+    tf->next_ms = first_ms ? timer_millis() + first_ms : 0;
+    return 0;
+}
+
+int fd_timerfd_gettime(int descriptor, uint64_t out[2])
+{
+    OpenFile* f = file_of(descriptor);
+    if (!f || f->kind != FD_KIND_TIMER) return f ? -22 : -9;
+    TimerFd* tf = &timerfds[f->aux];
+    tf_update(tf);
+    uint64_t now = timer_millis();
+    out[0] = tf->next_ms && tf->next_ms > now ? tf->next_ms - now : 0; out[1] = tf->interval_ms;
+    return 0;
+}
+
+/* fstat: regular files go through the filesystem; other kinds are synthesized (type 3 fifo, 4 socket, 5 tty, 6 anonymous) */
+int fd_fstat(int descriptor, FsStat* out)
+{
+    OpenFile* f = file_of(descriptor);
+    if (!f) return -9;
+    uint8_t* z = (uint8_t*)out; for (uint64_t i = 0; i < sizeof(FsStat); ++i) z[i] = 0;
+    if (f->kind == FD_KIND_FILE) return fs_stat_path(f->path, f->cwd, out);
+    out->mode = 0600;
+    switch (f->kind)
+    {
+        case FD_KIND_STDIN: case FD_KIND_STDOUT: case FD_KIND_STDERR: out->type = 5; out->mode = 0620; break;
+        case FD_KIND_PIPE_READ: case FD_KIND_PIPE_WRITE: out->type = 3; break;
+        case FD_KIND_SOCK_TCP: case FD_KIND_SOCK_UDP: case FD_KIND_UNIX: out->type = 4; out->mode = 0777; break;
+        default: out->type = 6; break;
+    }
+    out->inode = (uint32_t)(f - open_files) + 1U;
+    return 0;
+}
+
+int fd_file_path(int descriptor, char* out, int cap, int* cwd)
+{
+    OpenFile* f = file_of(descriptor);
+    if (!f) return -9;
+    if (f->kind != FD_KIND_FILE) return -22;
+    int l = 0; while (f->path[l] && l + 1 < cap) { out[l] = f->path[l]; ++l; }
+    out[l] = 0; *cwd = f->cwd;
+    return 0;
+}
+
+int fd_ftruncate(int descriptor, uint64_t length)
+{
+    OpenFile* f = file_of(descriptor);
+    if (!f) return -9;
+    if (f->kind != FD_KIND_FILE) return -22;
+    if (!can_write(f->flags)) return -9;
+    if (length > 4194304ULL) return -27;
+    return fs_truncate(f->path, f->cwd, length);
+}
+
+/* flock: op 1 shared, 2 exclusive, 8 unlock. Returns -11 on conflict (caller blocks unless LOCK_NB). */
+int fd_flock(int descriptor, int op)
+{
+    OpenFile* f = file_of(descriptor);
+    if (!f) return -9;
+    if (f->kind != FD_KIND_FILE) return -22;
+    int obj = (int)(f - open_files);
+    int node = fs_resolve(f->path, f->cwd);
+    if (node < 0) return -2;
+    for (int i = 0; i < FL_MAX; ++i) if (flocks[i].used && flocks[i].obj == obj) flocks[i].used = 0;   /* drop my old lock (convert) */
+    if (op == 8) return 0;
+    int want_ex = (op == 2);
+    for (int i = 0; i < FL_MAX; ++i)
+        if (flocks[i].used && flocks[i].node == node && flocks[i].obj != obj && (flocks[i].ex || want_ex)) return -11;
+    for (int i = 0; i < FL_MAX; ++i)
+        if (!flocks[i].used) { flocks[i].used = 1; flocks[i].node = node; flocks[i].ex = want_ex; flocks[i].obj = obj; return 0; }
+    return -37;                                    /* ENOLCK */
+}
+
+/* ===================== unified descriptors: sockets, eventfd, AF_UNIX, poll ===================== */
+
+static int new_object_fd(int kind, uint32_t flags, int aux, int owner, int cloexec)
+{
+    FdTable* table = current_table();
+    if (!table) return -24;
+    int descriptor = free_descriptor(table, 0);
+    if (descriptor < 0) return -24;
+    int object = free_object();
+    if (object < 0) return -24;
+    OpenFile* f = &open_files[object];
+    clear_object(object);
+    f->used = 1; f->permanent = 0; f->kind = kind; f->refs = 1; f->flags = flags;
+    f->aux = aux; f->owner = owner;
+    table->entries[descriptor].used = 1;
+    table->entries[descriptor].object = object;
+    table->entries[descriptor].cloexec = cloexec;
+    return descriptor;
+}
+
+static OpenFile* file_of(int descriptor)
+{
+    FdTable* table = current_table();
+    if (!descriptor_valid_in(table, descriptor)) return 0;
+    return &open_files[table->entries[descriptor].object];
+}
+
+static int object_of(int descriptor)
+{
+    FdTable* table = current_table();
+    if (!descriptor_valid_in(table, descriptor)) return -1;
+    return table->entries[descriptor].object;
+}
+
+int fd_set_nonblock(int descriptor, int value)
+{
+    OpenFile* f = file_of(descriptor);
+    if (!f) return -9;
+    if (value) f->flags |= FD_O_NONBLOCK; else f->flags &= ~FD_O_NONBLOCK;
+    return 0;
+}
+
+int fd_get_flags(int descriptor)
+{
+    OpenFile* f = file_of(descriptor);
+    if (!f) return -9;
+    return (int)(f->flags & (3U | FD_O_APPEND | FD_O_NONBLOCK));
+}
+
+int fd_is_blocking(int descriptor)
+{
+    OpenFile* f = file_of(descriptor);
+    if (!f || (f->flags & FD_O_NONBLOCK)) return 0;
+    return f->kind == FD_KIND_STDIN || f->kind == FD_KIND_PIPE_READ || f->kind == FD_KIND_PIPE_WRITE || f->kind == FD_KIND_SOCK_TCP ||
+           f->kind == FD_KIND_SOCK_UDP || f->kind == FD_KIND_EVENT || f->kind == FD_KIND_UNIX || f->kind == FD_KIND_TIMER;
+}
+
+int fd_is_socket(int descriptor)
+{
+    OpenFile* f = file_of(descriptor);
+    return f && (f->kind == FD_KIND_SOCK_TCP || f->kind == FD_KIND_SOCK_UDP || f->kind == FD_KIND_UNIX);
+}
+
+/* ---- AF_UNIX ---- */
+static int ux_of(OpenFile* f)
+{
+    if (!f || f->kind != FD_KIND_UNIX || f->aux < 0 || f->aux >= UX_MAX || !usocks[f->aux].used) return -1;
+    return f->aux;
+}
+
+static void ring_put(UnixSock* u, const uint8_t* d, uint32_t n)
+{
+    for (uint32_t i = 0; i < n; ++i) { u->ring[u->wr] = d[i]; u->wr = (u->wr + 1U) % UX_RING; }
+    u->size += n; u->tot_w += n;
+}
+static void ring_get(UnixSock* u, uint8_t* d, uint32_t n)
+{
+    for (uint32_t i = 0; i < n; ++i) { if (d) d[i] = u->ring[u->rd]; u->rd = (u->rd + 1U) % UX_RING; }
+    u->size -= n; u->tot_r += n;
+}
+
+int fd_unix_socket(int type_and_flags)
+{
+    int type = type_and_flags & SOCK_TYPE_MASK;
+    if (type != 1 && type != 2) return -94;      /* ESOCKTNOSUPPORT */
+    int idx = ux_alloc(type);
+    if (idx < 0) return -24;
+    uint32_t fl = FD_O_RDWR | ((type_and_flags & SOCK_NONBLOCK_FLAG) ? FD_O_NONBLOCK : 0);
+    int d = new_object_fd(FD_KIND_UNIX, fl, idx, -1, (type_and_flags & SOCK_CLOEXEC_FLAG) != 0);
+    if (d < 0) { usocks[idx].used = 0; return d; }
+    usocks[idx].attached = 1;
+    return d;
+}
+
+int fd_socketpair(int type_and_flags, int out[2])
+{
+    int a = fd_unix_socket(type_and_flags);
+    if (a < 0) return a;
+    int b = fd_unix_socket(type_and_flags);
+    if (b < 0) { fd_close(a); return b; }
+    int ia = ux_of(file_of(a)), ib = ux_of(file_of(b));
+    usocks[ia].state = usocks[ib].state = 2;
+    usocks[ia].peer = ib; usocks[ib].peer = ia;
+    out[0] = a; out[1] = b;
+    return 0;
+}
+
+static int sock_path_ok(const char* path)
+{
+    int n = string_length(path);
+    return path && n > 0 && n < 108;
+}
+
+int fd_unix_bind(int descriptor, const char* path)
+{
+    OpenFile* f = file_of(descriptor);
+    int me = ux_of(f);
+    if (me < 0) return -88;                       /* ENOTSOCK */
+    if (!sock_path_ok(path)) return -22;
+    if (usocks[me].path[0]) return -22;
+    for (int i = 0; i < UX_MAX; ++i)
+        if (usocks[i].used && usocks[i].path[0] && string_length(usocks[i].path) == string_length(path))
+        {
+            int same = 1;
+            for (int k = 0; path[k]; ++k) if (usocks[i].path[k] != path[k]) { same = 0; break; }
+            if (same) return -98;                 /* EADDRINUSE */
+        }
+    copy_string(usocks[me].path, path, 108);
+    return 0;
+}
+
+static int ux_find_listener(const char* path, int type)
+{
+    for (int i = 0; i < UX_MAX; ++i)
+    {
+        if (!usocks[i].used || usocks[i].state != 1 || usocks[i].type != type) continue;
+        int k = 0;
+        while (path[k] && usocks[i].path[k] == path[k]) ++k;
+        if (!path[k] && !usocks[i].path[k]) return i;
+    }
+    return -1;
+}
+
+int fd_unix_connect(int descriptor, const char* path)
+{
+    OpenFile* f = file_of(descriptor);
+    int me = ux_of(f);
+    if (me < 0) return -88;
+    if (!sock_path_ok(path)) return -22;
+    if (usocks[me].state == 2) return -106;       /* EISCONN */
+    if (usocks[me].state == 1) return -22;
+    int l = ux_find_listener(path, usocks[me].type);
+    if (l < 0) return -111;                       /* ECONNREFUSED */
+    if (usocks[l].nback >= UX_BACKLOG) return -111;
+    int srv = ux_alloc(usocks[me].type);
+    if (srv < 0) return -24;
+    usocks[srv].state = 2; usocks[srv].peer = me; usocks[srv].attached = 0;
+    usocks[me].state = 2; usocks[me].peer = srv;
+    usocks[l].backlog[usocks[l].nback++] = srv;
+    return 0;
+}
+
+static int ux_accept(int descriptor, int flags)
+{
+    OpenFile* f = file_of(descriptor);
+    int me = ux_of(f);
+    if (me < 0) return -88;
+    UnixSock* u = &usocks[me];
+    if (u->state != 1) return -22;
+    if (u->nback == 0) return -11;
+    int srv = u->backlog[0];
+    for (int i = 1; i < u->nback; ++i) u->backlog[i - 1] = u->backlog[i];
+    --u->nback;
+    int d = new_object_fd(FD_KIND_UNIX, FD_O_RDWR | ((flags & SOCK_NONBLOCK_FLAG) ? FD_O_NONBLOCK : 0), srv, -1,
+                          (flags & SOCK_CLOEXEC_FLAG) != 0);
+    if (d < 0)
+    {
+        u->backlog[u->nback++] = srv;             /* leave it queued */
+        return d;
+    }
+    usocks[srv].attached = 1;
+    return d;
+}
+
+/* data path; `fds` may carry SCM_RIGHTS descriptors (stream and datagram) */
+static int64_t ux_send(OpenFile* f, const uint8_t* data, uint64_t len, const int* fds, int nfds)
+{
+    int me = ux_of(f);
+    if (me < 0) return -9;
+    UnixSock* u = &usocks[me];
+    if (u->state != 2) return -107;
+    if (u->wr_shut) return -32;
+    if (u->peer < 0 || !usocks[u->peer].used) return -32;
+    UnixSock* p = &usocks[u->peer];
+    if (nfds > 0)
+    {
+        if (nfds > UX_FDQ || p->nfdq + nfds > UX_FDQ) return -11;
+        if (len == 0) return -22;                 /* ancillary data needs at least one byte */
+    }
+    uint64_t n;
+    if (u->type == 2)
+    {
+        if (len > UX_DGRAM_MAX) return -90;
+        if (UX_RING - p->size < len + 2U) return -11;
+        uint8_t hdr[2] = { (uint8_t)(len & 0xFF), (uint8_t)(len >> 8) };
+        ring_put(p, hdr, 2);
+        ring_put(p, data, (uint32_t)len);
+        n = len;
+    }
+    else
+    {
+        uint64_t space = UX_RING - p->size;
+        if (space == 0) return -11;
+        n = len < space ? len : space;
+        if (nfds > 0 && n < len) return -11;     /* keep the fd-carrying message whole */
+        ring_put(p, data, (uint32_t)n);
+    }
+    for (int i = 0; i < nfds; ++i)
+    {
+        int obj = object_of(fds[i]);
+        if (obj < 0) continue;
+        if (!open_files[obj].permanent) ++open_files[obj].refs;
+        p->fdq_obj[p->nfdq] = obj; p->fdq_end[p->nfdq] = p->tot_w; ++p->nfdq;
+    }
+    return (int64_t)n;
+}
+
+/* returns bytes, 0 on EOF, -11 when empty. `fds_out`/`nfds_out` receive SCM_RIGHTS if requested */
+static int64_t ux_recv(OpenFile* f, uint8_t* out, uint64_t cap, int* fds_out, int* nfds_out, int maxfds)
+{
+    int me = ux_of(f);
+    if (me < 0) return -9;
+    UnixSock* u = &usocks[me];
+    if (u->state == 1) return -22;
+    if (u->state != 2) return -107;
+    if (nfds_out) *nfds_out = 0;
+    if (u->size == 0)
+    {
+        if (u->peer_closed || u->peer < 0 || usocks[u->peer].wr_shut) return 0;
+        return -11;
+    }
+    uint64_t n;
+    if (u->type == 2)
+    {
+        uint8_t hdr[2];
+        uint32_t save_rd = u->rd;
+        (void)save_rd;
+        ring_get(u, hdr, 2);
+        uint32_t mlen = (uint32_t)hdr[0] | ((uint32_t)hdr[1] << 8);
+        n = mlen < cap ? mlen : cap;
+        ring_get(u, out, (uint32_t)n);
+        if (mlen > n) ring_get(u, 0, mlen - (uint32_t)n);
+    }
+    else
+    {
+        n = cap < u->size ? cap : u->size;
+        /* never read across the boundary of a message that carries descriptors */
+        if (u->nfdq > 0 && u->fdq_end[0] > u->tot_r && u->fdq_end[0] - u->tot_r < n) n = u->fdq_end[0] - u->tot_r;
+        ring_get(u, out, (uint32_t)n);
+    }
+    /* descriptors whose data has been consumed */
+    while (u->nfdq > 0 && u->fdq_end[0] <= u->tot_r)
+    {
+        int obj = u->fdq_obj[0];
+        for (int i = 1; i < u->nfdq; ++i) { u->fdq_obj[i - 1] = u->fdq_obj[i]; u->fdq_end[i - 1] = u->fdq_end[i]; }
+        --u->nfdq;
+        int got = -1;
+        if (fds_out && nfds_out && *nfds_out < maxfds)
+        {
+            FdTable* table = current_table();
+            got = attach_object(table, obj, 0);      /* adds a ref */
+        }
+        if (got >= 0) fds_out[(*nfds_out)++] = got;
+        release_object(obj);                          /* drop the reference the queue held */
+    }
+    return (int64_t)n;
+}
+
+int64_t fd_sendmsg(int descriptor, const void* buf, uint64_t len, const int* fds, int nfds)
+{
+    OpenFile* f = file_of(descriptor);
+    if (!f) return -9;
+    if (f->kind != FD_KIND_UNIX) return nfds ? -22 : fd_write(descriptor, buf, len);
+    if (len > FD_IO_MAX) return -22;
+    return ux_send(f, (const uint8_t*)buf, len, fds, nfds);
+}
+
+int64_t fd_recvmsg(int descriptor, void* buf, uint64_t cap, int* fds, int* nfds, int maxfds)
+{
+    OpenFile* f = file_of(descriptor);
+    if (!f) return -9;
+    if (nfds) *nfds = 0;
+    if (f->kind != FD_KIND_UNIX) return fd_read(descriptor, buf, cap);
+    if (cap > FD_IO_MAX) cap = FD_IO_MAX;
+    return ux_recv(f, (uint8_t*)buf, cap, fds, nfds, maxfds);
+}
+
+/* ---- eventfd ---- */
+int fd_eventfd(uint64_t initial, int flags)
+{
+    int idx = -1;
+    for (int i = 0; i < EV_MAX; ++i) if (!events[i].used) { idx = i; break; }
+    if (idx < 0) return -24;
+    events[idx].used = 1; events[idx].counter = initial; events[idx].semaphore = flags & 1;
+    int d = new_object_fd(FD_KIND_EVENT, FD_O_RDWR | ((flags & SOCK_NONBLOCK_FLAG) ? FD_O_NONBLOCK : 0), idx, -1,
+                          (flags & SOCK_CLOEXEC_FLAG) != 0);
+    if (d < 0) events[idx].used = 0;
+    return d;
+}
+
+/* ---- inet sockets (TCP/UDP) as descriptors ---- */
+int fd_socket(int type_and_flags)
+{
+    int type = type_and_flags & SOCK_TYPE_MASK;
+    if (type != 1 && type != 2) return -94;
+    int nb = (type_and_flags & SOCK_NONBLOCK_FLAG) ? 1 : 0;
+    int cloexec = (type_and_flags & SOCK_CLOEXEC_FLAG) != 0;
+    int d = new_object_fd(type == 1 ? FD_KIND_SOCK_TCP : FD_KIND_SOCK_UDP, FD_O_RDWR | (nb ? FD_O_NONBLOCK : 0), -1, -1, cloexec);
+    if (d < 0) return d;
+    OpenFile* f = file_of(d);
+    f->owner = SOCK_OWNER_BASE + object_of(d);
+    int h = type == 1 ? net_tcp_socket(f->owner) : net_udp_socket(f->owner);
+    if (h < 0) { fd_close(d); return h; }
+    f->aux = h;
+    return d;
+}
+
+static OpenFile* inet_of(int descriptor, int* err)
+{
+    OpenFile* f = file_of(descriptor);
+    if (!f) { *err = -9; return 0; }
+    if (f->kind != FD_KIND_SOCK_TCP && f->kind != FD_KIND_SOCK_UDP) { *err = -88; return 0; }
+    return f;
+}
+
+int fd_sock_bind(int descriptor, uint32_t ip, uint16_t port)
+{
+    (void)ip;
+    int e = 0; OpenFile* f = inet_of(descriptor, &e);
+    if (!f) return e;
+    if (f->kind == FD_KIND_SOCK_UDP) return net_udp_bind(f->owner, f->aux, port);
+    f->aux2 = port;
+    return 0;
+}
+
+int fd_sock_listen(int descriptor, int backlog)
+{
+    (void)backlog;
+    int e = 0; OpenFile* f = inet_of(descriptor, &e);
+    if (!f) return e;
+    if (f->kind == FD_KIND_UNIX) return 0;
+    if (f->kind != FD_KIND_SOCK_TCP) return -95;     /* EOPNOTSUPP */
+    return net_tcp_listen(f->owner, f->aux, (uint16_t)f->aux2);
+}
+
+int fd_listen_any(int descriptor, int backlog)
+{
+    OpenFile* f = file_of(descriptor);
+    if (!f) return -9;
+    if (f->kind == FD_KIND_UNIX)
+    {
+        int me = ux_of(f);
+        if (me < 0) return -9;
+        if (usocks[me].type != 1 || !usocks[me].path[0]) return -22;
+        if (usocks[me].state == 2) return -22;
+        usocks[me].state = 1;
+        return 0;
+    }
+    return fd_sock_listen(descriptor, backlog);
+}
+
+int fd_sock_connect(int descriptor, uint32_t ip, uint16_t port)
+{
+    int e = 0; OpenFile* f = inet_of(descriptor, &e);
+    if (!f) return e;
+    if (f->kind == FD_KIND_SOCK_UDP) { f->peer_ip = ip; f->peer_port = port; f->aux2 = 1; return 0; }
+    int rc = net_tcp_connect(f->owner, f->aux, ip, port, NET_TCP_MAX_TIMEOUT_MS);
+    if (rc == -110) rc = -110;
+    return rc;
+}
+
+int fd_accept_any(int descriptor, uint32_t* ip, uint16_t* port, int flags)
+{
+    OpenFile* f = file_of(descriptor);
+    if (!f) return -9;
+    if (f->kind == FD_KIND_UNIX) return ux_accept(descriptor, flags);
+    if (f->kind != FD_KIND_SOCK_TCP) return -95;
+    uint32_t pip = 0; uint16_t pport = 0;
+    (void)net_poll_once();
+    int h = net_tcp_accept(f->owner, f->aux, &pip, &pport, 0);
+    if (h < 0) return h;
+    int owner = f->owner;
+    int d = new_object_fd(FD_KIND_SOCK_TCP, FD_O_RDWR | ((flags & SOCK_NONBLOCK_FLAG) ? FD_O_NONBLOCK : 0), h, owner,
+                          (flags & SOCK_CLOEXEC_FLAG) != 0);
+    if (d < 0) { (void)net_tcp_close(owner, h); return d; }
+    if (ip) *ip = pip;
+    if (port) *port = pport;
+    return d;
+}
+
+int64_t fd_sock_sendto(int descriptor, const void* data, uint64_t len, uint32_t ip, uint16_t port, int has_addr)
+{
+    int e = 0; OpenFile* f = inet_of(descriptor, &e);
+    if (!f) return e;
+    if (f->kind == FD_KIND_SOCK_TCP) return net_tcp_send(f->owner, f->aux, data, (uint32_t)len, NET_TCP_MAX_TIMEOUT_MS);
+    if (!has_addr)
+    {
+        if (!f->aux2) return -89;                 /* EDESTADDRREQ */
+        ip = f->peer_ip; port = f->peer_port;
+    }
+    if (len > NET_UDP_MAX_PAYLOAD) return -90;
+    return net_udp_sendto(f->owner, f->aux, ip, port, data, (uint32_t)len);
+}
+
+int64_t fd_sock_recvfrom(int descriptor, void* data, uint64_t cap, uint32_t* ip, uint16_t* port)
+{
+    OpenFile* f = file_of(descriptor);
+    if (!f) return -9;
+    if (f->kind == FD_KIND_UNIX) return fd_recvmsg(descriptor, data, cap, 0, 0, 0);
+    if (f->kind == FD_KIND_SOCK_TCP)
+    {
+        if (cap > NET_TCP_MAX_IO) cap = NET_TCP_MAX_IO;
+        (void)net_poll_once();       /* timeout 0 never polls the NIC by itself */
+        int r = net_tcp_recv(f->owner, f->aux, data, (uint32_t)cap, 0);
+        return r == -110 ? -11 : r;
+    }
+    if (f->kind != FD_KIND_SOCK_UDP) return -88;
+    if (cap > NET_UDP_MAX_PAYLOAD) cap = NET_UDP_MAX_PAYLOAD;
+    int r = net_udp_recvfrom(f->owner, f->aux, ip, port, data, (uint32_t)cap, 0);
+    return r == -110 ? -11 : r;
+}
+
+int fd_sock_shutdown(int descriptor, int how)   /* 0 RD, 1 WR, 2 RDWR */
+{
+    OpenFile* f = file_of(descriptor);
+    if (!f) return -9;
+    if (how < 0 || how > 2) return -22;
+    if (f->kind == FD_KIND_UNIX)
+    {
+        int me = ux_of(f);
+        if (me < 0) return -9;
+        if (usocks[me].state != 2) return -107;
+        if (how >= 1) usocks[me].wr_shut = 1;
+        return 0;
+    }
+    if (f->kind == FD_KIND_SOCK_TCP)
+    {
+        if (how >= 1) return net_tcp_shutdown_wr(f->owner, f->aux);
+        return 0;
+    }
+    return f->kind == FD_KIND_SOCK_UDP ? 0 : -88;
+}
+
+int fd_sock_name(int descriptor, int peer, uint32_t* ip, uint16_t* port)
+{
+    OpenFile* f = file_of(descriptor);
+    if (!f) return -9;
+    if (f->kind == FD_KIND_SOCK_TCP)
+    {
+        uint32_t rip = 0; uint16_t rport = 0, lport = 0;
+        int connected = net_tcp_info(f->owner, f->aux, &rip, &rport, &lport);
+        if (connected < 0) return connected;
+        if (peer) { if (!connected) return -107; *ip = rip; *port = rport; }
+        else { *ip = 0; *port = lport; }
+        return 0;
+    }
+    if (f->kind == FD_KIND_SOCK_UDP)
+    {
+        if (peer) { if (!f->aux2) return -107; *ip = f->peer_ip; *port = f->peer_port; return 0; }
+        *ip = 0; int lp = net_udp_local_port(f->owner, f->aux); *port = lp > 0 ? (uint16_t)lp : 0; return lp < 0 ? lp : 0;
+    }
+    return -88;
+}
+
+/* sockopt SO_ERROR: pending error of a TCP socket (reset -> ECONNRESET) */
+int fd_sock_error(int descriptor)
+{
+    OpenFile* f = file_of(descriptor);
+    if (!f) return -9;
+    if (f->kind == FD_KIND_SOCK_TCP) return (net_tcp_poll(f->owner, f->aux) & POLL_ERR) ? 104 : 0;
+    return 0;
+}
+
+int fd_sock_type(int descriptor)   /* SOCK_STREAM 1 / SOCK_DGRAM 2, or -88 */
+{
+    OpenFile* f = file_of(descriptor);
+    if (!f) return -9;
+    if (f->kind == FD_KIND_SOCK_TCP) return 1;
+    if (f->kind == FD_KIND_SOCK_UDP) return 2;
+    if (f->kind == FD_KIND_UNIX) { int me = ux_of(f); return me < 0 ? -9 : usocks[me].type; }
+    return -88;
+}
+
+int fd_sock_is_unix(int descriptor)
+{
+    OpenFile* f = file_of(descriptor);
+    return f && f->kind == FD_KIND_UNIX;
+}
+
+/* ---- readiness (poll) ---- */
+int fd_poll_mask(int descriptor)
+{
+    OpenFile* f = file_of(descriptor);
+    if (!f) return POLL_NVAL;
+    switch (f->kind)
+    {
+        case FD_KIND_STDIN: return tty_poll() ? POLL_IN : 0;
+        case FD_KIND_STDOUT: case FD_KIND_STDERR: return POLL_OUT;
+        case FD_KIND_FILE: return (can_read(f->flags) ? POLL_IN : 0) | (can_write(f->flags) ? POLL_OUT : 0);
+        case FD_KIND_PIPE_READ:
+        {
+            if (f->pipe_id < 0 || !pipes[f->pipe_id].used) return POLL_ERR;
+            PipeState* p = &pipes[f->pipe_id];
+            return (p->size ? POLL_IN : 0) | (p->writers == 0 ? POLL_HUP : 0);
+        }
+        case FD_KIND_PIPE_WRITE:
+        {
+            if (f->pipe_id < 0 || !pipes[f->pipe_id].used) return POLL_ERR;
+            PipeState* p = &pipes[f->pipe_id];
+            if (p->readers == 0) return POLL_ERR;
+            return p->size < FD_PIPE_CAPACITY ? POLL_OUT : 0;
+        }
+        case FD_KIND_SOCK_TCP: return net_tcp_poll(f->owner, f->aux);
+        case FD_KIND_SOCK_UDP: return net_udp_poll(f->owner, f->aux);
+        case FD_KIND_EVENT:
+        {
+            EventState* e = &events[f->aux];
+            return (e->counter ? POLL_IN : 0) | (e->counter < 0xFFFFFFFFFFFFFFFEULL ? POLL_OUT : 0);
+        }
+        case FD_KIND_TIMER: { TimerFd* tf = &timerfds[f->aux]; tf_update(tf); return tf->expirations ? POLL_IN : 0; }
+        case FD_KIND_UNIX:
+        {
+            int me = ux_of(f);
+            if (me < 0) return POLL_ERR;
+            UnixSock* u = &usocks[me];
+            if (u->state == 1) return u->nback ? POLL_IN : 0;
+            if (u->state != 2) return POLL_OUT | POLL_HUP;
+            int m = 0;
+            int eof = u->peer_closed || u->peer < 0 || usocks[u->peer].wr_shut;
+            if (u->size) m |= POLL_IN;
+            else if (eof) m |= POLL_IN | POLL_HUP;
+            if (u->peer >= 0 && usocks[u->peer].used)
+            {
+                if (UX_RING - usocks[u->peer].size >= (u->type == 2 ? UX_DGRAM_MAX + 2U : 1U) && !u->wr_shut) m |= POLL_OUT;
+            }
+            else m |= POLL_ERR;
+            return m;
+        }
+        default: return POLL_NVAL;
+    }
+}
+
+
 int64_t fd_read(int descriptor, void* buffer, uint64_t length)
 {
     FdTable* table = current_table();
@@ -510,15 +1303,7 @@ int64_t fd_read(int descriptor, void* buffer, uint64_t length)
 
     if (entry->kind == FD_KIND_STDIN)
     {
-        uint8_t* out = (uint8_t*)buffer;
-        uint64_t got = 0;
-        while (got < length)
-        {
-            int c = uart_try_getc();
-            if (c < 0) break;
-            out[got++] = (uint8_t)c;
-        }
-        return (int64_t)got;
+        return tty_read((uint8_t*)buffer, length);
     }
     if (entry->kind == FD_KIND_PIPE_READ)
     {
@@ -535,6 +1320,29 @@ int64_t fd_read(int descriptor, void* buffer, uint64_t length)
         }
         pipe->size -= (uint32_t)count;
         return (int64_t)count;
+    }
+    if (entry->kind == FD_KIND_SOCK_TCP || entry->kind == FD_KIND_SOCK_UDP)
+        return fd_sock_recvfrom(descriptor, buffer, length, 0, 0);
+    if (entry->kind == FD_KIND_UNIX) return fd_recvmsg(descriptor, buffer, length, 0, 0, 0);
+    if (entry->kind == FD_KIND_TIMER)
+    {
+        if (length < 8) return -22;
+        TimerFd* tf = &timerfds[entry->aux];
+        tf_update(tf);
+        if (tf->expirations == 0) return -11;
+        *(uint64_t*)buffer = tf->expirations;
+        tf->expirations = 0;
+        return 8;
+    }
+    if (entry->kind == FD_KIND_EVENT)
+    {
+        if (length < 8) return -22;
+        EventState* ev = &events[entry->aux];
+        if (ev->counter == 0) return -11;
+        uint64_t v = ev->semaphore ? 1 : ev->counter;
+        ev->counter -= v;
+        *(uint64_t*)buffer = v;
+        return 8;
     }
     if (entry->kind != FD_KIND_FILE) return -9;
 
@@ -587,6 +1395,19 @@ int64_t fd_write(int descriptor, const void* buffer, uint64_t length)
         }
         pipe->size += (uint32_t)count;
         return (int64_t)count;
+    }
+    if (entry->kind == FD_KIND_SOCK_TCP || entry->kind == FD_KIND_SOCK_UDP)
+        return fd_sock_sendto(descriptor, buffer, length, 0, 0, 0);
+    if (entry->kind == FD_KIND_UNIX) return fd_sendmsg(descriptor, buffer, length, 0, 0);
+    if (entry->kind == FD_KIND_EVENT)
+    {
+        if (length < 8) return -22;
+        uint64_t v = *(const uint64_t*)buffer;
+        EventState* ev = &events[entry->aux];
+        if (v == 0xFFFFFFFFFFFFFFFFULL) return -22;
+        if (ev->counter > 0xFFFFFFFFFFFFFFFEULL - v) return -11;
+        ev->counter += v;
+        return 8;
     }
     if (entry->kind != FD_KIND_FILE) return -9;
 
@@ -661,6 +1482,11 @@ void fd_list()
             case FD_KIND_FILE: uart_puts("file       "); break;
             case FD_KIND_PIPE_READ: uart_puts("pipe-read  "); break;
             case FD_KIND_PIPE_WRITE: uart_puts("pipe-write "); break;
+            case FD_KIND_SOCK_TCP: uart_puts("tcp-socket "); break;
+            case FD_KIND_SOCK_UDP: uart_puts("udp-socket "); break;
+            case FD_KIND_EVENT: uart_puts("eventfd    "); break;
+            case FD_KIND_UNIX: uart_puts("unix-socket"); break;
+            case FD_KIND_TIMER: uart_puts("timerfd    "); break;
             default: uart_puts("unknown    "); break;
         }
         if (entry->kind == FD_KIND_FILE)

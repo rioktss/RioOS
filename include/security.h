@@ -47,6 +47,7 @@ uint32_t security_gid();
 void security_apply_fs_credentials();
 int security_verify(const char* name, const char* password);
 int security_ids_of(const char* name, uint32_t* uid, uint32_t* gid);   /* 0 ok, -1 unknown account */
+int security_account_at(int index, char* name16, uint32_t* uid, uint32_t* gid);   /* index-th account, no secrets; -1 past the end */
 int security_login_as(const char* name, const char* password);
 int security_user_add(const char* name, const char* password);   /* root only */
 int security_user_del(const char* name);                         /* root only */

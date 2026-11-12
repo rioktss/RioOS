@@ -102,7 +102,7 @@ extern "C" void kernel_main()
     uart_puts("[5] Initializing MMU...\r\n");
     mmu_init();
     smp_boot_secondaries();
-    if (smp_online_cpu_count() > 1U) uart_puts("SMP: secondary CPUs released via PSCI (idle/job loop; scheduler stays on CPU0).\r\n");
+    if (smp_online_cpu_count() > 1U) uart_puts("SMP: secondary CPUs released via PSCI.\r\n");
 
     uart_puts("[6] Initializing storage / VirtIO block...\r\n");
     storage_init();
@@ -180,6 +180,8 @@ interrupt_timer_line_enable();
 timer_start_periodic(100U);
 interrupt_enable();
 uart_puts("Timer IRQ active: CPU IRQ unmasked, tick = 100 Hz.\r\n");
+smp_enable_scheduling();
+if (smp_sched_on) uart_puts("SMP: scheduler active on all online CPUs (big kernel lock).\r\n");
 uart_puts(
     "Welcome to RioOS!\r\n"
     "Type 'help' to get started.\r\n"

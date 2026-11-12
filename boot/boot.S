@@ -71,6 +71,9 @@ bss_done:
     b boot_hang
 
 boot_drop_el2:
+    /* Do not trap FP/SIMD accesses of EL1/EL0 to EL2 (CPTR_EL2: RES1 bits only). */
+    mov x1, #0x33ff
+    msr cptr_el2, x1
     /* Allow EL1 access to the generic timer counters. */
     mov x1, #3
     msr cnthctl_el2, x1
@@ -94,6 +97,10 @@ boot_drop_el2:
 boot_el1:
     mov x1, #1
     msr spsel, x1
+    /* CPACR_EL1.FPEN = 0b11: EL0 may use FP/Advanced SIMD (the kernel itself is built without FP registers). */
+    mrs x1, cpacr_el1
+    orr x1, x1, #(3 << 20)
+    msr cpacr_el1, x1
     isb
 
     /* Second diagnostic: EL1 was reached. */
@@ -118,7 +125,7 @@ secondary_start:
     mov x19, x0
     ldr x2, =smp_stack_area
     add x3, x19, #1
-    lsl x3, x3, #13                 /* 8 KiB per CPU */
+    lsl x3, x3, #14                 /* 16 KiB per CPU */
     add x2, x2, x3
     mrs x0, CurrentEL
     lsr x0, x0, #2
@@ -127,6 +134,8 @@ secondary_start:
     b.ne 1f
     mov x1, #3
     msr cnthctl_el2, x1
+    mov x1, #0x33ff
+    msr cptr_el2, x1
     mrs x1, hcr_el2
     mov x4, #0x80000000
     orr x1, x1, x4
@@ -144,6 +153,9 @@ secondary_start:
 secondary_el1:
     mov x1, #1
     msr spsel, x1
+    mrs x1, cpacr_el1
+    orr x1, x1, #(3 << 20)
+    msr cpacr_el1, x1
     ldr x0, =smp_boot_ctx
     ldr x1, [x0, #0]
     msr vbar_el1, x1

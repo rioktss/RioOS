@@ -65,6 +65,11 @@ int net_tcp_recv(int owner_pid, int socket_handle, void* data,
                  uint32_t capacity, uint32_t timeout_ms);
 int net_tcp_close(int owner_pid, int socket_handle);
 void net_tcp_close_all_for(int owner_pid);
+int net_tcp_poll(int owner_pid, int socket_handle);   /* Linux poll bits: IN 1, OUT 4, ERR 8, HUP 16, NVAL 32 */
+int net_udp_poll(int owner_pid, int socket_handle);
+int net_tcp_shutdown_wr(int owner_pid, int socket_handle);
+int net_tcp_info(int owner_pid, int socket_handle, uint32_t* remote_ip, uint16_t* remote_port, uint16_t* local_port);
+int net_udp_local_port(int owner_pid, int socket_handle);
 
 /* TCP server: listen on a local port, accept returns a connected handle (same send/recv/close API). */
 int net_tcp_listen(int owner_pid, int socket_handle, uint16_t local_port);

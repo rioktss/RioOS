@@ -26,6 +26,7 @@
 #include "interrupt.h"
 #include "uart.h"
 #include "timer.h"
+#include "smp.h"
 
 /* QEMU virt with GICv2. */
 #define GICD_BASE 0x08000000ULL
@@ -119,8 +120,9 @@ void interrupt_init()
     *GICD_CTLR_REG = 0;
 
     /* Physical timer PPI 30 is a non-secure Group 1 interrupt on QEMU virt. */
-    *GICD_IGROUPR0_REG |= (1U << TIMER_IRQ);
+    *GICD_IGROUPR0_REG |= (1U << TIMER_IRQ) | 1U;      /* + SGI 0: wake-up kick between CPUs */
     GICD_IPRIORITYR0_REG[TIMER_IRQ] = 0x80U;
+    GICD_IPRIORITYR0_REG[0] = 0x80U;
 
     /* Start with the timer PPI disabled and any stale pending bit cleared. */
     *GICD_ICENABLER0_REG = (1U << TIMER_IRQ);
@@ -141,10 +143,30 @@ void interrupt_init()
     uart_puts("Interrupt controller initialized.\r\n");
 }
 
+/* A secondary CPU: its own GIC CPU interface and the banked timer PPI. */
+extern "C" void interrupt_init_secondary()
+{
+    *GICC_PMR_REG = 0xFFU;
+    *GICC_CTLR_REG = GICC_CTLR_VALUE;
+    *GICD_IGROUPR0_REG |= (1U << TIMER_IRQ) | 1U;
+    GICD_IPRIORITYR0_REG[TIMER_IRQ] = 0x80U;
+    GICD_IPRIORITYR0_REG[0] = 0x80U;
+    *GICD_ICPENDR0_REG = (1U << TIMER_IRQ) | 1U;
+    *GICD_ISENABLER0_REG = (1U << TIMER_IRQ) | 1U;
+    asm volatile("dsb sy\n isb" ::: "memory");
+}
+
+/* Wake every other CPU out of wfi (SGI 0, target filter "all but self"). */
+extern "C" void interrupt_kick_others()
+{
+    asm volatile("dsb sy" ::: "memory");
+    *(volatile uint32_t*)(GICD_BASE + 0xF00) = (1U << 24) | 0U;
+}
+
 void interrupt_enable()
 {
     /* Enable the timer PPI before unmasking CPU IRQs. */
-    *GICD_ISENABLER0_REG = (1U << TIMER_IRQ);
+    *GICD_ISENABLER0_REG = (1U << TIMER_IRQ) | 1U;
 
     asm volatile(
         "dsb sy\n"
@@ -221,6 +243,9 @@ extern "C" void interrupt_dispatch(ExceptionFrame* frame)
             timer_interrupt_handler();
             break;
 
+        case 0:                          /* SGI 0: wake-up kick, nothing to do (the wake itself is the point) */
+            break;
+
         default:
             ++irq_unhandled;
 
@@ -268,6 +293,7 @@ void interrupt_idle()
     asm volatile("yield" ::: "memory");
     /* Let background user tasks run while the shell waits for input. */
     if (thread_user_tasks() > 0) thread_yield();
+    smp_idle_wait();        /* several CPUs: sleep until the next tick instead of burning a CPU (no-op otherwise) */
 }
 
 int interrupt_cpu_irq_enabled()

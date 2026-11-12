@@ -65,6 +65,8 @@ int mmu_user_space_destroy(int pid);
 int mmu_user_space_sync_code(int pid, uint64_t start, uint64_t end);
 int mmu_user_space_exists(int pid);
 int mmu_user_space_active_pid();
+int mmu_user_space_is_loaded(int pid);   /* this CPU's TTBR0 really is pid's table (SMP-safe) */
+void mmu_ensure_kernel_space();           /* this CPU runs on the kernel table, whatever other CPUs did */
 
 
 /* Demand paging / copy-on-write / dynamic memory (per active address space). */

@@ -41,7 +41,7 @@ All additions keep the existing commands, syscalls, drivers, FS layout and build
 - Fixed: virtio-net header is 12 bytes with VERSION_1 (frames were shifted by two bytes).
 
 ## SMP
-- Secondary cores are released with PSCI CPU_ON (`-smp N`), run on the kernel page tables and execute offloaded jobs (`smp`, `smp test`). The scheduler, heap and drivers remain on CPU0.
+- Secondary cores are released with PSCI CPU_ON (`-smp N`). Since round 9 they schedule user processes in parallel under a Big Kernel Lock; see `docs/IPC_POSIX.md`. Offloaded jobs (`smp`, `smp test`) still work.
 
 ## Round 2 additions
 - **Shell**: redirects for every built-in (`> >> 2> 2>> &> 2>&1`, `/dev/null`; `<` keeps the legacy `cmd < file`), wildcards `* ?` (`ls *.txt`; `ls cat wc rm stat head tail` run once per match), command substitution `$(cmd)` and backticks (nested, 6 levels), shell functions (`name() { ...; }`, `function name { ...; }`, `return n`, arguments `$1..$9`), `for` lists up to 256 words, tab completion knows all commands.
@@ -102,4 +102,4 @@ All additions keep the existing commands, syscalls, drivers, FS layout and build
 - **`RIOOS_FWD`** (run scripts for Linux, Termux, macOS): comma separated hostfwd rules for host->guest servers, e.g. `RIOOS_FWD="tcp::8080-:8080,tcp::2121-:21,tcp::30000-:30000" bash termux/run-terminal.sh`, then inside RioOS `httpd 8080` / `ftpd -P 30000` and from the host `curl http://127.0.0.1:8080/` or `curl ftp://root:123@127.0.0.1:2121/`. `linux/run.sh` keeps its old default (8080 and 2121); the others forward nothing unless asked.
 
 ## Not implemented
-Scheduler running EL0 processes on several CPUs (secondaries still only run offloaded jobs; this needs a kernel-wide lock and per-CPU state, so it was left out rather than risk corrupting the single-CPU kernel), mounts persisted in an fstab, IPv6 global addressing / routers / DNS / DHCPv6, TLS certificate validation and TLS 1.2, HTTPS server, SSH, ext2, atime/ctime and disk encryption, USB hubs/storage/tablet devices, Wi-Fi and other NICs, audio/GPU, booting on real hardware (Raspberry Pi), native machine-code compilation, kernel floating-point (userspace floats are soft-float), job-control signals beyond what `jobs/fg/bg/kill` already do.
+Parallel kernel execution (SMP uses a Big Kernel Lock; only user code runs in parallel), mounts persisted in an fstab, IPv6 global addressing / routers / DNS / DHCPv6, TLS certificate validation and TLS 1.2, HTTPS server, SSH, ext2, atime/ctime and disk encryption, USB hubs/storage/tablet devices, Wi-Fi and other NICs, audio/GPU, booting on real hardware (Raspberry Pi), native machine-code compilation, kernel floating-point (userspace floats are soft-float), job-control signals beyond what `jobs/fg/bg/kill` already do.

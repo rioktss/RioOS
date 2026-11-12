@@ -848,6 +848,25 @@ int mmu_user_space_active_pid()
     return active_user_space >= 0 ? user_spaces[active_user_space].pid : -1;
 }
 
+int mmu_user_space_is_loaded(int pid)
+{
+    int slot = user_space_find(pid);
+    if (slot < 0 || active_user_space != slot) return 0;
+    return read_ttbr0() == (uint64_t)user_l1[slot];
+}
+
+void mmu_ensure_kernel_space()
+{
+    if (!mmu_enabled()) return;
+    if (read_ttbr0() != (uint64_t)l1_table)
+    {
+        asm volatile("msr ttbr0_el1, %0\n isb" :: "r"((uint64_t)l1_table) : "memory");
+        tlb_flush_all();
+    }
+    active_user_space = -1;
+    user_active = 0;
+}
+
 int mmu_user_space_create(int pid)
 {
     if (!mmu_enabled() || pid < 0 || !page_alloc_ready()) return -1;
@@ -1068,6 +1087,7 @@ int mmu_user_space_destroy(int pid)
     int slot = user_space_find(pid);
     if (slot < 0) return -1;
     if (active_user_space == slot) (void)mmu_user_space_deactivate();
+    if (read_ttbr0() == (uint64_t)user_l1[slot]) mmu_ensure_kernel_space();    /* this CPU must not keep running on tables about to be freed */
 
     for (uint64_t i = 0; i < MAX_USER_PAGES; ++i)
     {

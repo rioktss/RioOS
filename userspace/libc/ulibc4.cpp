@@ -51,16 +51,17 @@ void __rio_sigreturn(void);
 __asm__(".text\n.global __rio_sigreturn\n__rio_sigreturn:\n mov x8, #67\n svc #0\n 1: b 1b\n");
 
 /* setjmp family: x19-x28, x29, x30, sp (+ signal mask for sigsetjmp) */
-__asm__(".text\n"
+/* d8-d15 (callee-saved FP registers) are kept at byte offset 120..183 of the jmp_buf. */
+__asm__(".text\n.arch_extension fp\n"
         ".global setjmp\nsetjmp:\n"
         " stp x19, x20, [x0]\n stp x21, x22, [x0, #16]\n stp x23, x24, [x0, #32]\n stp x25, x26, [x0, #48]\n stp x27, x28, [x0, #64]\n"
-        " stp x29, x30, [x0, #80]\n mov x2, sp\n str x2, [x0, #96]\n mov x0, #0\n ret\n"
+        " stp x29, x30, [x0, #80]\n stp d8, d9, [x0, #120]\n stp d10, d11, [x0, #136]\n stp d12, d13, [x0, #152]\n stp d14, d15, [x0, #168]\n mov x2, sp\n str x2, [x0, #96]\n mov x0, #0\n ret\n"
         ".global longjmp\nlongjmp:\n"
         " ldp x19, x20, [x0]\n ldp x21, x22, [x0, #16]\n ldp x23, x24, [x0, #32]\n ldp x25, x26, [x0, #48]\n ldp x27, x28, [x0, #64]\n"
-        " ldp x29, x30, [x0, #80]\n ldr x2, [x0, #96]\n mov sp, x2\n cmp w1, #0\n csinc w0, w1, wzr, ne\n ret\n"
+        " ldp x29, x30, [x0, #80]\n ldp d8, d9, [x0, #120]\n ldp d10, d11, [x0, #136]\n ldp d12, d13, [x0, #152]\n ldp d14, d15, [x0, #168]\n ldr x2, [x0, #96]\n mov sp, x2\n cmp w1, #0\n csinc w0, w1, wzr, ne\n ret\n"
         ".global sigsetjmp\nsigsetjmp:\n"
         " stp x19, x20, [x0]\n stp x21, x22, [x0, #16]\n stp x23, x24, [x0, #32]\n stp x25, x26, [x0, #48]\n stp x27, x28, [x0, #64]\n"
-        " stp x29, x30, [x0, #80]\n mov x2, sp\n str x2, [x0, #96]\n"
+        " stp x29, x30, [x0, #80]\n stp d8, d9, [x0, #120]\n stp d10, d11, [x0, #136]\n stp d12, d13, [x0, #152]\n stp d14, d15, [x0, #168]\n mov x2, sp\n str x2, [x0, #96]\n"
         " sxtw x1, w1\n str x1, [x0, #104]\n cbz x1, 1f\n"
         " mov x9, x0\n mov x0, #3\n mov x1, #0\n mov x8, #66\n svc #0\n str x0, [x9, #112]\n"
         "1: mov x0, #0\n ret\n"

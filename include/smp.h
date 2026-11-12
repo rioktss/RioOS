@@ -39,6 +39,31 @@ uint32_t smp_cpu_id();
 uint32_t smp_online_cpu_count();
 int smp_is_enabled();
 
+/* Big kernel lock. With more than one online CPU every CPU runs scheduled threads, and the lock is held whenever a CPU executes
+   kernel code. It is released only when a CPU returns to EL0 or idles, and it is handed over (not released) by context switches
+   made on the same CPU. With a single CPU it is never activated and every operation below is a no-op. */
+extern volatile int smp_sched_on;
+#define SMP_MAX_CPUS 8
+void bkl_lock();
+void bkl_unlock();
+int bkl_held();
+void smp_idle_wait();               /* boot-CPU thread with nothing to do: sleep until the next interrupt without the lock */
+void smp_kick_others();             /* wake idle CPUs (a process exited, a thread became runnable) */
+void smp_window();                 /* brief hand-over window for a CPU that busy-waits in the kernel (IRQs must be masked) */
+void smp_enable_scheduling();      /* boot CPU: let every online CPU run scheduled threads */
+#ifndef HOST_TEST
+static inline uint32_t smp_cpu_id_fast() { uint64_t m; asm volatile("mrs %0, mpidr_el1" : "=r"(m)); return (uint32_t)(m & 0xFFU); }
+#else
+static inline uint32_t smp_cpu_id_fast() { return 0; }
+#endif
+extern "C" {
+void bkl_enter_user();                         /* EL0 exception entry */
+void bkl_leave_exception(void* frame);         /* before eret: releases when returning to EL0 */
+int bkl_enter_el1();                           /* EL1 exception entry: returns 1 when it took the lock */
+void bkl_leave_el1(int took);
+void bkl_leave_to_user();                      /* before a direct eret to EL0 */
+}
+
 void smp_spinlock_init(SmpSpinlock* lock);
 void smp_spin_lock(SmpSpinlock* lock);
 int smp_spin_try_lock(SmpSpinlock* lock);

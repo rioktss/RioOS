@@ -105,6 +105,38 @@ enum SyscallNumber
     SYS_SIGQUEUE   = 74,  /* sigqueue(pid, sig, value) */
     SYS_SIGALTSTACK= 75,  /* sigaltstack(const stack_t* new, stack_t* old) */
     SYS_SIGWAIT    = 76,  /* sigwait(set, timeout_ms | ~0 = forever, siginfo* out) -> signal / -EAGAIN / -EINTR */
+    SYS_SOCKET     = 80,  /* socket(domain 1 UNIX / 2 INET, type 1 STREAM / 2 DGRAM | 0x800 NONBLOCK | 0x1000 CLOEXEC) -> fd */
+    SYS_BIND       = 81,  /* bind(fd, ip, port) or bind(fd, path) for AF_UNIX */
+    SYS_LISTEN     = 82,  /* listen(fd, backlog) */
+    SYS_ACCEPT     = 83,  /* accept(fd, uint64_t* peer(ip|port<<32) or 0, flags) -> fd (blocks unless O_NONBLOCK) */
+    SYS_CONNECT    = 84,  /* connect(fd, ip, port) or connect(fd, path) for AF_UNIX */
+    SYS_SENDTO     = 85,  /* sendto(fd, buf, len, ip|port<<32, has_addr) */
+    SYS_RECVFROM   = 86,  /* recvfrom(fd, buf, len, uint64_t* peer or 0) */
+    SYS_SHUTDOWN   = 87,  /* shutdown(fd, how) */
+    SYS_SOCKNAME   = 88,  /* sockname(fd, peer, uint64_t* out(ip|port<<32)) */
+    SYS_SOCKETPAIR = 89,  /* socketpair(type|flags, int fds[2]) AF_UNIX */
+    SYS_EVENTFD    = 90,  /* eventfd(initial, flags: 1 SEMAPHORE | 0x800 NONBLOCK | 0x1000 CLOEXEC) */
+    SYS_POLL       = 91,  /* poll(struct pollfd*, nfds, timeout_ms (<0 forever)) -> ready count / -EINTR */
+    SYS_SENDMSG    = 92,  /* sendmsg(fd, buf, len, int* fds, nfds): SCM_RIGHTS */
+    SYS_RECVMSG    = 93,  /* recvmsg(fd, buf, cap, int* fds, maxfds | nfds_out_ptr<<8 not used: x4 = int* nfds) */
+    SYS_SOCKINFO   = 94,  /* sockinfo(fd, what 0 SO_ERROR / 1 SO_TYPE) */
+    SYS_PIPE2      = 95,  /* pipe2(int fds[2], flags 0x800 NONBLOCK | 0x1000 CLOEXEC) */
+    SYS_FUTEX      = 96,  /* futex(addr, op 0 WAIT / 1 WAKE, val, timeout_ms | ~0 forever) */
+    SYS_FSTAT      = 98,  /* fstat(fd, FsStat*) */
+    SYS_FS_CHOWN   = 99,  /* chown(path, uid, gid): root only */
+    SYS_FS_UTIME   = 100, /* utime(path, mtime_seconds): owner or root */
+    SYS_FTRUNCATE  = 101, /* ftruncate(fd, length) */
+    SYS_FLOCK      = 102, /* flock(fd, op 1 SH / 2 EX / 8 UN | 4 NB) */
+    SYS_FSYNC      = 103, /* fsync(fd): flushes the filesystem */
+    SYS_GETRANDOM  = 104, /* getrandom(buf, len <= 4096) */
+    SYS_TIMERFD    = 105, /* timerfd(op 0 create flags / 1 settime fd,first_ms,interval_ms,old* / 2 gettime fd,out*) */
+    SYS_GETPW      = 106, /* getpw(index, char out[24]: name[16], uid u32, gid u32) -> 0 / -ENOENT past the end */
+    SYS_CHDIR      = 107, /* chdir(path): per-process working directory */
+    SYS_GETCWD     = 108, /* getcwd(buf, cap) -> length */
+    SYS_UMASK      = 109, /* umask(mask | ~0 queries) -> old mask */
+    SYS_SYSINFO    = 110, /* sysinfo(uint64_t out[4]: total_pages, free_pages, online_cpus, uptime_ms) */
+    SYS_FDATTR     = 111, /* fdattr(fd, op 0 fchmod(mode) / 1 fchown(uid,gid) / 2 futimens(mtime_seconds)) on regular files */
+    SYS_TTY        = 97,  /* tty(op 0 tcgetattr / 1 tcsetattr(action in x2) / 2 winsize, ptr) */
     SYS_HTTP_GET   = 78,  /* http_get(url, buf, cap, flags | cacert<<8?) see syscall.cpp: flags bit0 = insecure; x4 = cacert path or 0 -> body length or -errno */
     SYS_SHA256     = 79,  /* sha256(data, len, out32) -> 0 */
     SYS_SETITIMER  = 77,  /* setitimer(value_ms, interval_ms) -> previous remaining ms (SIGALRM) */

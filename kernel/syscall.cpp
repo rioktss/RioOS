@@ -34,6 +34,10 @@
 #include "fs.h"
 #include "vfs.h"
 #include "fd.h"
+#include "tty.h"
+#include "smp.h"
+#include "page_alloc.h"
+#include "tls.h"
 #include "security.h"
 #include "netstack.h"
 #include "process.h"
@@ -127,6 +131,57 @@ static int copy_dns_name(const char* src, char* dst, int from_user)
     dst[253] = '\0';
     return -1;
 }
+
+/* One step of a blocking wait for a user process: handles alarms and signals (-EINTR), then yields for 1 ms. */
+#ifndef HOST_TEST
+static int block_step(int from_user)
+{
+    int me = user_current_pid();
+    if (me >= 0) process_alarm_check(me, timer_millis());
+    if (me >= 0 && (process_sig_pending(me) & ~((1U << SIG_CHLD) | (1U << SIG_CONT))) != 0) return -4;
+    thread_wait_ms(1);
+    (void)select_fd_owner(from_user);
+    return 0;
+}
+#endif
+
+/* working directory of the calling user process (falls back to the shell's directory) */
+static int ucwd(int from_user)
+{
+    if (from_user)
+    {
+        int c = process_cwd(user_current_pid());
+        if (c >= 0) return c;
+    }
+    return vfs_cwd();
+}
+
+/* exec/spawn paths: a relative path that exists below the caller's directory becomes absolute */
+#ifndef HOST_TEST
+static void exec_path_fix(int from_user, char* path)
+{
+    if (!from_user || path[0] == '/' || path[0] == 0) return;
+    int cwd = ucwd(from_user);
+    if (fs_resolve(path, cwd) < 0) return;
+    char base[SYSCALL_PATH_MAX]; vfs_path_of(cwd, base, (int)sizeof(base));
+    char out[SYSCALL_PATH_MAX]; int n = 0;
+    for (int i = 0; base[i] && n < (int)sizeof(out) - 2; ++i) out[n++] = base[i];
+    if (n == 0 || out[n - 1] != '/') out[n++] = '/';
+    const char* r = path; if (r[0] == '.' && r[1] == '/') r += 2;
+    for (int i = 0; r[i] && n < (int)sizeof(out) - 1; ++i) out[n++] = r[i];
+    out[n] = 0;
+    for (int i = 0; i <= n; ++i) path[i] = out[i];
+}
+#endif
+
+
+/* ---- futex: waiters are keyed by the physical address of the word, so shared mappings work across processes ---- */
+#define FUTEX_MAX 64
+struct FutexWaiter { int used; uint64_t key; int woken; };
+static FutexWaiter futex_waiters[FUTEX_MAX];
+
+struct PollFdK { int32_t fd; short events; short revents; };
+#define SYS_POLL_MAX 64
 
 void syscall_dispatch(ExceptionFrame* frame, int from_user)
 {
@@ -391,7 +446,7 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
                 break;
             }
             uint64_t size = 0;
-            int rc = fs_read_file(path, vfs_cwd(), buf, cap, &size);
+            int rc = fs_read_file(path, ucwd(from_user), buf, cap, &size);
             if (rc != 0)
             {
                 /* Preserve actionable filesystem errors for userspace. */
@@ -426,7 +481,7 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
                 result = (uint64_t)-14;
                 break;
             }
-            int write_rc = fs_write_data(path, vfs_cwd(), buf, len);
+            int write_rc = fs_write_data(path, ucwd(from_user), buf, len);
             if (write_rc != 0)
             {
                 result = (uint64_t)(int64_t)write_rc;
@@ -446,12 +501,12 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
                 result = (uint64_t)-14;
                 break;
             }
-            if (raw_flags > 0x17FFULL)
+            if (raw_flags > 0x37FFULL)
             {
                 result = (uint64_t)-22;
                 break;
             }
-            result = (uint64_t)(int64_t)fd_open(path, (uint32_t)raw_flags, vfs_cwd());
+            result = (uint64_t)(int64_t)fd_open(path, (uint32_t)raw_flags, ucwd(from_user));
             break;
         }
 
@@ -483,7 +538,7 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
             }
             result = (uint64_t)fd_read(descriptor, buffer, length);
 #ifndef HOST_TEST
-            while (from_user && (int64_t)result == -11 && fd_is_pipe(descriptor))
+            while (from_user && (int64_t)result == -11 && fd_is_blocking(descriptor))
             {
                 int me = user_current_pid();
                 if (me >= 0) process_alarm_check(me, timer_millis());
@@ -519,7 +574,7 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
                 int me = user_current_pid();
                 if (me >= 0) (void)process_sig_raise(me, SIG_PIPE);
             }
-            if (from_user && fd_is_pipe(descriptor) && ((int64_t)result == -11 ||
+            if (from_user && fd_is_blocking(descriptor) && ((int64_t)result == -11 ||
                 ((int64_t)result > 0 && (uint64_t)result < length)))
             {
                 /* Blocking pipe write: keep going until everything is queued. */
@@ -574,6 +629,8 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
                 }
                 case 1: result = (uint64_t)(int64_t)fd_get_cloexec(fdn); break;                    /* F_GETFD */
                 case 2: result = (uint64_t)(int64_t)fd_set_cloexec(fdn, (int)(frame->x[2] & 1)); break;   /* F_SETFD */
+                case 3: result = (uint64_t)(int64_t)fd_get_flags(fdn); break;                                  /* F_GETFL */
+                case 4: result = (uint64_t)(int64_t)fd_set_nonblock(fdn, (frame->x[2] & FD_O_NONBLOCK) ? 1 : 0); break;   /* F_SETFL */
                 default: result = (uint64_t)-22; break;
             }
             break;
@@ -632,8 +689,8 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
                 break;
             }
             FsStat st;
-            int rc = fs_stat_path(path, vfs_cwd(), &st);
-            if (rc != 0) { result = (uint64_t)(int64_t)rc; break; }
+            int rc = fs_stat_path(path, ucwd(from_user), &st);
+            if (rc != 0) { result = (uint64_t)(int64_t)(rc == -1 ? -2 : rc); break; }
             *out = st;
             result = 0;
             break;
@@ -652,7 +709,7 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
                 result = (uint64_t)-27;
                 break;
             }
-            result = (uint64_t)(int64_t)fs_truncate(path, vfs_cwd(), frame->x[1]);
+            result = (uint64_t)(int64_t)fs_truncate(path, ucwd(from_user), frame->x[1]);
             break;
         }
 
@@ -662,8 +719,8 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
             char path[SYSCALL_PATH_MAX];
             if (copy_path((const char*)frame->x[0], path, from_user) != 0) { result = (uint64_t)-14; break; }
             int rc;
-            if (number == SYS_FS_MKDIR) { rc = fs_resolve(path, vfs_cwd()) >= 0 ? -17 : fs_mkdir(path, vfs_cwd()); if (rc == -1) rc = -2; }
-            else { rc = fs_rm(path, vfs_cwd()); if (rc == -1) rc = -2; else if (rc == -2) rc = -39; else if (rc == -3) rc = -1; else if (rc == -4 || rc == -5) rc = -5; }
+            if (number == SYS_FS_MKDIR) { rc = fs_resolve(path, ucwd(from_user)) >= 0 ? -17 : fs_mkdir(path, ucwd(from_user)); if (rc == -1) rc = -2; }
+            else { rc = fs_rm(path, ucwd(from_user)); if (rc == -1) rc = -2; else if (rc == -2) rc = -39; else if (rc == -3) rc = -1; else if (rc == -4 || rc == -5) rc = -5; }
             result = (uint64_t)(int64_t)(rc >= 0 ? 0 : rc);
             break;
         }
@@ -672,7 +729,7 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
         {
             char from[SYSCALL_PATH_MAX]; char to[SYSCALL_PATH_MAX];
             if (copy_path((const char*)frame->x[0], from, from_user) != 0 || copy_path((const char*)frame->x[1], to, from_user) != 0) { result = (uint64_t)-14; break; }
-            int rc = fs_rename(from, to, vfs_cwd());
+            int rc = fs_rename(from, to, ucwd(from_user));
             result = (uint64_t)(int64_t)(rc == 0 ? 0 : rc == -1 ? -2 : rc == -2 ? -17 : rc == -6 ? -5 : -22);
             break;
         }
@@ -683,7 +740,7 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
             char* out = (char*)frame->x[1]; uint64_t cap = frame->x[2];
             if (copy_path((const char*)frame->x[0], path, from_user) != 0 || out == 0 || cap == 0 ||
                 (from_user && !syscall_user_pointer_ok_write(out, cap))) { result = (uint64_t)-14; break; }
-            int id = fs_resolve(path, vfs_cwd());
+            int id = fs_resolve(path, ucwd(from_user));
             if (id < 0) { result = (uint64_t)-2; break; }
             if (fs_get_type(id) != FS_DIR) { result = (uint64_t)-20; break; }
             uint64_t used = 0; int n = fs_get_child_count(id);
@@ -713,7 +770,7 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
         {
             char a[SYSCALL_PATH_MAX]; char b[SYSCALL_PATH_MAX];
             if (copy_path((const char*)frame->x[0], a, from_user) != 0 || copy_path((const char*)frame->x[1], b, from_user) != 0) { result = (uint64_t)-14; break; }
-            int rc = number == SYS_FS_SYMLINK ? fs_symlink(a, b, vfs_cwd()) : fs_link_hard(a, b, vfs_cwd());
+            int rc = number == SYS_FS_SYMLINK ? fs_symlink(a, b, ucwd(from_user)) : fs_link_hard(a, b, ucwd(from_user));
             if (rc >= 0) rc = 0; else if (rc == -1) rc = -2;
             result = (uint64_t)(int64_t)rc;
             break;
@@ -725,7 +782,7 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
             char* out = (char*)frame->x[1]; uint64_t cap = frame->x[2];
             if (copy_path((const char*)frame->x[0], path, from_user) != 0 || out == 0 || cap == 0 ||
                 (from_user && !syscall_user_pointer_ok_write(out, cap))) { result = (uint64_t)-14; break; }
-            int rc = fs_readlink(path, vfs_cwd(), tmp, (int)sizeof(tmp));
+            int rc = fs_readlink(path, ucwd(from_user), tmp, (int)sizeof(tmp));
             if (rc < 0) { result = (uint64_t)(int64_t)(rc == -1 ? -2 : rc); break; }
             uint64_t n = (uint64_t)rc < cap ? (uint64_t)rc : cap;      /* POSIX: truncates silently, no terminator */
             for (uint64_t i = 0; i < n; ++i) out[i] = tmp[i];
@@ -740,7 +797,7 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
             if (copy_path((const char*)frame->x[0], path, from_user) != 0 || out == 0 ||
                 (from_user && !syscall_user_pointer_ok_write(out, sizeof(FsStat)))) { result = (uint64_t)-14; break; }
             FsStat st;
-            int rc = fs_lstat_path(path, vfs_cwd(), &st);
+            int rc = fs_lstat_path(path, ucwd(from_user), &st);
             if (rc != 0) { result = (uint64_t)(int64_t)(rc == -1 ? -2 : rc); break; }
             *out = st;
             result = 0;
@@ -753,7 +810,7 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
             char* out = (char*)frame->x[1]; uint64_t cap = frame->x[2];
             if (copy_path((const char*)frame->x[0], path, from_user) != 0 || out == 0 || cap < 2 ||
                 (from_user && !syscall_user_pointer_ok_write(out, cap))) { result = (uint64_t)-14; break; }
-            int id = fs_resolve(path, vfs_cwd());
+            int id = fs_resolve(path, ucwd(from_user));
             if (id < 0) { result = (uint64_t)(int64_t)(id == -40 ? -40 : -2); break; }
             vfs_path_of(id, tmp, (int)sizeof(tmp));
             int l = 0; while (tmp[l]) ++l;
@@ -780,7 +837,7 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
                 result = (uint64_t)-22;
                 break;
             }
-            result = (uint64_t)(int64_t)fs_set_mode_path(path, vfs_cwd(), (uint32_t)frame->x[1]);
+            result = (uint64_t)(int64_t)fs_set_mode_path(path, ucwd(from_user), (uint32_t)frame->x[1]);
             break;
         }
 
@@ -970,6 +1027,546 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
             break;
         }
 
+        case SYS_SOCKET:
+        {
+            if (select_fd_owner(from_user) != 0) { result = (uint64_t)-24; break; }
+            int tf = (int)frame->x[1];
+            if (frame->x[0] == 1) result = (uint64_t)(int64_t)fd_unix_socket(tf);
+            else if (frame->x[0] == 2) result = (uint64_t)(int64_t)fd_socket(tf);
+            else result = (uint64_t)-97;                  /* EAFNOSUPPORT */
+            break;
+        }
+
+        case SYS_BIND:
+        case SYS_CONNECT:
+        {
+            if (select_fd_owner(from_user) != 0) { result = (uint64_t)-24; break; }
+            int fdn = frame->x[0] < FD_MAX_DESCRIPTORS ? (int)frame->x[0] : -1;
+            if (fd_sock_is_unix(fdn))
+            {
+                char path[SYSCALL_PATH_MAX];
+                if (copy_path((const char*)frame->x[1], path, from_user) != 0) { result = (uint64_t)-14; break; }
+                result = (uint64_t)(int64_t)(number == SYS_BIND ? fd_unix_bind(fdn, path) : fd_unix_connect(fdn, path));
+                break;
+            }
+            if (frame->x[1] > 0xFFFFFFFFULL || frame->x[2] > 65535ULL) { result = (uint64_t)-22; break; }
+            if (number == SYS_BIND) result = (uint64_t)(int64_t)fd_sock_bind(fdn, (uint32_t)frame->x[1], (uint16_t)frame->x[2]);
+            else result = (uint64_t)(int64_t)fd_sock_connect(fdn, (uint32_t)frame->x[1], (uint16_t)frame->x[2]);
+            break;
+        }
+
+        case SYS_LISTEN:
+        {
+            if (select_fd_owner(from_user) != 0) { result = (uint64_t)-24; break; }
+            int fdn = frame->x[0] < FD_MAX_DESCRIPTORS ? (int)frame->x[0] : -1;
+            result = (uint64_t)(int64_t)fd_listen_any(fdn, (int)frame->x[1]);
+            break;
+        }
+
+        case SYS_ACCEPT:
+        {
+            if (select_fd_owner(from_user) != 0) { result = (uint64_t)-24; break; }
+            int fdn = frame->x[0] < FD_MAX_DESCRIPTORS ? (int)frame->x[0] : -1;
+            uint64_t* out = (uint64_t*)frame->x[1];
+            if (out && from_user && !syscall_user_pointer_ok_write(out, sizeof(uint64_t))) { result = (uint64_t)-14; break; }
+            uint32_t ip = 0; uint16_t port = 0;
+            int rc = fd_accept_any(fdn, &ip, &port, (int)frame->x[2]);
+#ifndef HOST_TEST
+            while (from_user && rc == -11 && fd_is_blocking(fdn))
+            {
+                int b = block_step(from_user);
+                if (b < 0) { rc = b; break; }
+                rc = fd_accept_any(fdn, &ip, &port, (int)frame->x[2]);
+            }
+#endif
+            if (rc >= 0 && out) *out = (uint64_t)ip | ((uint64_t)port << 32);
+            result = (uint64_t)(int64_t)rc;
+            break;
+        }
+
+        case SYS_SENDTO:
+        {
+            if (select_fd_owner(from_user) != 0) { result = (uint64_t)-24; break; }
+            int fdn = frame->x[0] < FD_MAX_DESCRIPTORS ? (int)frame->x[0] : -1;
+            const void* buffer = (const void*)frame->x[1];
+            uint64_t length = frame->x[2];
+            if (length > FD_IO_MAX) { result = (uint64_t)-22; break; }
+            if (length && (!buffer || (from_user && !syscall_user_pointer_ok(buffer, length)))) { result = (uint64_t)-14; break; }
+            if (fd_sock_is_unix(fdn) || !fd_is_socket(fdn))
+            {
+                result = (uint64_t)fd_write(fdn, buffer, length);
+            }
+            else
+                result = (uint64_t)fd_sock_sendto(fdn, buffer, length, (uint32_t)frame->x[3], (uint16_t)(frame->x[3] >> 32), (int)frame->x[4]);
+#ifndef HOST_TEST
+            if (from_user && (int64_t)result == -32) { int me = user_current_pid(); if (me >= 0) (void)process_sig_raise(me, SIG_PIPE); }
+            if (from_user && (int64_t)result == -11 && fd_is_blocking(fdn))
+            {
+                for (;;)
+                {
+                    int b = block_step(from_user);
+                    if (b < 0) { result = (uint64_t)(int64_t)b; break; }
+                    result = fd_sock_is_unix(fdn) ? (uint64_t)fd_write(fdn, buffer, length)
+                        : (uint64_t)fd_sock_sendto(fdn, buffer, length, (uint32_t)frame->x[3], (uint16_t)(frame->x[3] >> 32), (int)frame->x[4]);
+                    if ((int64_t)result != -11) break;
+                }
+            }
+#endif
+            break;
+        }
+
+        case SYS_RECVFROM:
+        {
+            if (select_fd_owner(from_user) != 0) { result = (uint64_t)-24; break; }
+            int fdn = frame->x[0] < FD_MAX_DESCRIPTORS ? (int)frame->x[0] : -1;
+            void* buffer = (void*)frame->x[1];
+            uint64_t length = frame->x[2];
+            uint64_t* out = (uint64_t*)frame->x[3];
+            if (length > FD_IO_MAX) length = FD_IO_MAX;
+            if (length == 0) { result = 0; break; }
+            if (!buffer || (from_user && !syscall_user_pointer_ok_write(buffer, length))) { result = (uint64_t)-14; break; }
+            if (out && from_user && !syscall_user_pointer_ok_write(out, sizeof(uint64_t))) { result = (uint64_t)-14; break; }
+            uint32_t ip = 0; uint16_t port = 0;
+            int64_t rc = fd_sock_recvfrom(fdn, buffer, length, &ip, &port);
+#ifndef HOST_TEST
+            while (from_user && rc == -11 && fd_is_blocking(fdn))
+            {
+                int b = block_step(from_user);
+                if (b < 0) { rc = b; break; }
+                rc = fd_sock_recvfrom(fdn, buffer, length, &ip, &port);
+            }
+#endif
+            if (rc >= 0 && out) *out = (uint64_t)ip | ((uint64_t)port << 32);
+            result = (uint64_t)rc;
+            break;
+        }
+
+        case SYS_SHUTDOWN:
+        {
+            if (select_fd_owner(from_user) != 0) { result = (uint64_t)-24; break; }
+            int fdn = frame->x[0] < FD_MAX_DESCRIPTORS ? (int)frame->x[0] : -1;
+            result = (uint64_t)(int64_t)fd_sock_shutdown(fdn, (int)frame->x[1]);
+            break;
+        }
+
+        case SYS_SOCKNAME:
+        {
+            if (select_fd_owner(from_user) != 0) { result = (uint64_t)-24; break; }
+            int fdn = frame->x[0] < FD_MAX_DESCRIPTORS ? (int)frame->x[0] : -1;
+            uint64_t* out = (uint64_t*)frame->x[2];
+            if (!out || (from_user && !syscall_user_pointer_ok_write(out, sizeof(uint64_t)))) { result = (uint64_t)-14; break; }
+            uint32_t ip = 0; uint16_t port = 0;
+            int rc = fd_sock_name(fdn, frame->x[1] ? 1 : 0, &ip, &port);
+            if (rc == 0) *out = (uint64_t)ip | ((uint64_t)port << 32);
+            result = (uint64_t)(int64_t)rc;
+            break;
+        }
+
+        case SYS_SOCKETPAIR:
+        {
+            if (select_fd_owner(from_user) != 0) { result = (uint64_t)-24; break; }
+            int* out = (int*)frame->x[1];
+            if (!out || (from_user && !syscall_user_pointer_ok_write(out, 2U * sizeof(int)))) { result = (uint64_t)-14; break; }
+            int pair[2] = {-1, -1};
+            int rc = fd_socketpair((int)frame->x[0], pair);
+            if (rc == 0) { out[0] = pair[0]; out[1] = pair[1]; }
+            result = (uint64_t)(int64_t)rc;
+            break;
+        }
+
+        case SYS_EVENTFD:
+        {
+            if (select_fd_owner(from_user) != 0) { result = (uint64_t)-24; break; }
+            result = (uint64_t)(int64_t)fd_eventfd(frame->x[0], (int)frame->x[1]);
+            break;
+        }
+
+        case SYS_SOCKINFO:
+        {
+            if (select_fd_owner(from_user) != 0) { result = (uint64_t)-24; break; }
+            int fdn = frame->x[0] < FD_MAX_DESCRIPTORS ? (int)frame->x[0] : -1;
+            result = (uint64_t)(int64_t)(frame->x[1] == 0 ? fd_sock_error(fdn) : fd_sock_type(fdn));
+            break;
+        }
+
+        case SYS_PIPE2:
+        {
+            if (select_fd_owner(from_user) != 0) { result = (uint64_t)-24; break; }
+            int* out = (int*)frame->x[0];
+            if (!out || (from_user && !syscall_user_pointer_ok_write(out, 2U * sizeof(int)))) { result = (uint64_t)-14; break; }
+            int pr[2] = {-1, -1};
+            int rc = fd_pipe(pr);
+            if (rc == 0)
+            {
+                if (frame->x[1] & 0x800ULL) { (void)fd_set_nonblock(pr[0], 1); (void)fd_set_nonblock(pr[1], 1); }
+                if (frame->x[1] & 0x1000ULL) { (void)fd_set_cloexec(pr[0], 1); (void)fd_set_cloexec(pr[1], 1); }
+                out[0] = pr[0]; out[1] = pr[1];
+            }
+            result = (uint64_t)(int64_t)rc;
+            break;
+        }
+
+        case SYS_SENDMSG:
+        {
+            if (select_fd_owner(from_user) != 0) { result = (uint64_t)-24; break; }
+            int fdn = frame->x[0] < FD_MAX_DESCRIPTORS ? (int)frame->x[0] : -1;
+            const void* buffer = (const void*)frame->x[1];
+            uint64_t length = frame->x[2];
+            const int* fds = (const int*)frame->x[3];
+            uint64_t nfds = frame->x[4];
+            if (length > FD_IO_MAX || nfds > 8) { result = (uint64_t)-22; break; }
+            if (length && (!buffer || (from_user && !syscall_user_pointer_ok(buffer, length)))) { result = (uint64_t)-14; break; }
+            int local[8];
+            if (nfds)
+            {
+                if (!fds || (from_user && !syscall_user_pointer_ok(fds, nfds * sizeof(int)))) { result = (uint64_t)-14; break; }
+                for (uint64_t i = 0; i < nfds; ++i) local[i] = fds[i];
+            }
+            result = (uint64_t)fd_sendmsg(fdn, buffer, length, local, (int)nfds);
+#ifndef HOST_TEST
+            if (from_user && (int64_t)result == -32) { int me = user_current_pid(); if (me >= 0) (void)process_sig_raise(me, SIG_PIPE); }
+            while (from_user && (int64_t)result == -11 && fd_is_blocking(fdn))
+            {
+                int b = block_step(from_user);
+                if (b < 0) { result = (uint64_t)(int64_t)b; break; }
+                result = (uint64_t)fd_sendmsg(fdn, buffer, length, local, (int)nfds);
+            }
+#endif
+            break;
+        }
+
+        case SYS_RECVMSG:
+        {
+            if (select_fd_owner(from_user) != 0) { result = (uint64_t)-24; break; }
+            int fdn = frame->x[0] < FD_MAX_DESCRIPTORS ? (int)frame->x[0] : -1;
+            void* buffer = (void*)frame->x[1];
+            uint64_t length = frame->x[2];
+            int* fds = (int*)frame->x[3];
+            uint64_t maxfds = frame->x[4] & 0xFFULL;
+            int* nout = (int*)frame->x[5];
+            if (length > FD_IO_MAX) length = FD_IO_MAX;
+            if (length == 0 || !buffer || (from_user && !syscall_user_pointer_ok_write(buffer, length))) { result = (uint64_t)-14; break; }
+            if (maxfds > 8) maxfds = 8;
+            if (maxfds && (!fds || !nout || (from_user && (!syscall_user_pointer_ok_write(fds, maxfds * sizeof(int)) ||
+                                                           !syscall_user_pointer_ok_write(nout, sizeof(int)))))) { result = (uint64_t)-14; break; }
+            int local[8]; int got = 0;
+            int64_t rc = fd_recvmsg(fdn, buffer, length, local, &got, (int)maxfds);
+#ifndef HOST_TEST
+            while (from_user && rc == -11 && fd_is_blocking(fdn))
+            {
+                int b = block_step(from_user);
+                if (b < 0) { rc = b; break; }
+                rc = fd_recvmsg(fdn, buffer, length, local, &got, (int)maxfds);
+            }
+#endif
+            if (rc >= 0 && maxfds)
+            {
+                for (int i = 0; i < got; ++i) fds[i] = local[i];
+                *nout = got;
+            }
+            else if (rc >= 0 && got > 0) { for (int i = 0; i < got; ++i) (void)fd_close(local[i]); }
+            result = (uint64_t)rc;
+            break;
+        }
+
+        case SYS_FUTEX:
+        {
+            if (!from_user) { result = (uint64_t)-38; break; }
+            int me = user_current_pid();
+            uint64_t addr = frame->x[0];
+            if ((addr & 3ULL) != 0 || !syscall_user_pointer_ok((const void*)addr, 4)) { result = (uint64_t)-14; break; }
+            uint32_t* word = (uint32_t*)mmu_user_space_pointer(me, addr);
+            if (!word) { result = (uint64_t)-14; break; }
+            uint64_t key = (uint64_t)word;
+            if (frame->x[1] == 1)                                   /* WAKE(addr, n) */
+            {
+                uint64_t n = frame->x[2]; int woke = 0;
+                for (int i = 0; i < FUTEX_MAX && (uint64_t)woke < n; ++i)
+                    if (futex_waiters[i].used && futex_waiters[i].key == key && !futex_waiters[i].woken) { futex_waiters[i].woken = 1; ++woke; }
+                result = (uint64_t)(int64_t)woke;
+                break;
+            }
+            if (frame->x[1] != 0) { result = (uint64_t)-22; break; }
+            if (*word != (uint32_t)frame->x[2]) { result = (uint64_t)-11; break; }   /* WAIT(addr, expected, timeout_ms) */
+#ifdef HOST_TEST
+            result = (uint64_t)-11;
+#else
+            int slot = -1;
+            for (int i = 0; i < FUTEX_MAX; ++i) if (!futex_waiters[i].used) { slot = i; break; }
+            if (slot < 0) { result = (uint64_t)-11; break; }
+            futex_waiters[slot].used = 1; futex_waiters[slot].key = key; futex_waiters[slot].woken = 0;
+            uint64_t tmo = frame->x[3]; uint64_t start = timer_millis();
+            int64_t rc = 0;
+            while (!futex_waiters[slot].woken)
+            {
+                if (tmo != ~0ULL && timer_millis() - start >= tmo) { rc = -110; break; }
+                int b = block_step(from_user);
+                if (b < 0) { rc = b; break; }
+            }
+            futex_waiters[slot].used = 0;
+            result = (uint64_t)rc;
+#endif
+            break;
+        }
+
+        case SYS_FSTAT:
+        {
+            if (select_fd_owner(from_user) != 0) { result = (uint64_t)-24; break; }
+            FsStat* out = (FsStat*)frame->x[1];
+            if (!out || (from_user && !syscall_user_pointer_ok_write(out, sizeof(FsStat)))) { result = (uint64_t)-14; break; }
+            int fdn = frame->x[0] < FD_MAX_DESCRIPTORS ? (int)frame->x[0] : -1;
+            FsStat tmp;
+            int rc = fd_fstat(fdn, &tmp);
+            if (rc == 0) *out = tmp;
+            result = (uint64_t)(int64_t)rc;
+            break;
+        }
+
+        case SYS_FS_CHOWN:
+        {
+            char path[SYSCALL_PATH_MAX];
+            if (copy_path((const char*)frame->x[0], path, from_user) != 0) { result = (uint64_t)-14; break; }
+            if (from_user && process_uid(user_current_pid()) != 0) { result = (uint64_t)-1; break; }
+            result = (uint64_t)(int64_t)fs_set_owner_path(path, ucwd(from_user), (uint32_t)frame->x[1], (uint32_t)frame->x[2]);
+            break;
+        }
+
+        case SYS_FS_UTIME:
+        {
+            char path[SYSCALL_PATH_MAX];
+            if (copy_path((const char*)frame->x[0], path, from_user) != 0) { result = (uint64_t)-14; break; }
+            result = (uint64_t)(int64_t)fs_set_mtime_path(path, ucwd(from_user), frame->x[1]);
+            break;
+        }
+
+        case SYS_FTRUNCATE:
+        {
+            if (select_fd_owner(from_user) != 0) { result = (uint64_t)-24; break; }
+            int fdn = frame->x[0] < FD_MAX_DESCRIPTORS ? (int)frame->x[0] : -1;
+            result = (uint64_t)(int64_t)fd_ftruncate(fdn, frame->x[1]);
+            break;
+        }
+
+        case SYS_FDATTR:
+        {
+            if (select_fd_owner(from_user) != 0) { result = (uint64_t)-24; break; }
+            char fpath[SYSCALL_PATH_MAX]; int fcwd = 0;
+            int fdn = frame->x[0] < FD_MAX_DESCRIPTORS ? (int)frame->x[0] : -1;
+            int rc = fd_file_path(fdn, fpath, (int)sizeof(fpath), &fcwd);
+            if (rc != 0) { result = (uint64_t)(int64_t)rc; break; }
+            if (frame->x[1] == 0)
+            {
+                if (frame->x[2] > 0777ULL) { result = (uint64_t)-22; break; }
+                rc = fs_set_mode_path(fpath, fcwd, (uint32_t)frame->x[2]);
+            }
+            else if (frame->x[1] == 1)
+            {
+                if (from_user && process_uid(user_current_pid()) != 0) { result = (uint64_t)-1; break; }
+                rc = fs_set_owner_path(fpath, fcwd, (uint32_t)frame->x[2], (uint32_t)frame->x[3]);
+            }
+            else if (frame->x[1] == 2) rc = fs_set_mtime_path(fpath, fcwd, frame->x[2]);
+            else rc = -22;
+            result = (uint64_t)(int64_t)(rc > 0 ? 0 : rc);
+            break;
+        }
+
+        case SYS_FLOCK:
+        {
+            if (select_fd_owner(from_user) != 0) { result = (uint64_t)-24; break; }
+            int fdn = frame->x[0] < FD_MAX_DESCRIPTORS ? (int)frame->x[0] : -1;
+            int op = (int)frame->x[1];
+            int rc = fd_flock(fdn, op & ~4);
+#ifndef HOST_TEST
+            while (from_user && rc == -11 && !(op & 4))
+            {
+                int b = block_step(from_user);
+                if (b < 0) { rc = b; break; }
+                rc = fd_flock(fdn, op & ~4);
+            }
+#endif
+            result = (uint64_t)(int64_t)rc;
+            break;
+        }
+
+        case SYS_FSYNC:
+        {
+            if (select_fd_owner(from_user) != 0) { result = (uint64_t)-24; break; }
+            int fdn = frame->x[0] < FD_MAX_DESCRIPTORS ? (int)frame->x[0] : -1;
+            FsStat tmp;
+            if (frame->x[0] == ~0ULL) { int sr = fs_sync(); result = (uint64_t)(int64_t)(sr > 0 ? 0 : sr); break; }   /* sync(): whole filesystem */
+            int rc = fd_fstat(fdn, &tmp);
+            if (rc == 0) rc = (tmp.type == 0 || tmp.type == 1) ? fs_sync() : -22;
+            result = (uint64_t)(int64_t)(rc > 0 ? 0 : rc);
+            break;
+        }
+
+        case SYS_GETRANDOM:
+        {
+            uint8_t* buf = (uint8_t*)frame->x[0];
+            uint64_t len = frame->x[1];
+            if (len > SYSCALL_IO_MAX) len = SYSCALL_IO_MAX;
+            if (len == 0) { result = 0; break; }
+            if (!buf || (from_user && !syscall_user_pointer_ok_write(buf, len))) { result = (uint64_t)-14; break; }
+            tls_random(buf, (uint32_t)len);
+            result = len;
+            break;
+        }
+
+        case SYS_TIMERFD:
+        {
+            if (select_fd_owner(from_user) != 0) { result = (uint64_t)-24; break; }
+            if (frame->x[0] == 0) { result = (uint64_t)(int64_t)fd_timerfd_create((int)frame->x[1]); break; }
+            int fdn = frame->x[1] < FD_MAX_DESCRIPTORS ? (int)frame->x[1] : -1;
+            if (frame->x[0] == 1)
+            {
+                uint64_t* old = (uint64_t*)frame->x[4];
+                if (old && from_user && !syscall_user_pointer_ok_write(old, 16)) { result = (uint64_t)-14; break; }
+                uint64_t o[2] = {0, 0};
+                int rc = fd_timerfd_settime(fdn, frame->x[2], frame->x[3], &o[0]);
+                if (rc == 0 && old) { old[0] = o[0]; old[1] = o[1]; }
+                result = (uint64_t)(int64_t)rc;
+            }
+            else if (frame->x[0] == 2)
+            {
+                uint64_t* out = (uint64_t*)frame->x[2];
+                if (!out || (from_user && !syscall_user_pointer_ok_write(out, 16))) { result = (uint64_t)-14; break; }
+                uint64_t o[2];
+                int rc = fd_timerfd_gettime(fdn, o);
+                if (rc == 0) { out[0] = o[0]; out[1] = o[1]; }
+                result = (uint64_t)(int64_t)rc;
+            }
+            else result = (uint64_t)-22;
+            break;
+        }
+
+        case SYS_GETPW:
+        {
+            uint8_t* out = (uint8_t*)frame->x[1];
+            if (!out || (from_user && !syscall_user_pointer_ok_write(out, 24))) { result = (uint64_t)-14; break; }
+#ifdef HOST_TEST
+            result = (uint64_t)-2;
+#else
+            char nm[16]; uint32_t u = 0, g = 0;
+            if (security_account_at((int)frame->x[0], nm, &u, &g) != 0) { result = (uint64_t)-2; break; }
+            for (int i = 0; i < 16; ++i) out[i] = (uint8_t)nm[i];
+            *(uint32_t*)(out + 16) = u; *(uint32_t*)(out + 20) = g;
+            result = 0;
+#endif
+            break;
+        }
+
+        case SYS_CHDIR:
+        {
+            char path[SYSCALL_PATH_MAX];
+            if (!from_user) { result = (uint64_t)-38; break; }
+            if (copy_path((const char*)frame->x[0], path, from_user) != 0) { result = (uint64_t)-14; break; }
+            int id = fs_resolve(path, ucwd(from_user));
+            if (id < 0) { result = (uint64_t)(int64_t)(id == -40 ? -40 : -2); break; }
+            if (fs_get_type(id) != FS_DIR) { result = (uint64_t)-20; break; }
+            if (fs_check_access(id, 1) != 0) { result = (uint64_t)-13; break; }
+            result = (uint64_t)(int64_t)process_set_cwd(user_current_pid(), id);
+            break;
+        }
+
+        case SYS_GETCWD:
+        {
+            char tmp[256];
+            char* out = (char*)frame->x[0]; uint64_t cap = frame->x[1];
+            if (out == 0 || cap < 2 || (from_user && !syscall_user_pointer_ok_write(out, cap))) { result = (uint64_t)-14; break; }
+            vfs_path_of(ucwd(from_user), tmp, (int)sizeof(tmp));
+            int l = 0; while (tmp[l]) ++l;
+            if ((uint64_t)l + 1 > cap) { result = (uint64_t)-34; break; }
+            for (int i = 0; i <= l; ++i) out[i] = tmp[i];
+            result = (uint64_t)l;
+            break;
+        }
+
+        case SYS_UMASK:
+        {
+            if (!from_user) { result = 022; break; }
+            int me = user_current_pid();
+            uint32_t old = process_umask(me);
+            if (frame->x[0] != ~0ULL) (void)process_set_umask(me, (uint32_t)frame->x[0]);
+            result = old;
+            break;
+        }
+
+        case SYS_SYSINFO:
+        {
+            uint64_t* out = (uint64_t*)frame->x[0];
+            if (!out || (from_user && !syscall_user_pointer_ok_write(out, 40))) { result = (uint64_t)-14; break; }
+#ifdef HOST_TEST
+            out[0] = 32768; out[1] = 16384; out[2] = 1; out[3] = timer_millis(); out[4] = 0;
+#else
+            PageStats ps; page_alloc_get_stats(&ps);
+            out[0] = ps.total_pages; out[1] = ps.free_pages; out[2] = smp_sched_on ? smp_online_cpu_count() : 1U; out[3] = timer_millis(); out[4] = smp_cpu_id_fast();
+#endif
+            result = 0;
+            break;
+        }
+
+        case SYS_TTY:
+        {
+            uint64_t op = frame->x[0];
+            void* ptr = (void*)frame->x[1];
+            if (op == 0 || op == 1)
+            {
+                if (!ptr || (from_user && !(op == 0 ? syscall_user_pointer_ok_write(ptr, sizeof(TtyTermios)) : syscall_user_pointer_ok(ptr, sizeof(TtyTermios))))) { result = (uint64_t)-14; break; }
+                if (op == 0) { TtyTermios tmp; (void)tty_get(&tmp); *(TtyTermios*)ptr = tmp; result = 0; }
+                else { TtyTermios tmp = *(const TtyTermios*)ptr; result = (uint64_t)(int64_t)tty_set(user_current_pid(), &tmp, (int)frame->x[2]); }
+            }
+            else if (op == 2)
+            {
+                if (!ptr || (from_user && !syscall_user_pointer_ok_write(ptr, 8))) { result = (uint64_t)-14; break; }
+                uint16_t ws[4]; tty_winsize(ws); for (int i = 0; i < 4; ++i) ((uint16_t*)ptr)[i] = ws[i]; result = 0;
+            }
+            else result = (uint64_t)-22;
+            break;
+        }
+
+        case SYS_POLL:
+        {
+            if (select_fd_owner(from_user) != 0) { result = (uint64_t)-24; break; }
+            uint64_t nfds = frame->x[1];
+            int64_t timeout = (int64_t)frame->x[2];
+            PollFdK* user = (PollFdK*)frame->x[0];
+            if (nfds > SYS_POLL_MAX) { result = (uint64_t)-22; break; }
+            if (nfds && (!user || (from_user && !syscall_user_pointer_ok_write(user, nfds * sizeof(PollFdK))))) { result = (uint64_t)-14; break; }
+            PollFdK local[SYS_POLL_MAX];
+            for (uint64_t i = 0; i < nfds; ++i) local[i] = user[i];
+            int count = 0;
+#ifndef HOST_TEST
+            uint64_t start = timer_millis();
+#endif
+            for (;;)
+            {
+                count = 0;
+                for (uint64_t i = 0; i < nfds; ++i)
+                {
+                    local[i].revents = 0;
+                    if (local[i].fd < 0) continue;
+                    int ev = local[i].events;
+                    if (ev & 0x40) ev |= 1;
+                    if (ev & 0x100) ev |= 4;
+                    int m = local[i].fd < FD_MAX_DESCRIPTORS ? fd_poll_mask(local[i].fd) : 32;
+                    int r = m & (ev | 8 | 16 | 32);
+                    local[i].revents = (short)r;
+                    if (r) ++count;
+                }
+                if (count > 0 || timeout == 0) break;
+#ifdef HOST_TEST
+                break;
+#else
+                if (timeout > 0 && timer_millis() - start >= (uint64_t)timeout) break;
+                int b = block_step(from_user);
+                if (b < 0) { count = b; break; }
+#endif
+            }
+            if (count >= 0) for (uint64_t i = 0; i < nfds; ++i) user[i].revents = local[i].revents;
+            result = (uint64_t)(int64_t)count;
+            break;
+        }
+
 #ifndef HOST_TEST
         case SYS_SIGACTION:
         {
@@ -1055,6 +1652,7 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
             char path[SYSCALL_PATH_MAX];
             char args[PROCESS_ARGS_SIZE];
             if (copy_path((const char*)frame->x[0], path, from_user) != 0) { result = (uint64_t)-14; break; }
+            exec_path_fix(from_user, path);
             args[0] = '\0';
             if (frame->x[1] != 0)
             {
@@ -1345,6 +1943,7 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
             char path[SYSCALL_PATH_MAX];
             char args[PROCESS_ARGS_SIZE];
             if (copy_path((const char*)frame->x[0], path, from_user) != 0) { result = (uint64_t)-14; break; }
+            exec_path_fix(from_user, path);
             args[0] = '\0';
             if (frame->x[1] != 0)
             {

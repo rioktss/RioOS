@@ -63,6 +63,32 @@ int net_tcp_connect(int, int, uint32_t, uint16_t, uint32_t) { return 0; }
 int net_tcp_send(int, int, const void*, uint32_t length, uint32_t) { return (int)length; }
 int net_tcp_recv(int, int, void*, uint32_t, uint32_t) { return -110; }
 int net_tcp_close(int, int) { return 0; }
+int net_tcp_poll(int, int) { return 0; }
+int net_poll_once() { return 0; }
+int fs_sync() { return 0; }
+int process_cwd(int) { return -1; }
+int process_set_cwd(int, int) { return 0; }
+uint32_t process_umask(int) { return 022; }
+int process_set_umask(int, uint32_t) { return 0; }
+void* mmu_user_space_pointer(int, uint64_t) { return 0; }
+int process_uid(int) { return 0; }
+int fs_set_owner_path(const char*, int, uint32_t, uint32_t) { return 0; }
+void tls_random(uint8_t* o, uint32_t n) { for (uint32_t i = 0; i < n; ++i) o[i] = (uint8_t)(i * 31 + 7); }
+int fs_set_mtime_path(const char*, int, uint64_t) { return 0; }
+#include "tty.h"
+int64_t tty_read(uint8_t* buf, uint64_t len) { uint64_t g = 0; while (g < len) { int c = uart_try_getc(); if (c < 0) break; buf[g++] = (uint8_t)c; } return (int64_t)g; }
+int uart_has_data();
+int tty_poll() { return uart_has_data(); }
+void tty_process_exit(int) {}
+int tty_get(TtyTermios*) { return 0; }
+int tty_set(int, const TtyTermios*, int) { return 0; }
+void tty_winsize(uint16_t o[4]) { o[0] = 24; o[1] = 80; o[2] = o[3] = 0; }
+
+int net_udp_poll(int, int) { return 4; }
+int net_tcp_shutdown_wr(int, int) { return 0; }
+int net_tcp_info(int, int, uint32_t*, uint16_t*, uint16_t*) { return 0; }
+int net_udp_local_port(int, int) { return 0; }
+int uart_has_data() { return rx[rx_pos] != 0; }
 void net_tcp_close_all_for(int) {}
 int net_tcp_listen(int, int, uint16_t) { return -38; }
 int net_tcp_accept(int, int, uint32_t*, uint16_t*, uint32_t) { return -38; }
@@ -197,7 +223,7 @@ int main()
     CHECK(call6(SYS_NET_TCP_RECV, 1, 0x47000000, 16, 1000, 0, 0, 1) == ((uint64_t)(-14)));
     CHECK(call(SYS_NET_TCP_CLOSE, 1) == 0);
     CHECK(call(SYS_GETPID, 0, 0, 1) == 5 && call(SYS_GETPID, 0, 0, 0) == 1);
-    CHECK(call(99) == ERR(38));
+    CHECK(call(127) == ERR(38));
 
     /* write(buf,len): EL0 pointers are validated, kernel pointers are not */
     char kbuf[8] = "abc";

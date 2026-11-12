@@ -24,6 +24,8 @@ def run(cmds, extra=(), disk=True, boot=8, wait=2, env=None, base_disk=None, mon
         args += ["-drive", "if=none,format=raw,file=%s,id=vd0" % (base_disk or os.path.join(TMP, "disk.img")),
                  "-device", "virtio-blk-device,drive=vd0"]
     args += list(extra)
+    if os.environ.get("RIO_SMP") and "-smp" not in args: args += ["-smp", os.environ["RIO_SMP"]]
+    args += os.environ.get("RIO_QEMU_EXTRA", "").split()      # e.g. "-accel tcg,thread=single" on a host with few cores
     pid, fd = pty.fork()
     if pid == 0:
         os.execv(QEMU, args)
@@ -85,7 +87,7 @@ log = run(C("ktest", "dltest", "id", "echo hello > /home/user/a.txt", "ln -s a.t
 check("core", log, "ktest: 28/28 passed", "dltest ALL PASS", "uid=1000(user)")
 check("fs", log, "[LINK] l1 -> a.txt", "hello", "a.txt", "remounted read-only", "remounted read-write", "journal        : on")
 check("script", log, "n=3", "it1", "it2")
-check("shell", log, "fb-ok", "st=127", "/bin/hello.elf", "\n23\r")
+check("shell", log, "fb-ok", "st=127", "/bin/hello.elf", "\n28\r")
 check("security", log, "Switched to root", "bob  uid=1001", "$rio$3000$", "User created")
 print("== session 1b: reboot recovers the journal")
 log = run(C("cat /jt.txt", "mount"))
@@ -304,6 +306,23 @@ check("pthread", log, "thrtest done fails=0")
 total += 0
 if "FAIL " in log.replace("FAIL cmd", ""):
     fails += 1; total += 1; print("  FAIL  pthread: a FAIL line was printed")
+log = run(C("su", "123", "fptest"), wait=60)
+check("fpu-neon", log, "fptest done fails=0", "PASS exec-zeroes-regs", "PASS sigreturn-restores-vregs", "PASS pthread-switch-keeps-d8-d15")
+if "FAIL " in log:
+    fails += 1; total += 1; print("  FAIL  fpu-neon: a FAIL line was printed")
+log = run(C("su", "123", "ipctest"), wait=90, extra=["-netdev", "dgram,id=n0,local.type=inet,local.host=127.0.0.1,local.port=7011,remote.type=inet,remote.host=127.0.0.1,remote.port=7012",
+    "-device", "virtio-net-device,netdev=n0,mac=52:54:00:12:34:56"])
+check("ipc-poll-sockets", log, "ipctest done fails=0", "PASS scm-write-via-passed-fd", "PASS unix-accept", "PASS poll-eintr", "PASS eventfd-sum", "PASS write-20000-through-pipe", "PASS so-rcvtimeo")
+if "FAIL " in log:
+    fails += 1; total += 1; print("  FAIL  ipc-poll-sockets: a FAIL line was printed")
+log = run(C("su", "123", "smptest 5"), extra=["-smp", "4"], wait=600)
+check("smp-scheduler", log, "smptest done fails=0", "PASS work-spreads-across-cpus", "PASS futex-mutex-counter-exact", "PASS atomic-counter-exact", "PASS fork-storm", "PASS cow-isolation-parallel", "PASS signal-to-spinning-process", "PASS soak")
+if "FAIL " in log:
+    fails += 1; total += 1; print("  FAIL  smp-scheduler: a FAIL line was printed")
+log = run(C("su", "123", "posixtest"), wait=150)
+check("posix-libc", log, "posixtest done fails=0", "PASS rx-backref", "PASS epoll-edge-reports-once", "PASS futex-wake-cross-process", "PASS sem-wait-cross-process", "PASS flock-blocks-until-released", "PASS tcsetattr-raw", "PASS glob-star", "PASS getopt_long")
+if "FAIL " in log:
+    fails += 1; total += 1; print("  FAIL  posix-libc: a FAIL line was printed")
 log = run(C("su", "123", "sigtest"), wait=60)
 check("signals", log, "sigtest done fails=0")
 if "FAIL " in log:

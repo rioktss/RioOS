@@ -26,6 +26,7 @@
 #include "thread.h"
 #include "uart.h"
 #include "scheduler.h"
+#include "smp.h"
 
 static uint64_t initial_ticks = 0;
 static uint64_t frequency = 0;
@@ -145,6 +146,28 @@ void timer_start_periodic(uint32_t hz)
     asm volatile("dsb sy\n" ::: "memory");
 }
 
+/* A secondary CPU arms its own banked timer with the period the boot CPU configured. */
+extern "C" void timer_arm_secondary()
+{
+    if (period_ticks == 0) return;
+    write_ctl(0);
+    write_cval(read_counter() + period_ticks);
+    asm volatile("dsb sy\n" ::: "memory");
+    write_ctl(1);
+    asm volatile("dsb sy\n" ::: "memory");
+}
+
+/* Idle CPU: fire at an absolute millisecond time (never later than the periodic tick that is already armed). */
+extern "C" void timer_arm_deadline_ms(uint64_t ms)
+{
+    if (frequency == 0 || period_ticks == 0) return;
+    uint64_t now = read_counter();
+    uint64_t target = initial_ticks + (ms * frequency) / 1000ULL;
+    if (target <= now) target = now + frequency / 20000ULL + 1ULL;
+    if (target > now + period_ticks) return;
+    write_cval(target);
+}
+
 void timer_start_oneshot_ms(uint32_t ms)
 {
     if (ms == 0 || frequency == 0)
@@ -201,7 +224,7 @@ void timer_interrupt_handler()
 
         write_cval(next);
 
-        if (sched_tick_enabled)
+        if (sched_tick_enabled && smp_cpu_id_fast() == 0)
             (void)scheduler_tick();
 
         thread_timer_tick();

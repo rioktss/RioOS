@@ -98,31 +98,45 @@ exception_vectors_el1:
 
 sync_el1_entry:
     SAVE_EXCEPTION_FRAME
+    bl bkl_enter_el1
+    str x0, [sp, #280]
     mov x0, sp
     bl exception_sync_el1
+    ldr x0, [sp, #280]
+    bl bkl_leave_el1
     b exception_restore_el1
 
 sync_el0_entry:
     SAVE_EXCEPTION_FRAME
+    bl bkl_enter_user
     mov x0, sp
     bl exception_sync_el0
     mov x0, sp
     bl task_deliver_signals
+    mov x0, sp
+    bl bkl_leave_exception
     b exception_restore_el1
 
 irq_el1_entry:
     SAVE_EXCEPTION_FRAME
+    bl bkl_enter_el1
+    str x0, [sp, #280]
     mov x0, sp
     bl interrupt_dispatch
+    ldr x0, [sp, #280]
+    bl bkl_leave_el1
     b exception_restore_el1
 
 irq_el0_entry:
     SAVE_EXCEPTION_FRAME
+    bl bkl_enter_user
     mov x0, sp
     bl interrupt_dispatch
     bl thread_user_preempt
     mov x0, sp
     bl task_deliver_signals
+    mov x0, sp
+    bl bkl_leave_exception
     b exception_restore_el1
 
 exception_restore_el1:

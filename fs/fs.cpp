@@ -74,6 +74,7 @@
 #define fs_total_sectors fs_total_sectors_impl
 #define fs_used_sectors fs_used_sectors_impl
 #define fs_set_mode_path fs_set_mode_path_impl
+#define fs_set_mtime_path fs_set_mtime_path_impl
 #define fs_persistent fs_persistent_impl
 #define fs_link_hard fs_link_hard_impl
 #define fs_link_count fs_link_count_impl
@@ -121,6 +122,7 @@ uint32_t fs_get_uid(int id);
 uint32_t fs_get_gid(int id);
 int fs_set_mode(int id, uint32_t mode);
 int fs_set_mode_path(const char* path, int cwd, uint32_t mode);
+int fs_set_mtime_path(const char* path, int cwd, uint64_t mtime);
 uint64_t fs_total_sectors();
 uint64_t fs_used_sectors();
 int fs_get_child_count(int id);
@@ -1812,6 +1814,19 @@ int fs_set_mode(int id, uint32_t mode)
     return storage_flush();
 }
 
+int fs_set_mtime_path(const char* path, int cwd, uint64_t mtime)
+{
+    FS_RW_CHECK();
+    FsTx fs_tx_scope;
+    int id = fs_resolve(path, cwd);
+    if (id < 0) return id;
+    if (current_uid != 0 && current_uid != nodes[id].uid) return -13;
+    FsNode old; copy_node(&old, &nodes[id]);
+    nodes[id].mtime = mtime;
+    if (save_inode(id) != 0) { copy_node(&nodes[id], &old); return -4; }
+    return storage_flush();
+}
+
 int fs_set_owner(int id, uint32_t uid, uint32_t gid)
 {
     FS_RW_CHECK();
@@ -2073,6 +2088,7 @@ static void quota_load()
 #undef fs_total_sectors
 #undef fs_used_sectors
 #undef fs_set_mode_path
+#undef fs_set_mtime_path
 #undef fs_persistent
 #undef fs_link_hard
 #undef fs_link_count
@@ -2298,6 +2314,7 @@ int fs_truncate(const char* path, int cwd, uint64_t size) { Route r; route(path,
 uint64_t fs_total_sectors() { act(0); return fs_total_sectors_impl(); }
 uint64_t fs_used_sectors() { act(0); return fs_used_sectors_impl(); }
 int fs_set_mode_path(const char* path, int cwd, uint32_t mode) { Route r; route(path, cwd, &r, 1, 1); return fs_set_mode_path_impl(r.rest, r.cwd, mode); }
+int fs_set_mtime_path(const char* path, int cwd, uint64_t mtime) { Route r; route(path, cwd, &r, 1, 1); return fs_set_mtime_path_impl(r.rest, r.cwd, mtime); }
 int fs_persistent() { return ctxs[0].mounted; }
 void fs_init() { fs_init_impl(); act(0); }
 

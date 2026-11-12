@@ -23,28 +23,36 @@
  */
 
 #include "thread.h"
+#include "fpu.h"
 #include "sched_policy.h"
 #include "timer.h"
 #include "uart.h"
+#include "smp.h"
 
-static SchedEntry sched[THREAD_MAX];
-static uint64_t saved_sp[THREAD_MAX];
-static char names[THREAD_MAX][16];
-static uint64_t run_ticks[THREAD_MAX];
-static uint64_t run_count[THREAD_MAX];
+/* Slots THREAD_MAX..THREAD_TOTAL-1 are the per-CPU idle contexts of the secondary CPUs; they are never picked from the pool. */
+#define THREAD_TOTAL (THREAD_MAX + SMP_MAX_CPUS)
+static SchedEntry sched[THREAD_TOTAL];
+static uint64_t saved_sp[THREAD_TOTAL];
+static char names[THREAD_TOTAL][16];
+static uint64_t run_ticks[THREAD_TOTAL];
+static uint64_t run_count[THREAD_TOTAL];
 
 static uint8_t stacks[THREAD_MAX][THREAD_STACK_SIZE]
     __attribute__((aligned(16)));
 
-static int current = 0;
+static int cur_of[SMP_MAX_CPUS];                 /* running thread per CPU */
+#define current (cur_of[smp_cpu_id_fast()])
 static int initialised = 0;
 static int preempt_on = 0;
-static volatile int need_resched = 0;
-static int slice_left = THREAD_SLICE_TICKS;
+static volatile int need_resched_of[SMP_MAX_CPUS];
+#define need_resched (need_resched_of[smp_cpu_id_fast()])
+static int slice_of[SMP_MAX_CPUS];
+#define slice_left (slice_of[smp_cpu_id_fast()])
 static uint64_t switches = 0;
-static int tpid[THREAD_MAX];
-static uint64_t saved_sp0[THREAD_MAX];   /* user stack pointer: SP_EL0 is not part of the kernel context */
+static int tpid[THREAD_TOTAL];
+static uint64_t saved_sp0[THREAD_TOTAL];   /* user stack pointer: SP_EL0 is not part of the kernel context */
 static int user_task_count = 0;
+static FpState fps[THREAD_TOTAL];          /* FP/SIMD state of user threads, saved while they are switched out */
 
 extern "C" void task_context_enter(int pid);
 
@@ -104,7 +112,7 @@ void thread_init()
 {
     uint64_t flags = irq_save();
 
-    for (int i = 0; i < THREAD_MAX; ++i)
+    for (int i = 0; i < THREAD_TOTAL; ++i)
     {
         sched[i].state = SCHED_FREE;
         sched[i].priority = 1;
@@ -123,47 +131,69 @@ void thread_init()
     copy_name(names[0], "main");
     run_count[0] = 1;
 
-    current = 0;
+    for (int c = 0; c < SMP_MAX_CPUS; ++c) { cur_of[c] = 0; need_resched_of[c] = 0; slice_of[c] = THREAD_SLICE_TICKS; }
     preempt_on = 0;
-    need_resched = 0;
-    slice_left = THREAD_SLICE_TICKS;
     switches = 0;
     initialised = 1;
 
     irq_restore(flags);
 }
 
-/* Must be called with IRQs masked. */
-static void schedule()
+/* SMP pick: a thread running on another CPU is not available, and the shell thread (0) stays on the boot CPU. */
+static int pick_smp(int cpu, int cu)
+{
+    int best = -1; uint32_t best_prio = 0;
+    int start = (cu >= 0 && cu < THREAD_MAX) ? cu : THREAD_MAX - 1;
+    for (int offset = 1; offset <= THREAD_MAX; ++offset)
+    {
+        int i = (start + offset) % THREAD_MAX;
+        int st = sched[i].state;
+        if (st != SCHED_READY && !(st == SCHED_RUNNING && i == cu)) continue;
+        if (i == 0 && cpu != 0) continue;
+        uint32_t prio = sched_effective_priority(&sched[i]);
+        if (best < 0 || prio > best_prio) { best = i; best_prio = prio; }
+    }
+    return best;
+}
+
+/* Must be called with IRQs masked (and the kernel lock held when SMP scheduling is on). Returns 1 when it switched. */
+static int schedule()
 {
     (void)sched_wake_sleepers(sched, THREAD_MAX, timer_millis());
 
-    int next = sched_pick(sched, THREAD_MAX, current);
+    int cpu = (int)smp_cpu_id_fast();
+    int cu = cur_of[cpu];
+    int next = smp_sched_on ? pick_smp(cpu, cu) : sched_pick(sched, THREAD_MAX, cu);
 
-    need_resched = 0;
-    slice_left = THREAD_SLICE_TICKS;
+    need_resched_of[cpu] = 0;
+    slice_of[cpu] = THREAD_SLICE_TICKS;
 
-    if (next < 0 || next == current)
-        return;
+    if (next < 0 && smp_sched_on && cpu != 0 && cu < THREAD_MAX) next = THREAD_MAX + cpu;   /* nothing runnable: this CPU idles */
+    if (next < 0 || next == cu)
+        return 0;
 
-    sched_account(sched, THREAD_MAX, next);
+    if (next < THREAD_MAX) sched_account(sched, THREAD_MAX, next);
 
-    if (sched[current].state == SCHED_RUNNING)
-        sched[current].state = SCHED_READY;
+    if (sched[cu].state == SCHED_RUNNING)
+        sched[cu].state = SCHED_READY;
 
     sched[next].state = SCHED_RUNNING;
 
-    int prev = current;
-    current = next;
+    int prev = cu;
+    cur_of[cpu] = next;
     ++switches;
     ++run_count[next];
 
     asm volatile("mrs %0, sp_el0" : "=r"(saved_sp0[prev]));
+    if (tpid[prev] >= 0) fp_save(&fps[prev]);            /* the live V0-V31 belong to the thread that is leaving */
     thread_context_switch(&saved_sp[prev], saved_sp[next]);
+    /* Resumed, possibly on another CPU: `current` now names this thread on the CPU we are running on. */
     asm volatile("msr sp_el0, %0" :: "r"(saved_sp0[current]));
+    if (tpid[current] >= 0) fp_restore(&fps[current]);
 
     /* We are the resumed thread again: re-establish our address space. */
     task_context_enter(tpid[current]);
+    return 1;
 }
 
 static int thread_create_inner(const char* name, ThreadEntry entry, void* arg, uint32_t priority, int pid)
@@ -212,9 +242,11 @@ static int thread_create_inner(const char* name, ThreadEntry entry, void* arg, u
     sched[slot].waited = 0;
     sched[slot].wake_ms = 0;
     tpid[slot] = pid;
+    fp_state_clear(&fps[slot]);
     sched[slot].state = SCHED_READY;
 
     irq_restore(flags);
+    smp_kick_others();                      /* an idle CPU picks the new thread up now, not at its next tick */
 
     return slot;
 }
@@ -266,7 +298,8 @@ void thread_yield()
         return;
 
     uint64_t flags = irq_save();
-    schedule();
+    int switched = schedule();
+    if (!switched && smp_sched_on && current == 0) smp_window();   /* nothing else to run here: let the other CPUs into the kernel */
     irq_restore(flags);
 }
 
@@ -408,6 +441,48 @@ void thread_list()
     irq_restore(flags);
 }
 
+void fp_state_clear(FpState* state)
+{
+    uint64_t* w = (uint64_t*)state;
+    for (unsigned i = 0; i < sizeof(FpState) / 8U; ++i) w[i] = 0;
+}
+
+/* fork(): the child starts with a copy of the parent's live FP/SIMD registers. */
+void thread_fp_copy_live_to(int thread)
+{
+    if (thread > 0 && thread < THREAD_MAX) fp_save(&fps[thread]);
+}
+
+/* exec(): a new program image starts with cleared FP/SIMD registers. */
+void thread_fp_reset_live()
+{
+    FpState zero;
+    fp_state_clear(&zero);
+    fp_restore(&zero);
+}
+
+void thread_secondary_adopt(uint32_t cpu)
+{
+    int idle = THREAD_MAX + (int)cpu;
+    copy_name(names[idle], "idle");
+    tpid[idle] = -1;
+    sched[idle].state = SCHED_RUNNING;
+    cur_of[cpu] = idle;
+    need_resched_of[cpu] = 0;
+    slice_of[cpu] = THREAD_SLICE_TICKS;
+}
+void thread_idle_schedule() { (void)schedule(); }
+/* Earliest wake-up time of a sleeping thread (0 when none): an idle CPU programs its timer for it, so a 1 ms block_step sleep is
+   not stretched to the next 10 ms tick. */
+uint64_t thread_next_wake_ms()
+{
+    uint64_t best = 0;
+    for (int i = 0; i < THREAD_MAX; ++i)
+        if (sched[i].state == SCHED_SLEEPING && (best == 0 || sched[i].wake_ms < best)) best = sched[i].wake_ms;
+    return best;
+}
+void thread_reload_context() { task_context_enter(tpid[current]); }
+
 extern "C" void thread_entry_hook()
 {
     /* Cooperative threads do not need asynchronous IRQs. Keep the IRQ mask
@@ -415,6 +490,7 @@ extern "C" void thread_entry_hook()
        as a side effect of creating/running a demo thread. */
     asm volatile("isb" ::: "memory");
     task_context_enter(tpid[current]);
+    if (tpid[current] >= 0) fp_restore(&fps[current]);   /* new thread: cleared state, or the parent's copy after fork */
 }
 
 extern "C" void thread_exit()

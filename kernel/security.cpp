@@ -259,6 +259,22 @@ int security_ids_of(const char* name, uint32_t* uid, uint32_t* gid)
     *uid = accounts[i].uid; *gid = accounts[i].gid; return 0;
 }
 
+int security_account_at(int index, char* name, uint32_t* uid, uint32_t* gid)
+{
+    if (!accounts_loaded) security_init();
+    int seen = 0;
+    for (int i = 0; i < ACCOUNT_MAX; ++i)
+    {
+        if (!accounts[i].used) continue;
+        if (seen++ != index) continue;
+        for (int k = 0; k < 16; ++k) name[k] = accounts[i].name[k];
+        name[15] = 0;
+        *uid = accounts[i].uid; *gid = accounts[i].gid;
+        return 0;
+    }
+    return -1;
+}
+
 int security_login_as(const char* name, const char* password)
 {
     if (security_verify(name, password) != 0) return -1;

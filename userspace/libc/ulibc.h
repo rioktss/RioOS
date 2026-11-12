@@ -80,6 +80,24 @@ extern int errno;
 #define ERANGE 34
 #define ELOOP 40
 #endif
+#ifndef ENOTDIR
+#define ENXIO 6
+#define ENODEV 19
+#define ENOTDIR 20
+#define EISDIR 21
+#define EXDEV 18
+#define ENOTTY 25
+#define ENOSPC 28
+#define ESPIPE 29
+#define EROFS 30
+#define EDOM 33
+#define ENAMETOOLONG 36
+#define ENOTEMPTY 39
+#define EOVERFLOW 75
+#define EILSEQ 84
+#define ENOTSUP 95
+#define EOPNOTSUPP 95
+#endif
 
 /* string.h */
 void* memcpy(void* d, const void* s, size_t n);
@@ -137,6 +155,7 @@ char* fgets_fd(int fd, char* buf, int cap);
 #define O_CREAT  0x100
 #define O_TRUNC  0x200
 #define O_APPEND 0x400
+#define O_EXCL   0x2000
 #define SEEK_SET 0
 #define SEEK_CUR 1
 #define SEEK_END 2
@@ -445,7 +464,7 @@ typedef struct { unsigned count; unsigned waiting; unsigned phase; } pthread_bar
 typedef int pthread_spinlock_t;
 typedef int pthread_once_t;
 typedef unsigned pthread_key_t;
-typedef struct { unsigned value; } sem_t;
+typedef struct { unsigned value; unsigned shared; } sem_t;
 #define PTHREAD_MUTEX_NORMAL 0
 #define PTHREAD_MUTEX_RECURSIVE 1
 #define PTHREAD_MUTEX_ERRORCHECK 2
@@ -504,6 +523,462 @@ int sem_init(sem_t* s, int pshared, unsigned value); int sem_destroy(sem_t* s);
 int sem_wait(sem_t* s); int sem_trywait(sem_t* s); int sem_post(sem_t* s); int sem_getvalue(sem_t* s, int* v);
 int sem_timedwait(sem_t* s, const struct timespec* abs);
 int pthread_setname_np(pthread_t t, const char* name);
+
+/* ===== sockets, poll/select, IPC (descriptor based; see docs/IPC_POSIX.md) ===== */
+#ifndef ENOTSOCK
+#define ENOTSOCK 88
+#define EDESTADDRREQ 89
+#define EMSGSIZE 90
+#define EPROTOTYPE 91
+#define ENOPROTOOPT 92
+#define EPROTONOSUPPORT 93
+#define ESOCKTNOSUPPORT 94
+#define EOPNOTSUPP 95
+#define EAFNOSUPPORT 97
+#define EADDRINUSE 98
+#define EADDRNOTAVAIL 99
+#define ENETUNREACH 101
+#define ECONNABORTED 103
+#define ECONNRESET 104
+#define ENOBUFS 105
+#define EISCONN 106
+#define ENOTCONN 107
+#define ETIMEDOUT 110
+#define ECONNREFUSED 111
+#define EHOSTUNREACH 113
+#define EALREADY 114
+#define EINPROGRESS 115
+#define EWOULDBLOCK EAGAIN
+#endif
+#define O_NONBLOCK 0x800
+#define F_GETFL 3
+#define F_SETFL 4
+#define AF_UNSPEC 0
+#define AF_UNIX 1
+#define AF_LOCAL 1
+#define AF_INET 2
+#define PF_UNIX AF_UNIX
+#define PF_LOCAL AF_UNIX
+#define PF_INET AF_INET
+#define SOCK_STREAM 1
+#define SOCK_DGRAM 2
+#define SOCK_NONBLOCK 0x800
+#define SOCK_CLOEXEC 0x1000
+#define SOL_SOCKET 1
+#define SO_DEBUG 1
+#define SO_REUSEADDR 2
+#define SO_TYPE 3
+#define SO_ERROR 4
+#define SO_BROADCAST 6
+#define SO_SNDBUF 7
+#define SO_RCVBUF 8
+#define SO_KEEPALIVE 9
+#define SO_LINGER 13
+#define SO_REUSEPORT 15
+#define SO_RCVTIMEO 20
+#define SO_SNDTIMEO 21
+#define IPPROTO_IP 0
+#define IPPROTO_TCP 6
+#define IPPROTO_UDP 17
+#define TCP_NODELAY 1
+#define SHUT_RD 0
+#define SHUT_WR 1
+#define SHUT_RDWR 2
+#define SOMAXCONN 8
+#define MSG_PEEK 2
+#define MSG_DONTWAIT 0x40
+#define MSG_NOSIGNAL 0x4000
+#define MSG_WAITALL 0x100
+#define MSG_CTRUNC 8
+#define SCM_RIGHTS 1
+#define INADDR_ANY 0U
+#define INADDR_LOOPBACK 0x7F000001U
+#define INADDR_NONE 0xFFFFFFFFU
+#define INET_ADDRSTRLEN 16
+typedef unsigned int socklen_t;
+typedef unsigned short sa_family_t;
+typedef uint16_t in_port_t;
+typedef uint32_t in_addr_t;
+struct sockaddr { sa_family_t sa_family; char sa_data[14]; };
+struct in_addr { in_addr_t s_addr; };
+struct sockaddr_in { sa_family_t sin_family; in_port_t sin_port; struct in_addr sin_addr; unsigned char sin_zero[8]; };
+struct sockaddr_un { sa_family_t sun_family; char sun_path[108]; };
+struct sockaddr_storage { sa_family_t ss_family; char __pad[126]; };
+struct iovec { void* iov_base; size_t iov_len; };
+struct msghdr { void* msg_name; socklen_t msg_namelen; struct iovec* msg_iov; size_t msg_iovlen; void* msg_control; size_t msg_controllen; int msg_flags; };
+struct cmsghdr { size_t cmsg_len; int cmsg_level; int cmsg_type; };
+#define CMSG_ALIGN(l) (((l) + sizeof(size_t) - 1) & ~(sizeof(size_t) - 1))
+#define CMSG_LEN(l) (CMSG_ALIGN(sizeof(struct cmsghdr)) + (l))
+#define CMSG_SPACE(l) (CMSG_ALIGN(sizeof(struct cmsghdr)) + CMSG_ALIGN(l))
+#define CMSG_DATA(c) ((unsigned char*)(c) + CMSG_ALIGN(sizeof(struct cmsghdr)))
+#define CMSG_FIRSTHDR(m) ((m)->msg_controllen >= sizeof(struct cmsghdr) ? (struct cmsghdr*)(m)->msg_control : (struct cmsghdr*)0)
+struct cmsghdr* CMSG_NXTHDR(struct msghdr* m, struct cmsghdr* c);
+struct linger { int l_onoff; int l_linger; };
+struct addrinfo { int ai_flags; int ai_family; int ai_socktype; int ai_protocol; socklen_t ai_addrlen; struct sockaddr* ai_addr; char* ai_canonname; struct addrinfo* ai_next; };
+struct hostent { char* h_name; char** h_aliases; int h_addrtype; int h_length; char** h_addr_list; };
+#define h_addr h_addr_list[0]
+#define AI_PASSIVE 1
+#define AI_CANONNAME 2
+#define AI_NUMERICHOST 4
+#define AI_NUMERICSERV 0x400
+#define EAI_NONAME -2
+#define EAI_AGAIN -3
+#define EAI_FAIL -4
+#define EAI_FAMILY -6
+#define EAI_SOCKTYPE -7
+#define EAI_SERVICE -8
+#define EAI_MEMORY -10
+#define NI_NUMERICHOST 1
+#define NI_NUMERICSERV 2
+uint16_t htons(uint16_t v); uint16_t ntohs(uint16_t v); uint32_t htonl(uint32_t v); uint32_t ntohl(uint32_t v);
+in_addr_t inet_addr(const char* s); int inet_aton(const char* s, struct in_addr* out); char* inet_ntoa(struct in_addr a);
+int inet_pton(int af, const char* src, void* dst); const char* inet_ntop(int af, const void* src, char* dst, socklen_t size);
+int socket(int domain, int type, int protocol);
+int socketpair(int domain, int type, int protocol, int sv[2]);
+int bind(int fd, const struct sockaddr* addr, socklen_t len);
+int listen(int fd, int backlog);
+int accept(int fd, struct sockaddr* addr, socklen_t* len);
+int accept4(int fd, struct sockaddr* addr, socklen_t* len, int flags);
+int connect(int fd, const struct sockaddr* addr, socklen_t len);
+ssize_t send(int fd, const void* buf, size_t n, int flags);
+ssize_t recv(int fd, void* buf, size_t n, int flags);
+ssize_t sendto(int fd, const void* buf, size_t n, int flags, const struct sockaddr* addr, socklen_t len);
+ssize_t recvfrom(int fd, void* buf, size_t n, int flags, struct sockaddr* addr, socklen_t* len);
+ssize_t sendmsg(int fd, const struct msghdr* msg, int flags);
+ssize_t recvmsg(int fd, struct msghdr* msg, int flags);
+int shutdown(int fd, int how);
+int getsockname(int fd, struct sockaddr* addr, socklen_t* len);
+int getpeername(int fd, struct sockaddr* addr, socklen_t* len);
+int setsockopt(int fd, int level, int name, const void* val, socklen_t len);
+int getsockopt(int fd, int level, int name, void* val, socklen_t* len);
+int getaddrinfo(const char* node, const char* service, const struct addrinfo* hints, struct addrinfo** res);
+void freeaddrinfo(struct addrinfo* ai);
+const char* gai_strerror(int code);
+struct hostent* gethostbyname(const char* name);
+int getnameinfo(const struct sockaddr* sa, socklen_t salen, char* host, socklen_t hostlen, char* serv, socklen_t servlen, int flags);
+int pipe2(int fds[2], int flags);
+ssize_t readv(int fd, const struct iovec* iov, int cnt);
+ssize_t writev(int fd, const struct iovec* iov, int cnt);
+/* poll / select */
+#define POLLIN 0x001
+#define POLLPRI 0x002
+#define POLLOUT 0x004
+#define POLLERR 0x008
+#define POLLHUP 0x010
+#define POLLNVAL 0x020
+#define POLLRDNORM 0x040
+#define POLLWRNORM 0x100
+struct pollfd { int fd; short events; short revents; };
+typedef unsigned long nfds_t;
+int poll(struct pollfd* fds, nfds_t n, int timeout_ms);
+int ppoll(struct pollfd* fds, nfds_t n, const struct timespec* timeout, const void* sigmask);
+#define FD_SETSIZE 64
+typedef struct { unsigned long fds_bits[1]; } fd_set;
+#define FD_ZERO(s) ((s)->fds_bits[0] = 0UL)
+#define FD_SET(f, s) ((s)->fds_bits[0] |= (1UL << (f)))
+#define FD_CLR(f, s) ((s)->fds_bits[0] &= ~(1UL << (f)))
+#define FD_ISSET(f, s) (((s)->fds_bits[0] >> (f)) & 1UL)
+int select(int nfds, fd_set* r, fd_set* w, fd_set* e, struct timeval* tv);
+int pselect(int nfds, fd_set* r, fd_set* w, fd_set* e, const struct timespec* ts, const void* sigmask);
+/* eventfd */
+#define EFD_SEMAPHORE 1
+#define EFD_NONBLOCK O_NONBLOCK
+#define EFD_CLOEXEC O_CLOEXEC
+typedef uint64_t eventfd_t;
+int eventfd(unsigned initval, int flags);
+int eventfd_read(int fd, eventfd_t* value);
+int eventfd_write(int fd, eventfd_t value);
+extern int __rio_ep_active; void __rio_epoll_rearm(int fd);   /* internal: epoll edge re-arm on I/O */
+void __rio_sockopt_close(int fd);   /* internal: forget per-descriptor socket timeouts */
+
+
+/* ===== POSIX layer (ulibc7.cpp / ulibc8.cpp): stat, dirent, termios, pwd/grp, epoll, timerfd, regex, getopt, ... ===== */
+typedef unsigned int uid_t; typedef unsigned int gid_t; typedef unsigned int mode_t; typedef long off_t;
+typedef unsigned long dev_t; typedef unsigned long ino_t; typedef unsigned int nlink_t; typedef long blksize_t; typedef long blkcnt_t;
+typedef int wint_t;
+#define S_IFMT 0170000
+#define S_IFSOCK 0140000
+#define S_IFLNK 0120000
+#define S_IFREG 0100000
+#define S_IFBLK 0060000
+#define S_IFDIR 0040000
+#define S_IFCHR 0020000
+#define S_IFIFO 0010000
+#define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
+#define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
+#define S_ISLNK(m) (((m) & S_IFMT) == S_IFLNK)
+#define S_ISCHR(m) (((m) & S_IFMT) == S_IFCHR)
+#define S_ISBLK(m) (((m) & S_IFMT) == S_IFBLK)
+#define S_ISFIFO(m) (((m) & S_IFMT) == S_IFIFO)
+#define S_ISSOCK(m) (((m) & S_IFMT) == S_IFSOCK)
+#define S_ISUID 04000
+#define S_ISGID 02000
+#define S_ISVTX 01000
+#define S_IRWXU 0700
+#define S_IRUSR 0400
+#define S_IWUSR 0200
+#define S_IXUSR 0100
+#define S_IRWXG 070
+#define S_IRGRP 040
+#define S_IWGRP 020
+#define S_IXGRP 010
+#define S_IRWXO 07
+#define S_IROTH 04
+#define S_IWOTH 02
+#define S_IXOTH 01
+struct stat { dev_t st_dev; ino_t st_ino; mode_t st_mode; nlink_t st_nlink; uid_t st_uid; gid_t st_gid; dev_t st_rdev; off_t st_size;
+              blksize_t st_blksize; blkcnt_t st_blocks; struct timespec st_atim, st_mtim, st_ctim; };
+#define st_atime st_atim.tv_sec
+#define st_mtime st_mtim.tv_sec
+#define st_ctime st_ctim.tv_sec
+int stat(const char* path, struct stat* st); int lstat(const char* path, struct stat* st); int fstat(int fd, struct stat* st);
+int fchmod(int fd, mode_t mode); int chown(const char* path, uid_t u, gid_t g); int lchown(const char* path, uid_t u, gid_t g); int fchown(int fd, uid_t u, gid_t g);
+mode_t umask(mode_t mask);
+struct utimbuf { time_t actime, modtime; };
+int utime(const char* path, const struct utimbuf* t); int utimes(const char* path, const struct timeval tv[2]);
+#define UTIME_NOW ((1L << 30) - 1L)
+#define UTIME_OMIT ((1L << 30) - 2L)
+#define AT_FDCWD (-100)
+int utimensat(int dirfd, const char* path, const struct timespec ts[2], int flags); int futimens(int fd, const struct timespec ts[2]);
+int truncate(const char* path, off_t len); int ftruncate(int fd, off_t len);
+int fsync(int fd); int fdatasync(int fd); void sync(void);
+#define F_OK 0
+#define X_OK 1
+#define W_OK 2
+#define R_OK 4
+int access(const char* path, int mode);
+#define LOCK_SH 1
+#define LOCK_EX 2
+#define LOCK_NB 4
+#define LOCK_UN 8
+int flock(int fd, int op);
+char* getcwd(char* buf, size_t size); int chdir(const char* path);
+int dup3(int oldfd, int newfd, int flags);
+int getpagesize(void); int getdtablesize(void);
+/* dirent */
+#define DT_UNKNOWN 0
+#define DT_DIR 4
+#define DT_REG 8
+#define DT_LNK 10
+struct dirent { ino_t d_ino; unsigned char d_type; char d_name[64]; };
+typedef struct RioDir DIR;
+DIR* opendir(const char* path); struct dirent* readdir(DIR* d); int closedir(DIR* d); void rewinddir(DIR* d); int dirfd(DIR* d);
+int scandir(const char* path, struct dirent*** list, int (*filter)(const struct dirent*), int (*cmp)(const struct dirent**, const struct dirent**));
+int alphasort(const struct dirent** a, const struct dirent** b);
+#define FNM_NOMATCH 1
+#define FNM_PATHNAME 1
+#define FNM_NOESCAPE 2
+#define FNM_PERIOD 4
+#define FNM_CASEFOLD 16
+int fnmatch(const char* pattern, const char* string, int flags);
+typedef struct { size_t gl_pathc; char** gl_pathv; size_t gl_offs; } glob_t;
+#define GLOB_ERR 1
+#define GLOB_MARK 2
+#define GLOB_NOSORT 4
+#define GLOB_NOCHECK 16
+#define GLOB_NOMATCH (-3)
+#define GLOB_NOSPACE (-1)
+#define GLOB_ABORTED (-2)
+int glob(const char* pattern, int flags, int (*errfn)(const char*, int), glob_t* g); void globfree(glob_t* g);
+int mkstemp(char* tmpl); char* mkdtemp(char* tmpl);
+char* basename(char* path); char* dirname(char* path);
+/* termios / tty */
+#define NCCS 19
+typedef unsigned int tcflag_t; typedef unsigned char cc_t; typedef unsigned int speed_t;
+struct termios { tcflag_t c_iflag, c_oflag, c_cflag, c_lflag; cc_t c_line; cc_t c_cc[NCCS]; unsigned char __pad[4]; speed_t c_ispeed, c_ospeed; };
+#define ISIG 1
+#define ICANON 2
+#define ECHO 8
+#define ECHOE 0x10
+#define ECHOK 0x20
+#define ICRNL 0x100
+#define INLCR 0x40
+#define IXON 0x400
+#define OPOST 1
+#define ONLCR 4
+#define CS8 0x30
+#define CREAD 0x80
+#define VINTR 0
+#define VQUIT 1
+#define VERASE 2
+#define VKILL 3
+#define VEOF 4
+#define VTIME 5
+#define VMIN 6
+#define TCSANOW 0
+#define TCSADRAIN 1
+#define TCSAFLUSH 2
+#define TCIFLUSH 0
+#define TCIOFLUSH 2
+#define B9600 13
+#define B38400 15
+#define B115200 4098
+int tcgetattr(int fd, struct termios* t); int tcsetattr(int fd, int action, const struct termios* t);
+void cfmakeraw(struct termios* t); speed_t cfgetispeed(const struct termios* t); speed_t cfgetospeed(const struct termios* t);
+int cfsetispeed(struct termios* t, speed_t s); int cfsetospeed(struct termios* t, speed_t s);
+int tcflush(int fd, int q); int tcdrain(int fd); int tcflow(int fd, int a); int isatty(int fd); char* ttyname(int fd);
+struct winsize { unsigned short ws_row, ws_col, ws_xpixel, ws_ypixel; };
+#define TIOCGWINSZ 0x5413
+#define TCGETS 0x5401
+#define TCSETS 0x5402
+#define TCSETSW 0x5403
+#define TCSETSF 0x5404
+#define FIONBIO 0x5421
+int ioctl(int fd, unsigned long req, ...);
+/* users and groups */
+struct passwd { char* pw_name; char* pw_passwd; uid_t pw_uid; gid_t pw_gid; char* pw_gecos; char* pw_dir; char* pw_shell; };
+struct group { char* gr_name; char* gr_passwd; gid_t gr_gid; char** gr_mem; };
+struct passwd* getpwnam(const char* n); struct passwd* getpwuid(uid_t u);
+int getpwnam_r(const char* n, struct passwd* pw, char* buf, size_t cap, struct passwd** res);
+int getpwuid_r(uid_t u, struct passwd* pw, char* buf, size_t cap, struct passwd** res);
+struct passwd* getpwent(void); void setpwent(void); void endpwent(void);
+struct group* getgrnam(const char* n); struct group* getgrgid(gid_t g);
+struct group* getgrent(void); void setgrent(void); void endgrent(void);
+char* getlogin(void); int getgroups(int size, gid_t list[]);
+/* system information and limits */
+struct utsname { char sysname[32], nodename[64], release[32], version[32], machine[32]; };
+int uname(struct utsname* u); int gethostname(char* name, size_t len); int sethostname(const char* name, size_t len);
+typedef unsigned long rlim_t;
+struct rlimit { rlim_t rlim_cur, rlim_max; };
+struct rusage { struct timeval ru_utime, ru_stime; long ru_maxrss, ru_ixrss, ru_idrss, ru_isrss, ru_minflt, ru_majflt, ru_nswap, ru_inblock, ru_oublock, ru_msgsnd, ru_msgrcv, ru_nsignals, ru_nvcsw, ru_nivcsw; };
+#define RLIM_INFINITY (~0UL)
+#define RLIMIT_CPU 0
+#define RLIMIT_FSIZE 1
+#define RLIMIT_DATA 2
+#define RLIMIT_STACK 3
+#define RLIMIT_CORE 4
+#define RLIMIT_RSS 5
+#define RLIMIT_NPROC 6
+#define RLIMIT_NOFILE 7
+#define RLIMIT_MEMLOCK 8
+#define RLIMIT_AS 9
+#define RUSAGE_SELF 0
+#define RUSAGE_CHILDREN (-1)
+int getrlimit(int res, struct rlimit* r); int setrlimit(int res, const struct rlimit* r); int getrusage(int who, struct rusage* ru);
+#define _SC_ARG_MAX 0
+#define _SC_CLK_TCK 2
+#define _SC_OPEN_MAX 4
+#define _SC_PAGESIZE 30
+#define _SC_PHYS_PAGES 85
+#define _SC_AVPHYS_PAGES 86
+#define _SC_NPROCESSORS_CONF 83
+#define _SC_NPROCESSORS_ONLN 84
+#define _SC_LINE_MAX 43
+#define _SC_HOST_NAME_MAX 180
+#define _SC_NGROUPS_MAX 3
+#define _PC_NAME_MAX 3
+#define _PC_PATH_MAX 4
+#define _PC_PIPE_BUF 5
+long sysconf(int name); long pathconf(const char* path, int name); long fpathconf(int fd, int name);
+#define PATH_MAX 128
+#define NAME_MAX 63
+#define PIPE_BUF 4096
+pid_t wait4(pid_t pid, int* status, int options, struct rusage* ru); pid_t wait3(int* status, int options, struct rusage* ru);
+void _Exit(int code) __attribute__((noreturn)); int on_exit(void (*fn)(int, void*), void* arg);
+int mlock(const void* a, size_t n); int munlock(const void* a, size_t n); int mlockall(int f); int munlockall(void);
+#define MADV_NORMAL 0
+#define MADV_DONTNEED 4
+int madvise(void* a, size_t n, int advice); int posix_madvise(void* a, size_t n, int advice);
+ssize_t getrandom(void* buf, size_t n, unsigned flags); int getentropy(void* buf, size_t n);
+uint32_t arc4random(void); void arc4random_buf(void* buf, size_t n); uint32_t arc4random_uniform(uint32_t bound);
+long random(void); void srandom(unsigned seed); int rand_r(unsigned* seed);
+double drand48(void); long lrand48(void); long mrand48(void); void srand48(long seed); double erand48(unsigned short x[3]);
+/* futex / process-shared semaphores / shared memory */
+int futex_wait(volatile uint32_t* addr, uint32_t expected, long timeout_ms);   /* 0 woken, -1 EAGAIN/ETIMEDOUT/EINTR */
+int futex_wake(volatile uint32_t* addr, int n);
+int shm_open(const char* name, int oflag, mode_t mode); int shm_unlink(const char* name);
+typedef struct { unsigned long bits[1]; } cpu_set_t;
+#define CPU_ZERO(s) ((s)->bits[0] = 0UL)
+#define CPU_SET(c, s) ((s)->bits[0] |= (1UL << (c)))
+#define CPU_ISSET(c, s) (((s)->bits[0] >> (c)) & 1UL)
+#define CPU_COUNT(s) __builtin_popcountl((s)->bits[0])
+int sched_getcpu(void);
+int sched_getaffinity(pid_t pid, size_t size, cpu_set_t* set);   /* mask of online CPUs; pinning (sched_setaffinity) is not supported */
+#define SEM_FAILED ((sem_t*)0)
+sem_t* sem_open(const char* name, int oflag, ...); int sem_close(sem_t* s); int sem_unlink(const char* name);
+/* epoll (level- and edge-triggered over poll) */
+#define EPOLL_CTL_ADD 1
+#define EPOLL_CTL_DEL 2
+#define EPOLL_CTL_MOD 3
+#define EPOLLIN 0x001
+#define EPOLLOUT 0x004
+#define EPOLLERR 0x008
+#define EPOLLHUP 0x010
+#define EPOLLRDHUP 0x2000
+#define EPOLLONESHOT (1u << 30)
+#define EPOLLET (1u << 31)
+#define EPOLL_CLOEXEC O_CLOEXEC
+typedef union epoll_data { void* ptr; int fd; uint32_t u32; uint64_t u64; } epoll_data_t;
+struct epoll_event { uint32_t events; epoll_data_t data; };
+int epoll_create(int size); int epoll_create1(int flags); int epoll_ctl(int ep, int op, int fd, struct epoll_event* ev);
+int epoll_wait(int ep, struct epoll_event* evs, int maxevents, int timeout_ms);
+/* timerfd */
+#define TFD_NONBLOCK O_NONBLOCK
+#define TFD_CLOEXEC O_CLOEXEC
+#define TFD_TIMER_ABSTIME 1
+struct itimerspec { struct timespec it_interval, it_value; };
+int timerfd_create(int clockid, int flags); int timerfd_settime(int fd, int flags, const struct itimerspec* nv, struct itimerspec* old);
+int timerfd_gettime(int fd, struct itimerspec* cur);
+int clock_nanosleep(int clk, int flags, const struct timespec* req, struct timespec* rem);
+#define TIMER_ABSTIME 1
+/* getopt */
+extern char* optarg; extern int optind, opterr, optopt;
+int getopt(int argc, char* const argv[], const char* optstring);
+struct option { const char* name; int has_arg; int* flag; int val; };
+#define no_argument 0
+#define required_argument 1
+#define optional_argument 2
+int getopt_long(int argc, char* const argv[], const char* optstring, const struct option* longopts, int* longindex);
+int getopt_long_only(int argc, char* const argv[], const char* optstring, const struct option* longopts, int* longindex);
+/* regex (POSIX BRE/ERE, leftmost-longest, back-references) */
+typedef struct { void* __prog; size_t re_nsub; } regex_t;
+typedef int regoff_t;
+typedef struct { regoff_t rm_so, rm_eo; } regmatch_t;
+#define REG_EXTENDED 1
+#define REG_ICASE 2
+#define REG_NEWLINE 4
+#define REG_NOSUB 8
+#define REG_NOTBOL 1
+#define REG_NOTEOL 2
+#define REG_NOMATCH 1
+#define REG_BADPAT 2
+#define REG_ECOLLATE 3
+#define REG_ECTYPE 4
+#define REG_EESCAPE 5
+#define REG_ESUBREG 6
+#define REG_EBRACK 7
+#define REG_EPAREN 8
+#define REG_EBRACE 9
+#define REG_BADBR 10
+#define REG_ERANGE 11
+#define REG_ESPACE 12
+#define REG_BADRPT 13
+int regcomp(regex_t* re, const char* pattern, int cflags); int regexec(const regex_t* re, const char* s, size_t nmatch, regmatch_t pm[], int eflags);
+size_t regerror(int code, const regex_t* re, char* buf, size_t cap); void regfree(regex_t* re);
+/* misc string / wide / locale helpers */
+char* stpcpy(char* d, const char* s); char* stpncpy(char* d, const char* s, size_t n);
+int strverscmp(const char* a, const char* b); int strcoll(const char* a, const char* b); size_t strxfrm(char* d, const char* s, size_t n);
+int strerror_r(int err, char* buf, size_t cap);
+#define CODESET 14
+char* nl_langinfo(int item);
+size_t wcslen(const wchar_t* s); wchar_t* wcscpy(wchar_t* d, const wchar_t* s); wchar_t* wcsncpy(wchar_t* d, const wchar_t* s, size_t n);
+int wcscmp(const wchar_t* a, const wchar_t* b); wchar_t* wcscat(wchar_t* d, const wchar_t* s); wchar_t* wcschr(const wchar_t* s, wchar_t c);
+int mblen(const char* s, size_t n); int mbtowc(wchar_t* w, const char* s, size_t n); int wctomb(char* s, wchar_t w);
+size_t mbstowcs(wchar_t* d, const char* s, size_t n); size_t wcstombs(char* d, const wchar_t* s, size_t n);
+char* strptime(const char* s, const char* fmt, struct tm* tm);
+#define LOG_EMERG 0
+#define LOG_ALERT 1
+#define LOG_CRIT 2
+#define LOG_ERR 3
+#define LOG_WARNING 4
+#define LOG_NOTICE 5
+#define LOG_INFO 6
+#define LOG_DEBUG 7
+#define LOG_PID 1
+#define LOG_USER 8
+#define LOG_DAEMON 24
+void openlog(const char* ident, int opt, int facility); void syslog(int prio, const char* fmt, ...); void closelog(void);
+
 /* internal hooks between the thread scheduler and sleep/yield/fork */
 extern int __rio_threads_started;
 unsigned __rio_thread_sleep(unsigned ms);

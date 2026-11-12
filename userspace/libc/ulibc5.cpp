@@ -63,10 +63,13 @@ extern unsigned long long __rio_realtime_ms(void);
 extern int __rio_signal_local(int sig);
 extern void* mmap(void*, size_t, int, int, int, long);
 void __rio_ctx_switch(void** save_sp, void* new_sp);
-__asm__(".text\n.global __rio_ctx_switch\n__rio_ctx_switch:\n"
-        " sub sp, sp, #96\n stp x19, x20, [sp]\n stp x21, x22, [sp, #16]\n stp x23, x24, [sp, #32]\n stp x25, x26, [sp, #48]\n stp x27, x28, [sp, #64]\n stp x29, x30, [sp, #80]\n"
+/* x19-x30 + d8-d15 (callee-saved FP registers, used by hard-float programs) are switched; 160-byte frame. */
+__asm__(".text\n.arch_extension fp\n.global __rio_ctx_switch\n__rio_ctx_switch:\n"
+        " sub sp, sp, #160\n stp x19, x20, [sp]\n stp x21, x22, [sp, #16]\n stp x23, x24, [sp, #32]\n stp x25, x26, [sp, #48]\n stp x27, x28, [sp, #64]\n stp x29, x30, [sp, #80]\n"
+        " stp d8, d9, [sp, #96]\n stp d10, d11, [sp, #112]\n stp d12, d13, [sp, #128]\n stp d14, d15, [sp, #144]\n"
         " mov x2, sp\n str x2, [x0]\n mov sp, x1\n"
-        " ldp x19, x20, [sp]\n ldp x21, x22, [sp, #16]\n ldp x23, x24, [sp, #32]\n ldp x25, x26, [sp, #48]\n ldp x27, x28, [sp, #64]\n ldp x29, x30, [sp, #80]\n add sp, sp, #96\n ret\n");
+        " ldp x19, x20, [sp]\n ldp x21, x22, [sp, #16]\n ldp x23, x24, [sp, #32]\n ldp x25, x26, [sp, #48]\n ldp x27, x28, [sp, #64]\n ldp x29, x30, [sp, #80]\n"
+        " ldp d8, d9, [sp, #96]\n ldp d10, d11, [sp, #112]\n ldp d12, d13, [sp, #128]\n ldp d14, d15, [sp, #144]\n add sp, sp, #160\n ret\n");
 
 static void init_main(void)
 {
@@ -260,8 +263,8 @@ int pthread_create(pthread_t* t, const pthread_attr_t* attr, void* (*fn)(void*),
     n->detached = attr ? attr->detachstate == PTHREAD_CREATE_DETACHED : 0;
     n->cancel_state = PTHREAD_CANCEL_ENABLE; n->cancel_type = PTHREAD_CANCEL_DEFERRED;
     unsigned long long top = ((unsigned long long)st + ss) & ~15ULL;
-    unsigned long long* frame = (unsigned long long*)(top - 96);
-    for (int i = 0; i < 12; ++i) frame[i] = 0;
+    unsigned long long* frame = (unsigned long long*)(top - 160);
+    for (int i = 0; i < 20; ++i) frame[i] = 0;
     frame[11] = (unsigned long long)thread_entry;             /* x30: where `ret` lands */
     n->sp = frame;
     n->state = ST_RUN;
@@ -474,27 +477,46 @@ int pthread_key_delete(pthread_key_t k) { if (k >= KEYS || !keytab[k].used) retu
 void* pthread_getspecific(pthread_key_t k) { init_main(); return (k < KEYS && keytab[k].used) ? cur->keys[k] : 0; }
 int pthread_setspecific(pthread_key_t k, const void* v) { init_main(); if (k >= KEYS || !keytab[k].used) return EINVAL; cur->keys[k] = (void*)v; return 0; }
 
-/* ---- semaphores ---- */
-int sem_init(sem_t* s, int pshared, unsigned value) { (void)pshared; s->value = value; return 0; }
+/* ---- semaphores (atomic; pshared ones live in shared memory and sleep on a futex) ---- */
+static int sem_take(sem_t* s)
+{
+    unsigned v = __atomic_load_n(&s->value, __ATOMIC_ACQUIRE);
+    while (v > 0)
+        if (__atomic_compare_exchange_n(&s->value, &v, v - 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return 1;
+    return 0;
+}
+int sem_init(sem_t* s, int pshared, unsigned value) { s->value = value; s->shared = pshared ? 1U : 0U; return 0; }
 int sem_destroy(sem_t* s) { (void)s; return 0; }
-int sem_post(sem_t* s) { init_main(); ++s->value; wake_one(s); return 0; }
-int sem_trywait(sem_t* s) { if (s->value == 0) { errno = EAGAIN; return -1; } --s->value; return 0; }
+int sem_post(sem_t* s)
+{
+    init_main();
+    __atomic_add_fetch(&s->value, 1, __ATOMIC_ACQ_REL);
+    if (s->shared) futex_wake(&s->value, 1); else wake_one(s);
+    return 0;
+}
+int sem_trywait(sem_t* s) { if (sem_take(s)) return 0; errno = EAGAIN; return -1; }
 int sem_wait(sem_t* s)
 {
     init_main();
-    while (s->value == 0) (void)block_on(s, 0);
-    --s->value; return 0;
+    for (;;)
+    {
+        if (sem_take(s)) return 0;
+        if (s->shared) { if (futex_wait(&s->value, 0, -1) < 0 && errno == EINTR) return -1; }
+        else (void)block_on(s, 0);
+    }
 }
 int sem_timedwait(sem_t* s, const struct timespec* abs)
 {
     init_main();
     unsigned long long dl = abs_to_deadline(abs);
-    while (s->value == 0)
+    for (;;)
     {
-        if (clock_ms() >= dl) { errno = ETIMEDOUT; return -1; }
-        if (block_on(s, dl) == ETIMEDOUT && s->value == 0) { errno = ETIMEDOUT; return -1; }
+        if (sem_take(s)) return 0;
+        unsigned long long now = clock_ms();
+        if (now >= dl) { errno = ETIMEDOUT; return -1; }
+        if (s->shared) { if (futex_wait(&s->value, 0, (long)(dl - now)) < 0 && errno == EINTR) return -1; }
+        else (void)block_on(s, dl);
     }
-    --s->value; return 0;
 }
 int sem_getvalue(sem_t* s, int* v) { *v = (int)s->value; return 0; }
 

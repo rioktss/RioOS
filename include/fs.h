@@ -102,6 +102,7 @@ uint32_t fs_get_uid(int id);
 uint32_t fs_get_gid(int id);
 int fs_set_mode(int id, uint32_t mode);
 int fs_set_mode_path(const char* path, int cwd, uint32_t mode);
+int fs_set_mtime_path(const char* path, int cwd, uint64_t mtime);   /* owner or root */
 uint64_t fs_total_sectors();
 uint64_t fs_used_sectors();
 int fs_get_child_count(int id);

@@ -43,6 +43,11 @@ user_enter:
     stp x25, x26, [sp, #64]
     stp x27, x28, [sp, #80]
 
+    mov x19, x0
+    mov x20, x1
+    bl bkl_leave_to_user
+    mov x0, x19
+    mov x1, x20
     msr sp_el0, x1
 
     /* Return to EL0t with IRQ unmasked (I=0) so the 100 Hz timer tick keeps
@@ -98,6 +103,11 @@ user_exit_return:
 .global user_resume
 user_resume:
     msr daifset, #0x2
+    mov x19, x0
+    mov x20, x1
+    bl bkl_leave_to_user
+    mov x0, x19
+    mov x1, x20
     ldr x2, [x0, #248]
     msr elr_el1, x2
     ldr x2, [x0, #256]

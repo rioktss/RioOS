@@ -24,6 +24,10 @@
 
 #include "task.h"
 #include "thread.h"
+#include "smp.h"
+#include "fpu.h"
+#include "tty.h"
+#include "vfs.h"
 #include "process.h"
 #include "scheduler.h"
 #include "mmu.h"
@@ -55,14 +59,14 @@ extern "C" void task_context_enter(int pid)
 {
     if (pid >= 0 && mmu_user_space_exists(pid))
     {
-        if (mmu_user_space_active_pid() != pid) (void)mmu_user_space_activate(pid);
+        if (!mmu_user_space_is_loaded(pid)) (void)mmu_user_space_activate(pid);
         (void)fd_set_process(pid);
         (void)scheduler_set_current_logical(pid);
         fs_set_credentials(process_uid(pid), process_gid(pid));     /* privilege separation */
     }
     else
     {
-        if (mmu_user_space_active_pid() >= 0) (void)mmu_user_space_deactivate();
+        mmu_ensure_kernel_space();
         int kp = kernel_pid();
         (void)fd_set_process(kp);
         (void)scheduler_set_current_logical(kp);
@@ -100,6 +104,7 @@ static void drop_process(int pid)
 {
     net_udp_close_all_for(pid);
     net_tcp_close_all_for(pid);
+    tty_process_exit(pid);
     fd_release_process(pid);
     (void)scheduler_remove(pid);
     (void)mmu_user_space_destroy(pid);
@@ -116,6 +121,7 @@ int task_spawn(const char* path, const char* args, int parent, int background,
     int active = mmu_user_space_active_pid();
 
     int pid = process_create(path);
+    if (pid >= 0) (void)process_set_cwd(pid, vfs_cwd());
     if (pid < 0) return -11;
     (void)process_set_parent(pid, parent);
     (void)process_set_args(pid, args ? args : "");
@@ -173,6 +179,8 @@ int task_fork(ExceptionFrame* frame)
     (void)process_set_start(pid, timer_millis());
     (void)process_set_creds(pid, process_uid(parent), process_gid(parent));
     (void)process_sig_inherit(parent, pid);
+    (void)process_set_cwd(pid, process_cwd(parent));
+    (void)process_set_umask(pid, process_umask(parent));
 
     if (mmu_user_space_clone(parent, pid) != 0)
     {
@@ -205,6 +213,7 @@ int task_fork(ExceptionFrame* frame)
         drop_process(pid);
         return -11;
     }
+    thread_fp_copy_live_to(process_thread(pid));       /* child inherits the parent's FP/SIMD registers */
     return pid;
 }
 
@@ -242,6 +251,7 @@ int task_exec(ExceptionFrame* frame, const char* path, const char* args)
     frame->spsr = USER_SPSR_EL0T;
     uint64_t sp = MMU_USER_STACK_TOP - 16ULL;
     asm volatile("msr sp_el0, %0" :: "r"(sp));
+    thread_fp_reset_live();
     return 0;
 }
 
@@ -258,6 +268,7 @@ extern "C" void task_exit_current(int code, int signal)
     (void)fd_set_process(pid);
     mapping_release_pid(pid);                  /* shared file pages are written back before the space goes */
     fd_close_all();
+    tty_process_exit(pid);
     fd_release_process(pid);
     (void)scheduler_remove(pid);
     (void)mmu_user_space_destroy(pid);         /* also returns TTBR0 to the kernel space */
@@ -268,6 +279,7 @@ extern "C" void task_exit_current(int code, int signal)
     (void)process_mark_exit(pid, code);
     (void)process_set_thread(pid, -1);
     if (parent >= 0) (void)process_sig_raise(parent, SIG_CHLD);
+    smp_kick_others();                         /* a boot-CPU shell waiting in wfi notices the exit at once */
 
     --user_task_total;
     thread_set_user_tasks(user_task_total);
@@ -344,6 +356,7 @@ struct SigFrame
     uint64_t x[31];
     uint64_t elr, spsr, sp;
     uint64_t pad;
+    FpState fp;                  /* FP/SIMD registers at the time of the signal (restored by sigreturn) */
 };
 #define SIGFRAME_MAGIC 0x52494F5349474652ULL   /* "RIOSIGFR" */
 #define SA_ONSTACK_FLAG 0x08000000U
@@ -369,6 +382,7 @@ static int push_signal_frame(ExceptionFrame* frame, int pid, int sig, uint64_t h
     sf->info.si_signo = sig; sf->info.si_errno = 0; sf->info.si_code = code; sf->info.si_pid = sender; sf->info.si_value = value; sf->info.si_addr = fault_addr;
     for (int i = 0; i < 31; ++i) sf->x[i] = frame->x[i];
     sf->elr = frame->elr; sf->spsr = frame->spsr; sf->sp = sp; sf->pad = 0;
+    fp_save(&sf->fp);
     uint32_t nm = sf->old_mask | amask;
     if (!(flags & 0x40000000U)) nm |= (1U << sig);          /* SA_NODEFER not set */
     (void)process_sig_set_mask(pid, nm);
@@ -410,6 +424,7 @@ int task_sigreturn(ExceptionFrame* frame)
     for (int i = 0; i < 31; ++i) frame->x[i] = sf->x[i];
     frame->elr = sf->elr;
     frame->spsr = (frame->spsr & ~0xF0000000ULL) | (sf->spsr & 0xF0000000ULL);   /* only the condition flags come back */
+    fp_restore(&sf->fp);
     uint32_t om = sf->old_mask; uint64_t nsp = sf->sp;
     (void)process_sig_set_mask(pid, om);
     asm volatile("msr sp_el0, %0" :: "r"(nsp));
@@ -493,6 +508,7 @@ int task_wait_foreground(int pid, int shell_pid)
         if (process_is_stopped(pid)) { result = TASK_STOPPED; break; }
         if (!process_is_child_of(shell_pid, pid) && process_get_state(pid) < 0) { result = -1; break; }
         thread_yield();
+        smp_idle_wait();
     }
     fg_job_pid = -1;
     return result;

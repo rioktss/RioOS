@@ -440,6 +440,8 @@ int main(int argc, char** argv)
     if (fname[0] && load(fname) < 0) snprintf(msg, sizeof(msg), "\"%s\" [New File]", fname);
     else if (fname[0]) snprintf(msg, sizeof(msg), "\"%s\" %dL", fname, nl);
     if (!nl) ins_line(0, "", 0);
+    struct termios saved_tio; int have_tio = tcgetattr(0, &saved_tio) == 0;
+    if (have_tio) { struct termios raw = saved_tio; cfmakeraw(&raw); raw.c_cc[VMIN] = 0; raw.c_cc[VTIME] = 0; (void)tcsetattr(0, TCSANOW, &raw); }
     os("\x1b[2J"); 
     while (!quit_flag)
     {
@@ -456,5 +458,6 @@ int main(int argc, char** argv)
         if (dot_rec) dot_rec = 0;
     }
     os("\x1b[2J\x1b[H"); oflush();
+    if (have_tio) (void)tcsetattr(0, TCSANOW, &saved_tio);
     return 0;
 }

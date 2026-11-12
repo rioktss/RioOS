@@ -175,15 +175,26 @@ unsigned sleep_ms(unsigned ms)   /* returns the milliseconds left when a signal 
 }
 unsigned long clock_ms(void) { return (unsigned long)user_time_ms(); }
 int open(const char* p, int f) { return (int)ret((uint64_t)user_fd_open(p, (uint64_t)f)); }
-int close(int fd) { return (int)ret((uint64_t)user_fd_close(fd)); }
+int close(int fd) { __rio_sockopt_close(fd); return (int)ret((uint64_t)user_fd_close(fd)); }
 int __rio_sa_restart = 0;   /* set by the signal dispatcher when a SA_RESTART handler ran */
 ssize_t read(int fd, void* b, size_t n)
 {
+    if (n > 4096) n = 4096;      /* kernel transfers are bounded: a short read is normal POSIX behaviour */
+    if (__rio_ep_active) __rio_epoll_rearm(fd);
     for (;;) { ssize_t r = ret((uint64_t)user_fd_read(fd, b, n)); if (r < 0 && errno == EINTR && __rio_sa_restart) { __rio_sa_restart = 0; continue; } return r; }
 }
 ssize_t write(int fd, const void* b, size_t n)
 {
-    for (;;) { ssize_t r = ret((uint64_t)user_fd_write(fd, b, n)); if (r < 0 && errno == EINTR && __rio_sa_restart) { __rio_sa_restart = 0; continue; } return r; }
+    size_t done = 0;
+    if (__rio_ep_active) __rio_epoll_rearm(fd);
+    do {
+        size_t chunk = n - done; if (chunk > 4096) chunk = 4096;
+        ssize_t r = ret((uint64_t)user_fd_write(fd, (const char*)b + done, chunk));
+        if (r < 0) { if (errno == EINTR && __rio_sa_restart) { __rio_sa_restart = 0; continue; } return done ? (ssize_t)done : -1; }
+        done += (size_t)r;
+        if ((size_t)r < chunk) break;
+    } while (done < n);
+    return (ssize_t)done;
 }
 long lseek(int fd, long o, int w) { return ret((uint64_t)user_fd_seek(fd, o, w)); }
 int dup(int fd) { return (int)ret((uint64_t)user_fd_dup(fd)); }
@@ -366,11 +377,12 @@ static unsigned rng = 12345;
 int rand(void) { rng = rng * 1103515245u + 12345u; return (int)((rng >> 16) & 0x7FFF); }
 void srand(unsigned s) { rng = s; }
 
-static void (*exit_hooks[8])(void);
+static void (*exit_hooks[32])(void);
+int __rio_exit_status = 0;
 static int exit_hook_n = 0;
-int atexit(void (*fn)(void)) { if (exit_hook_n >= 8) return -1; exit_hooks[exit_hook_n++] = fn; return 0; }
+int atexit(void (*fn)(void)) { if (exit_hook_n >= 32) return -1; exit_hooks[exit_hook_n++] = fn; return 0; }
 void _exit(int code) { (void)user_syscall1(USER_SYS_EXIT, (uint64_t)(long)code); for (;;) {} }
-void exit(int code) { while (exit_hook_n > 0) exit_hooks[--exit_hook_n](); _exit(code); }
+void exit(int code) { __rio_exit_status = code; while (exit_hook_n > 0) exit_hooks[--exit_hook_n](); _exit(code); }
 void abort(void) { _exit(134); }
 
 /* ---- printf ------------------------------------------------------------ */

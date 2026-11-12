@@ -33,7 +33,8 @@ struct FILE
     int rpos, rlen; int wlen; int unget; int append; int line;
     unsigned char rbuf[FILE_BUF]; unsigned char wbuf[FILE_BUF];
 };
-static FILE files[8];
+#define FILE_POOL 24
+static FILE files[FILE_POOL];
 static FILE std_in  = { 0, 0, 0, 1, 0, 0, 0, -1, 0, 0, {0}, {0} };
 static FILE std_out = { 1, 0, 0, 2, 0, 0, 0, -1, 0, 1, {0}, {0} };
 static FILE std_err = { 2, 0, 0, 2, 0, 0, 0, -1, 0, 1, {0}, {0} };
@@ -48,7 +49,7 @@ int fflush(FILE* f)
         int rc = 0;
         if (fflush(&std_out)) rc = -1;
         if (fflush(&std_err)) rc = -1;
-        for (int i = 0; i < 8; ++i) if (files[i].fd >= 0 && files[i].mode && fflush(&files[i])) rc = -1;
+        for (int i = 0; i < FILE_POOL; ++i) if (files[i].fd >= 0 && files[i].mode && fflush(&files[i])) rc = -1;
         return rc;
     }
     int off = 0;
@@ -68,7 +69,7 @@ static void stdio_init(void)
 {
     if (stdio_hooked) return;
     stdio_hooked = 1;
-    for (int i = 0; i < 8; ++i) files[i].fd = -1;
+    for (int i = 0; i < FILE_POOL; ++i) files[i].fd = -1;
     atexit(stdio_flush_all);
 }
 
@@ -82,7 +83,7 @@ FILE* fopen(const char* path, const char* mode)
     else if (mode[0] == 'a') { fl = (plus ? O_RDWR : O_WRONLY) | O_CREAT; m = plus ? 3 : 2; app = 1; }
     else { errno = EINVAL; return 0; }
     FILE* f = 0;
-    for (int i = 0; i < 8; ++i) if (files[i].fd < 0 && files[i].mode == 0) { f = &files[i]; break; }
+    for (int i = 0; i < FILE_POOL; ++i) if (files[i].fd < 0 && files[i].mode == 0) { f = &files[i]; break; }
     if (!f) { errno = EMFILE; return 0; }
     int fd = open(path, fl);
     if (fd < 0) return 0;
@@ -102,7 +103,7 @@ FILE* fdopen(int fd, const char* mode)
     else if (mode[0] == 'a') { m = plus ? 3 : 2; app = 1; }
     else { errno = EINVAL; return 0; }
     FILE* f = 0;
-    for (int i = 0; i < 8; ++i) if (files[i].fd < 0 && files[i].mode == 0) { f = &files[i]; break; }
+    for (int i = 0; i < FILE_POOL; ++i) if (files[i].fd < 0 && files[i].mode == 0) { f = &files[i]; break; }
     if (!f) { errno = EMFILE; return 0; }
     f->fd = fd; f->err = f->eof = 0; f->mode = m; f->rpos = f->rlen = f->wlen = 0; f->unget = -1; f->append = app; f->line = 0;
     return f;
