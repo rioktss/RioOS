@@ -55,6 +55,7 @@ static void fail(const char* m){fprintf(stderr,"FS HOST TEST FAIL: %s\n",m);exit
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "FS HOST TEST FAIL line %d: %s\n", __LINE__, #c); fail(#c); } } while (0)
 static int same(const unsigned char*a,const unsigned char*b,unsigned long n){for(unsigned long i=0;i<n;i++)if(a[i]!=b[i])return 0;return 1;}
 
+static void fsck_check_clean(){ FsckInfo f; if(fs_fsck(0,0,0,&f)!=0||!f.structure_ok||!f.bitmap_ok||f.problems)fail("fsck clean"); }
 int main(){
     const char* path="build/fs-host-test.img";
     g_file=fopen(path,"w+b"); if(!g_file)fail("open");
@@ -105,6 +106,19 @@ int main(){
         if(fs_rename("/mvdir","/renamed",fs_get_root())!=0)fail("rename: dir");
         fs_init();
         if(fs_resolve("/renamed/b.txt",fs_get_root())<0||fs_resolve("/mvdir",fs_get_root())>=0)fail("rename persistence");
+        /* rename(2): replaces an existing file atomically (the save-to-temp-then-rename pattern) */
+        { int r=fs_get_root(); unsigned char n1[200],o1[100];
+          for(int i=0;i<200;i++)n1[i]=(unsigned char)(i^0x33); for(int i=0;i<100;i++)o1[i]=(unsigned char)i;
+          if(fs_write_data("/db.new",r,n1,200)!=0||fs_write_data("/db",r,o1,100)!=0)fail("replace: setup");
+          if(fs_rename("/db.new","/db",r)!=-2)fail("replace: plain rename must still refuse");
+          if(fs_rename_replace("/db.new","/db",r)!=0)fail("replace: rename_replace");
+          if(fs_resolve("/db.new",r)>=0)fail("replace: source remains");
+          got=0; if(fs_read_file("/db",r,dst,900,&got)!=0||got!=200||!same(n1,dst,200))fail("replace: new content");
+          fs_init(); got=0; if(fs_read_file("/db",fs_get_root(),dst,900,&got)!=0||got!=200||!same(n1,dst,200))fail("replace: persistence");
+          if(fs_mkdir("/rd",fs_get_root())<0)fail("replace: mkdir"); if(fs_write_data("/f2",fs_get_root(),o1,100)!=0)fail("replace: f2");
+          if(fs_rename_replace("/rd","/f2",fs_get_root())!=-2)fail("replace: dir over file refused");
+          if(fs_rename_replace("/f2","/f2",fs_get_root())!=0)fail("replace: onto itself");
+          fsck_check_clean(); }
     }
     /* P2: persisted ownership, permission enforcement, stat and truncate. */
     {
@@ -216,8 +230,9 @@ int main(){
         CHECK(fwrite(impossible_size, 1, sizeof(impossible_size), g_file) == sizeof(impossible_size));
         CHECK(fflush(g_file) == 0);
         fs_init();
-        CHECK(fs_persistent() == 0);
+        CHECK(fs_persistent() == 1);                                  /* mount repairs it (the entry with the impossible size is dropped) */
         CHECK(fs_resolve("/p2-corrupt-size.bin", fs_get_root()) < 0);
+        fsck_check_clean();
     }
 
     fclose(g_file); remove(path); puts("FS HOST TEST: PASS"); return 0;

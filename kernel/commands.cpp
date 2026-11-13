@@ -22,6 +22,9 @@
  * SOFTWARE.
  */
 
+#include "random.h"
+#include "sshkey.h"
+#include "crypto.h"
 #include "commands.h"
 #include "jobs.h"
 #include "filters.h"
@@ -771,11 +774,90 @@ static void command_basename(const char* argument, int dir)
 /* PSCI SYSTEM_OFF / SYSTEM_RESET (QEMU virt exits on either; with -no-reboot reset also exits) */
 static void command_power(int reset)
 {
+    (void)random_seed_save();
     (void)fs_sync();
     uart_puts(reset ? "Rebooting...\r\n" : "Powering off...\r\n");
     register uint64_t x0 asm("x0") = reset ? 0x84000009ULL : 0x84000008ULL;
     asm volatile("smc #0" : "+r"(x0) :: "memory", "x1", "x2", "x3");
     uart_puts("power: PSCI call failed\r\n");
+}
+
+static void command_rng(const char* argument)
+{
+    RandomStatus st; random_status(&st);
+    if (argument && str_equal(argument, "seed"))
+    {
+        if (!security_is_root()) { uart_puts("rng: permission denied (root required)\r\n"); return; }
+        uart_puts(random_seed_save() == 0 ? "rng: seed file refreshed.\r\n" : "rng: could not write the seed file\r\n");
+        return;
+    }
+    if (argument && argument[0]) { uart_puts("usage: rng [seed]\r\n"); return; }
+    uart_puts("Random number generator (SHA-256 hash DRBG)\r\n  entropy estimate : "); print_u64(st.entropy_bits); uart_puts(" bits ("); uart_puts(st.ready ? "ready" : "NOT ready: use the system for a while before generating keys"); uart_puts(")\r\n");
+    uart_puts("  event samples    : "); print_u64(st.events); uart_puts("\r\n  virtio-rng       : "); uart_puts(st.hw_rng ? "yes (host entropy)" : "no (start QEMU with -device virtio-rng-device)");
+    uart_puts("\r\n  stored seed      : "); uart_puts(st.seed_loaded ? "loaded from /var/lib/random.seed" : "none yet (created for the next boot)");
+    uart_puts("\r\n  bytes generated  : "); print_u64(st.bytes_out); uart_puts("\r\n");
+}
+
+static void ssh_default_identity_path(char* out, int cap);
+static void command_ssh_keygen(const char* argument)
+{
+    char buf[300]; str_copy(buf, argument ? argument : "", sizeof(buf));
+    char* w[12]; int n = split_words(buf, w, 12);
+    const char* file = 0; const char* comment = 0; int show_pub = 0, show_fp = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        if (str_equal(w[i], "-f") && i + 1 < n) file = w[++i];
+        else if (str_equal(w[i], "-C") && i + 1 < n) comment = w[++i];
+        else if (str_equal(w[i], "-y")) show_pub = 1;
+        else if (str_equal(w[i], "-l")) show_fp = 1;
+        else if (str_equal(w[i], "-t") && i + 1 < n) { if (!str_equal(w[++i], "ed25519")) { uart_puts("ssh-keygen: only -t ed25519 is supported\r\n"); return; } }
+        else if (str_equal(w[i], "-N") && i + 1 < n) { if (w[++i][0]) { uart_puts("ssh-keygen: passphrases are not supported (use -N \"\")\r\n"); return; } }
+        else if (str_equal(w[i], "-q")) { }
+        else { uart_puts("usage: ssh-keygen [-t ed25519] [-f file] [-C comment] [-N \"\"]   create a key pair (default ~/.ssh/id_ed25519)\r\n       ssh-keygen -y -f file     print the public key of a private key\r\n       ssh-keygen -l -f file     show the fingerprint of a key file\r\n"); return; }
+    }
+    char path[160];
+    if (file) str_copy(path, file, sizeof(path)); else ssh_default_identity_path(path, sizeof(path));
+    uint8_t seed[32], pub[32]; char cm[80]; cm[0] = 0;
+    if (show_pub || show_fp)
+    {
+        static uint8_t kb[2048]; uint64_t sz = 0;
+        if (fs_read_file(path, vfs_cwd(), kb, sizeof(kb), &sz) != 0 || sz == 0) { uart_puts("ssh-keygen: cannot read "); uart_puts(path); uart_puts("\r\n"); return; }
+        int r = sshkey_parse_private(kb, (uint32_t)sz, seed, pub, cm, sizeof(cm));
+        if (r != SSHKEY_OK)
+        {
+            kb[sz < sizeof(kb) ? sz : sizeof(kb) - 1] = 0;
+            if (!show_pub && sshkey_parse_public((const char*)kb, pub) == 0) { cm[0] = 0; }
+            else { uart_puts("ssh-keygen: "); uart_puts(path); uart_puts(r == SSHKEY_ENCRYPTED ? ": passphrase-protected keys are not supported\r\n" : ": not a valid Ed25519 OpenSSH key\r\n"); return; }
+        }
+        for (int i = 0; i < 32; ++i) seed[i] = 0;
+        char line[200];
+        if (show_fp) { uint8_t blob[51]; sshkey_blob(pub, blob); char fp[64]; ssh_fingerprint(blob, 51, fp, sizeof(fp)); uart_puts("256 "); uart_puts(fp); uart_putc(' '); uart_puts(cm[0] ? cm : "no comment"); uart_puts(" (ED25519)\r\n"); return; }
+        if (sshkey_format_public(pub, cm, line, sizeof(line)) < 0) { uart_puts("ssh-keygen: internal error\r\n"); return; }
+        for (char* q = line; *q; ++q) { if (*q == '\n') uart_putc('\r'); uart_putc(*q); }
+        return;
+    }
+    FsStat st;
+    if (fs_stat_path(path, vfs_cwd(), &st) == 0) { uart_puts(path); uart_puts(" already exists; refusing to overwrite a key (remove it first)\r\n"); return; }
+    if (!random_ready()) { uart_puts("ssh-keygen: the kernel has not collected enough entropy yet (see 'rng'); wait a little and retry\r\n"); return; }
+    char dir[160]; str_copy(dir, path, sizeof(dir)); int dl = str_len(dir); while (dl > 0 && dir[dl - 1] != '/') --dl;
+    if (dl > 1) { dir[dl - 1] = 0; if (fs_resolve(dir, vfs_cwd()) < 0) { int mr = fs_mkdir_p(dir, vfs_cwd()); if (mr < 0) { uart_puts("ssh-keygen: cannot create "); uart_puts(dir); uart_puts("\r\n"); return; } int did = fs_resolve(dir, vfs_cwd()); if (did >= 0) (void)fs_set_mode(did, 0700U); } }
+    random_get(seed, 32);
+    if (ed25519_pubkey(seed, pub) != 0) { uart_puts("ssh-keygen: key generation failed\r\n"); return; }
+    char defcm[96]; if (!comment) { str_copy(defcm, security_username(), sizeof(defcm)); str_copy(defcm + str_len(defcm), "@RioOS", 8); comment = defcm; }
+    uint32_t chk; { uint8_t r4[4]; random_get(r4, 4); chk = (uint32_t)r4[0] << 24 | (uint32_t)r4[1] << 16 | (uint32_t)r4[2] << 8 | r4[3]; }
+    static char priv[1000], pubtxt[200];
+    int pl = sshkey_format_private(seed, pub, comment, chk, priv, sizeof(priv)); int ql = sshkey_format_public(pub, comment, pubtxt, sizeof(pubtxt));
+    for (int i = 0; i < 32; ++i) seed[i] = 0;
+    if (pl < 0 || ql < 0) { uart_puts("ssh-keygen: internal error\r\n"); return; }
+    if (fs_write_data(path, vfs_cwd(), (const uint8_t*)priv, (uint64_t)pl) != 0) { uart_puts("ssh-keygen: cannot write "); uart_puts(path); uart_puts("\r\n"); return; }
+    (void)fs_set_mode_path(path, vfs_cwd(), 0600U);
+    for (int i = 0; i < (int)sizeof(priv); ++i) priv[i] = 0;
+    char ppath[170]; str_copy(ppath, path, sizeof(ppath)); str_copy(ppath + str_len(ppath), ".pub", 5);
+    if (fs_write_data(ppath, vfs_cwd(), (const uint8_t*)pubtxt, (uint64_t)ql) != 0) { uart_puts("ssh-keygen: cannot write "); uart_puts(ppath); uart_puts("\r\n"); return; }
+    (void)fs_set_mode_path(ppath, vfs_cwd(), 0644U);
+    uint8_t blob[51]; sshkey_blob(pub, blob); char fp[64]; ssh_fingerprint(blob, 51, fp, sizeof(fp));
+    uart_puts("Generated Ed25519 key pair.\r\nYour identification has been saved in "); uart_puts(path); uart_puts("\r\nYour public key has been saved in "); uart_puts(ppath);
+    uart_puts("\r\nThe key fingerprint is: "); uart_puts(fp); uart_puts(" "); uart_puts(comment); uart_puts("\r\n");
 }
 
 static void command_sync()
@@ -1081,11 +1163,13 @@ static const ManualEntry manual_entries[] =
     {"libctest", "libc part 2 self-test (user program)", "libctest", "FILE stdio, sscanf, strtok_r, strcasecmp, bsearch, integer math; prints N/N passed"},
     {"fat", "FAT32 volumes on a raw device (not VFS-mounted)", "fat <dev> mkfs [label] | info | ls [path] | cat <p> | get <p> <file> | put <file> <p> | mkdir <p> | rm <p>", "root only; dev ram0 ram1 nvme0n1 sda; reads long names, new names must be 8.3; files up to 1 MiB; works on images made by other OSes"},
     {"curl", "HTTP/HTTPS client", "curl [-s] [-i|-I] [-L] [-o file] [-X METHOD] [-H 'K: V'] [-d data] <url>", "GET/POST/HEAD, custom headers, follows up to 4 redirects with -L, -i/-I show headers, -o saves the body; https uses TLS 1.3 without certificate verification"},
-    {"ssh", "secure shell client (SSH-2)", "ssh [-p port] [-t|-T] [-o StrictHostKeyChecking=yes|no|accept-new] [user@]host [command]", "curve25519 key exchange, aes128-ctr + hmac-sha2-256, password login, host keys ssh-ed25519/rsa-sha2/ecdsa-nistp256 remembered in ~/.ssh_known_hosts; without a command opens a shell on a pty (~. at line start quits); with a command runs it and returns its exit status in $?; ssh -R host forgets a stored host key"},
+    {"ssh", "secure shell client (SSH-2)", "ssh [-p port] [-t|-T] [-o StrictHostKeyChecking=yes|no|accept-new] [user@]host [command]", "curve25519 key exchange, aes128-ctr + hmac-sha2-256, publickey login with an Ed25519 key (~/.ssh/id_ed25519 or -i file; see ssh-keygen) then password, host keys ssh-ed25519/rsa-sha2/ecdsa-nistp256 remembered in ~/.ssh_known_hosts; without a command opens a shell on a pty (~. at line start quits); with a command runs it and returns its exit status in $?; ssh -R host forgets a stored host key"},
     {"scp", "copy files over SSH", "scp [-P port] [-r] [-q] <src> <dst>", "one side is [user@]host:path (upload or download); -r copies directories; files are limited to 4 MiB; password login only"},
     {"certs", "TLS trust store (CA certificates)", "certs [list|count|add <pem>|verify <pem chain> [host]]", "the trust store is /etc/ssl/certs.pem; add (root) appends CA certificates; verify checks a PEM chain (leaf first) against the store, signatures, dates and the optional host name"},
     {"ntpdate", "set the clock from an NTP server", "ntpdate [-q] <server>", "SNTP over UDP 123; -q only queries and prints the offset; setting the RTC needs root"},
     {"fw", "IPv4 packet filter (firewall)", "fw [list] | fw add|insert <allow|deny> <in|out|both> <tcp|udp|icmp|any> [ip[/bits]|any] [port|any] | fw del <n> | fw flush | fw default <in|out> <allow|deny>", "ordered rules, first match wins, then the per-direction default policy; inbound rules apply to new connections only (SYN, new UDP flow, echo request); DHCP and DNS are exempt; changing rules needs root"},
+    {"ssh-keygen", "create or inspect SSH keys", "ssh-keygen [-f file] [-C comment] | -y -f file | -l -f file", "creates an Ed25519 key pair in OpenSSH format (default ~/.ssh/id_ed25519 + .pub, private file mode 0600, no passphrase). ssh and scp use ~/.ssh/id_ed25519 automatically (or -i file) and fall back to the password. Install the public key on a server with: scp ~/.ssh/id_ed25519.pub user@host:.ssh/authorized_keys (or append it there)"},
+    {"rng", "random number generator status", "rng [seed]", "shows the entropy estimate and sources of the kernel CSPRNG; rng seed (root) rewrites /var/lib/random.seed, which is also refreshed at boot and poweroff"},
     {"fsck", "check the filesystem", "fsck [-r] [mountpoint]", "reports inodes/sectors, structure and bitmap; -r (root) repairs a leaked/missing bitmap"},
     {"quota", "per-user disk quota", "quota [list|<uid>] | quota set <uid> <KiB>", "root sets; stored in /etc/quota; writes beyond the limit fail; root is exempt"},
     {"awk", "pattern scanning and processing", "awk [-F sep] 'prog' [file]  |  cmd | awk 'prog'", "BEGIN/END, /re/ and expr patterns, print/printf, if/while/for, arrays, $N NF NR FS; length substr index split sub gsub tolower toupper int sprintf; integer arithmetic only"},
@@ -3813,18 +3897,51 @@ static int ssh_split_target(const char* s, SshTarget* t, int need_colon)
     t->has_host = 1; return 1;
 }
 
+/* Ed25519 identity: -i <file>, else ~/.ssh/id_ed25519 when it exists. Returns 1 loaded, 0 none, -1 error (message printed). */
+static const char* g_ssh_identity = 0;
+static uint8_t g_id_seed[32], g_id_pub[32];
+static char g_prompt_user[48], g_prompt_host[96];
+static void ssh_default_identity_path(char* out, int cap)
+{
+    const char* u = security_username(); char t[96]; int n;
+    if (str_equal(u, "root")) { str_copy(t, "/root", sizeof(t)); n = 5; }
+    else { str_copy(t, "/home/", sizeof(t)); n = 6; while (*u && n < 70) t[n++] = *u++; t[n] = 0; }
+    str_copy(t + n, "/.ssh/id_ed25519", (int)sizeof(t) - n); str_copy(out, t, cap);
+}
+static int ssh_load_identity(const char* who)
+{
+    char path[160]; int explicit_id = g_ssh_identity != 0;
+    if (explicit_id) str_copy(path, g_ssh_identity, sizeof(path)); else ssh_default_identity_path(path, sizeof(path));
+    FsStat st;
+    if (fs_stat_path(path, vfs_cwd(), &st) != 0) { if (explicit_id) { uart_puts(who); uart_puts(": identity file "); uart_puts(path); uart_puts(" not found\r\n"); return -1; } return 0; }
+    if (st.mode & 077U) { uart_puts(who); uart_puts(": UNPROTECTED PRIVATE KEY FILE "); uart_puts(path); uart_puts(" (permissions too open; run: chmod 600 "); uart_puts(path); uart_puts(")\r\n"); return -1; }
+    static uint8_t kb[2048]; uint64_t sz = 0;
+    if (fs_read_file(path, vfs_cwd(), kb, sizeof(kb), &sz) != 0 || sz == 0) { uart_puts(who); uart_puts(": cannot read identity "); uart_puts(path); uart_puts("\r\n"); return -1; }
+    int r = sshkey_parse_private(kb, (uint32_t)sz, g_id_seed, g_id_pub, 0, 0);
+    for (uint32_t i = 0; i < sizeof(kb); ++i) kb[i] = 0;
+    if (r == SSHKEY_OK) return 1;
+    uart_puts(who); uart_puts(": "); uart_puts(path); uart_puts(r == SSHKEY_ENCRYPTED ? ": passphrase-protected keys are not supported (create one with ssh-keygen)\r\n" : r == SSHKEY_UNSUPPORTED ? ": only Ed25519 keys are supported\r\n" : ": not a valid OpenSSH private key\r\n");
+    return explicit_id ? -1 : 0;
+}
+static int ssh_ask_password(char* out, int cap)
+{
+    uart_puts(g_prompt_user); uart_putc('@'); uart_puts(g_prompt_host); uart_puts("'s password: ");
+    return security_read_password(out, cap);
+}
+
 static int ssh_prompt_connect(const SshTarget* t, int port, int strict, const char* who, int* sk_out)
 {
     if (!net_ready()) { uart_puts(who); uart_puts(": network not ready\r\n"); return -1; }
     int sk = tcp_open_any(t->host, port, 6000U, who, 0);
     if (sk < 0) { uart_puts(who); uart_puts(": connection failed\r\n"); return -1; }
     char user[48]; str_copy(user, t->user[0] ? t->user : security_username(), sizeof(user));
-    char pw[128];
-    uart_puts(user); uart_putc('@'); uart_puts(t->host); uart_puts("'s password: ");
-    if (security_read_password(pw, sizeof(pw)) < 0) { net_tcp_close(0, sk); uart_puts("\r\n"); return -1; }
-    SshOpts o; o.host = t->host; o.port = (uint32_t)port; o.user = user; o.password = pw; o.strict = strict;
+    int have_id = ssh_load_identity(who);
+    if (have_id < 0) { net_tcp_close(0, sk); return -1; }
+    str_copy(g_prompt_user, user, sizeof(g_prompt_user)); str_copy(g_prompt_host, t->host, sizeof(g_prompt_host));
+    SshOpts o; o.host = t->host; o.port = (uint32_t)port; o.user = user; o.password = 0; o.strict = strict;
+    o.key_seed = have_id ? g_id_seed : 0; o.key_pub = have_id ? g_id_pub : 0; o.get_password = ssh_ask_password;
     int rc = ssh_connect(sk, &o);
-    for (int i = 0; i < (int)sizeof(pw); ++i) pw[i] = 0;
+    for (int i = 0; i < 32; ++i) g_id_seed[i] = 0;
     if (rc != 0) { uart_puts(who); uart_puts(": "); uart_puts(ssh_error()); uart_puts("\r\n"); net_tcp_close(0, sk); return -1; }
     *sk_out = sk; return 0;
 }
@@ -3842,9 +3959,11 @@ static void command_ssh(const char* argument)
     char buf[400]; str_copy(buf, argument ? argument : "", sizeof(buf));
     char* w[24]; int n = split_words(buf, w, 24);
     int port = 22, strict = 0, force_tty = 0, no_tty = 0, i = 0;
+    g_ssh_identity = 0;
     for (; i < n && w[i][0] == '-' && w[i][1]; ++i)
     {
         if (str_equal(w[i], "-p") && i + 1 < n) port = parse_uint(w[++i], -1);
+        else if (str_equal(w[i], "-i") && i + 1 < n) g_ssh_identity = w[++i];
         else if (str_equal(w[i], "-t")) force_tty = 1;
         else if (str_equal(w[i], "-T")) no_tty = 1;
         else if (str_equal(w[i], "-o") && i + 1 < n) { if (!ssh_parse_o(w[++i], &strict)) { uart_puts("ssh: unsupported option "); uart_puts(w[i]); uart_puts("\r\n"); return; } }
@@ -3856,7 +3975,7 @@ static void command_ssh(const char* argument)
         }
         else { i = -1; break; }
     }
-    if (i < 0 || i >= n || port <= 0 || port > 65535) { uart_puts("usage: ssh [-p port] [-t|-T] [-o StrictHostKeyChecking=yes|no|accept-new] [user@]host [command]\r\n       ssh -R [-p port] host      (forget a stored host key)\r\n"); return; }
+    if (i < 0 || i >= n || port <= 0 || port > 65535) { uart_puts("usage: ssh [-p port] [-i identity] [-t|-T] [-o StrictHostKeyChecking=yes|no|accept-new] [user@]host [command]\r\n       ssh -R [-p port] host      (forget a stored host key)\r\n"); return; }
     SshTarget t; if (!ssh_split_target(w[i], &t, 0)) { uart_puts("ssh: bad host\r\n"); return; }
     /* the command is everything after the host word, kept verbatim */
     char cmd[300]; cmd[0] = 0;
@@ -4063,15 +4182,17 @@ static void command_scp(const char* argument)
     char buf[500]; str_copy(buf, argument ? argument : "", sizeof(buf));
     char* w[16]; int n = split_words(buf, w, 16);
     int port = 22, recursive = 0, quiet = 0, strict = 0, i = 0;
+    g_ssh_identity = 0;
     for (; i < n && w[i][0] == '-' && w[i][1]; ++i)
     {
         if (str_equal(w[i], "-P") && i + 1 < n) port = parse_uint(w[++i], -1);
         else if (str_equal(w[i], "-r")) recursive = 1;
+        else if (str_equal(w[i], "-i") && i + 1 < n) g_ssh_identity = w[++i];
         else if (str_equal(w[i], "-q")) quiet = 1;
         else if (str_equal(w[i], "-o") && i + 1 < n) { if (!ssh_parse_o(w[++i], &strict)) { uart_puts("scp: unsupported option "); uart_puts(w[i]); uart_puts("\r\n"); return; } }
         else { i = -1; break; }
     }
-    if (i < 0 || n - i != 2 || port <= 0 || port > 65535) { uart_puts("usage: scp [-P port] [-r] [-q] [-o StrictHostKeyChecking=...] <src> <dst>   (exactly one of them is [user@]host:path)\r\n"); return; }
+    if (i < 0 || n - i != 2 || port <= 0 || port > 65535) { uart_puts("usage: scp [-P port] [-i identity] [-r] [-q] [-o StrictHostKeyChecking=...] <src> <dst>   (exactly one of them is [user@]host:path)\r\n"); return; }
     SshTarget a, b; int ra = ssh_split_target(w[i], &a, 1), rb = ssh_split_target(w[i + 1], &b, 1);
     if (ra == rb) { uart_puts("scp: exactly one of source and destination must be remote ([user@]host:path)\r\n"); return; }
     const SshTarget* rem = ra ? &a : &b; const char* local = ra ? w[i + 1] : w[i];
@@ -4705,6 +4826,8 @@ static void execute_command_inner(
     if (str_equal(command, "mount")) { command_mount(argument); return; }
     if (str_equal(command, "mkfs")) { command_mkfs(argument); return; }
     if (str_equal(command, "fsck")) { command_fsck(argument); return; }
+    if (str_equal(command, "rng")) { command_rng(argument); return; }
+    if (str_equal(command, "ssh-keygen")) { command_ssh_keygen(argument); return; }
     if (str_equal(command, "fat")) { command_fat(argument); return; }
     if (str_equal(command, "quota")) { command_quota(argument); return; }
     if (str_equal(command, "stats")) { command_stats(); return; }

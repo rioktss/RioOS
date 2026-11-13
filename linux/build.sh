@@ -113,7 +113,7 @@ ASMFLAGS=(
 
 MODULES=(
     uart memory string fs vfs process sched_policy scheduler timer interrupt keyboard
-    commands version shell history env rtc exceptions syscall user mmu virtio_mmio virtio_input virtio_blk storage thread fd tty task mapping jobs sha256 script pci nvme ahci filters textutils shellext usb tls crypto x509 trust ssh netserv fat32
+    commands version shell history env rtc exceptions syscall user mmu virtio_mmio virtio_input virtio_blk storage thread fd tty task mapping jobs sha256 script pci nvme ahci filters textutils shellext usb tls crypto x509 trust ssh netserv fat32 random virtio_rng sshkey
     fb console console_font
     elf virtio_net netstack page_alloc fault diag security smp
     kernel
@@ -264,7 +264,7 @@ step "6/9" "Linking"
     build/commands.o build/version.o build/shell.o build/history.o build/env.o build/rtc.o build/exceptions.o build/syscall.o build/user.o build/mmu.o \
     build/virtio_mmio.o build/virtio_input.o build/virtio_blk.o build/storage.o build/elf.o build/virtio_net.o \
     build/netstack.o build/page_alloc.o build/fault.o build/diag.o build/security.o \
-    build/fb.o build/console.o build/console_font.o build/thread.o build/fd.o build/tty.o build/smp.o build/task.o build/mapping.o build/jobs.o build/sha256.o build/script.o build/pci.o build/nvme.o build/ahci.o build/filters.o build/textutils.o build/shellext.o build/usb.o build/tls.o build/crypto.o build/x509.o build/trust.o build/ssh.o build/netserv.o build/fat32.o \
+    build/fb.o build/console.o build/console_font.o build/thread.o build/fd.o build/tty.o build/smp.o build/task.o build/mapping.o build/jobs.o build/sha256.o build/script.o build/pci.o build/nvme.o build/ahci.o build/filters.o build/textutils.o build/shellext.o build/usb.o build/tls.o build/crypto.o build/x509.o build/trust.o build/ssh.o build/netserv.o build/fat32.o build/random.o build/virtio_rng.o build/sshkey.o \
     -o build/kernel.elf
 
 step "7/9" "Verifying ELF"
@@ -279,6 +279,12 @@ step "8/9" "Running host tests"
     tests/fs_host_test.cpp fs/fs.cpp kernel/string.cpp kernel/rtc.cpp \
     -o "$HOST_TOOLS/fs_host_test"
 "$HOST_TOOLS/fs_host_test" > /dev/null
+"$CXX" -std=c++17 -O2 -iquote include -DHOST_TEST tests/sshkey_host_test.cpp net/sshkey.cpp net/crypto.cpp kernel/sha256.cpp -o "$HOST_TOOLS/sshkey_host_test"
+"$HOST_TOOLS/sshkey_host_test" > /dev/null
+# crash injection: power loss at sector writes of metadata-heavy operations (every 6th crash point here; stride 1 = full run), corruption repair
+"$CXX" -std=c++17 -O2 -iquote include -DHOST_TEST tests/fs_crash_test.cpp fs/fs.cpp kernel/string.cpp kernel/rtc.cpp \
+    -o "$HOST_TOOLS/fs_crash_test"
+"$HOST_TOOLS/fs_crash_test" 6 > /dev/null
 
 # soft-float, libm and deflate (user libc) host tests
 "$CXX" -std=c++17 -O2 -fno-strict-aliasing -ffp-contract=off -c userspace/libc/softfloat.cpp -o "$HOST_TOOLS/sf_plain.o"

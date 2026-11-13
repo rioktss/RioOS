@@ -527,3 +527,71 @@ int ed25519_verify(const uint8_t pub[32], const uint8_t* msg, uint64_t mlen, con
     e_mul(l1, SB.y, rhs.z); e_mul(l2, rhs.y, SB.z); if (bn_cmp(l1, l2, 8) != 0) return -1;
     return 0;
 }
+
+/* ---- Ed25519 signing (RFC 8032). Not constant-time: keys live on a single-user machine and are not exposed to timing probes. ---- */
+static const uint32_t ED_L[8] = {0x5cf5d3edu, 0x5812631au, 0xa2f79cd6u, 0x14def9deu, 0, 0, 0, 0x10000000u};
+static int w_ge(const uint32_t* a, const uint32_t* b) { for (int i = 7; i >= 0; --i) { if (a[i] != b[i]) return a[i] > b[i]; } return 1; }
+static uint32_t w_add(uint32_t* r, const uint32_t* a, const uint32_t* b) { uint64_t c = 0; for (int i = 0; i < 8; ++i) { c += (uint64_t)a[i] + b[i]; r[i] = (uint32_t)c; c >>= 32; } return (uint32_t)c; }
+static void w_sub(uint32_t* r, const uint32_t* a, const uint32_t* b) { int64_t c = 0; for (int i = 0; i < 8; ++i) { c += (int64_t)a[i] - b[i]; r[i] = (uint32_t)c; c >>= 32; } }
+static void l_addmod(uint32_t* r, const uint32_t* a, const uint32_t* b)          /* a,b < L */
+{
+    uint32_t t[8]; uint32_t carry = w_add(t, a, b);
+    if (carry || w_ge(t, ED_L)) w_sub(t, t, ED_L);
+    for (int i = 0; i < 8; ++i) r[i] = t[i];
+}
+static void l_reduce(uint32_t* r, const uint8_t* le, int nbytes)                    /* little-endian integer mod L, bit-serial */
+{
+    uint32_t acc[8] = {0};
+    for (int i = nbytes * 8 - 1; i >= 0; --i)
+    {
+        l_addmod(acc, acc, acc);
+        if ((le[i / 8] >> (i % 8)) & 1) { uint32_t one[8] = {1}; l_addmod(acc, acc, one); }
+    }
+    for (int i = 0; i < 8; ++i) r[i] = acc[i];
+}
+static void l_mulmod(uint32_t* r, const uint32_t* a, const uint32_t* b)
+{
+    uint32_t acc[8] = {0};
+    for (int i = 255; i >= 0; --i) { l_addmod(acc, acc, acc); if ((b[i / 32] >> (i % 32)) & 1) l_addmod(acc, acc, a); }
+    for (int i = 0; i < 8; ++i) r[i] = acc[i];
+}
+static void w_to_le(uint8_t* out, const uint32_t* w) { for (int i = 0; i < 8; ++i) for (int k = 0; k < 4; ++k) out[i * 4 + k] = (uint8_t)(w[i] >> (8 * k)); }
+static void ep_encode(uint8_t out[32], const EPt* p)
+{
+    uint32_t zi[8], x[8], y[8], xn[8], yn[8];
+    mont_inv(&ED.f, zi, p->z); e_mul(x, p->x, zi); e_mul(y, p->y, zi);
+    mont_from(&ED.f, xn, x); mont_from(&ED.f, yn, y);
+    w_to_le(out, yn);
+    out[31] = (uint8_t)((out[31] & 0x7f) | ((xn[0] & 1) << 7));
+}
+static int ed_base(EPt* B) { uint8_t by[32]; for (int i = 0; i < 32; ++i) by[i] = 0x66; by[0] = 0x58; return ep_decode(B, by); }
+static void ed_expand(const uint8_t seed[32], uint8_t a_le[32], uint8_t prefix[32])
+{
+    uint8_t h[64]; sha512(seed, 32, h);
+    for (int i = 0; i < 32; ++i) { a_le[i] = h[i]; prefix[i] = h[32 + i]; }
+    a_le[0] &= 248; a_le[31] &= 127; a_le[31] |= 64;
+}
+int ed25519_pubkey(const uint8_t seed[32], uint8_t pub[32])
+{
+    if (ed_init() != 0) return -1;
+    uint8_t a[32], pre[32]; ed_expand(seed, a, pre);
+    EPt B, A; if (ed_base(&B) != 0) return -1;
+    ep_mul(&A, &B, a, 32); ep_encode(pub, &A);
+    return 0;
+}
+int ed25519_sign(const uint8_t seed[32], const uint8_t* msg, uint64_t mlen, uint8_t sig[64])
+{
+    if (ed_init() != 0) return -1;
+    uint8_t a_le[32], pre[32], pub[32]; ed_expand(seed, a_le, pre);
+    EPt B, A, R; if (ed_base(&B) != 0) return -1;
+    ep_mul(&A, &B, a_le, 32); ep_encode(pub, &A);
+    Sha512Ctx c; uint8_t h[64];
+    sha512_init(&c); sha512_update(&c, pre, 32); sha512_update(&c, msg, mlen); sha512_final(&c, h, 64);
+    uint32_t r[8]; l_reduce(r, h, 64);
+    uint8_t r_le[32]; w_to_le(r_le, r);
+    ep_mul(&R, &B, r_le, 32); ep_encode(sig, &R);
+    sha512_init(&c); sha512_update(&c, sig, 32); sha512_update(&c, pub, 32); sha512_update(&c, msg, mlen); sha512_final(&c, h, 64);
+    uint32_t k[8], a[8], ka[8], s[8]; l_reduce(k, h, 64); l_reduce(a, a_le, 32);
+    l_mulmod(ka, k, a); l_addmod(s, r, ka); w_to_le(sig + 32, s);
+    return 0;
+}

@@ -104,3 +104,5 @@ Round 8: host tests `crypto_host_test` (86 vectors from python `cryptography`), 
 - httpd: python http.client (keep-alive, HEAD, Range, listing, redirects, 400/404/405, traversal, 700 KB file); ftpd: python ftplib (per-user permissions, PASV and active mode, anonymous, `-d` jail, 300 KB transfer)
 - pkg: remote add/list/remove, update, install with dependency, upgrade from a second remote, sha256 mismatch rejected, missing index, HTTPS refused without CA / accepted after `certs add` / `-k`, `mkindex`
 
+
+Round 9: `fs_crash_test` (6185 simulated power-loss points on write-through and volatile-cache disks, plus corruption repair), `sshkey_host_test`, Ed25519 signing vectors in `crypto_host_test`; `qemu_net_tests.py` pkg session extended (signed index, untrusted key, rollback, tampered package, detached signatures, policy) and ssh session extended (ssh-keygen, public-key login without password, fallback to password, `-i`, key permission check); regression session 16 (`rng`, seed file persisting across boots, `fsck: clean` after create/rename/rm -r, `ssh-keygen`).

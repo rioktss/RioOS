@@ -23,6 +23,7 @@
  */
 
 #include "timer.h"
+#include "random.h"
 #include "thread.h"
 #include "uart.h"
 #include "scheduler.h"
@@ -212,6 +213,7 @@ void timer_interrupt_handler()
     }
 
     ++irq_events;
+    random_add_event();
 
     if (mode == TIMER_MODE_PERIODIC && period_ticks != 0)
     {

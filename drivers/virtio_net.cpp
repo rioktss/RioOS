@@ -26,6 +26,7 @@
 #include "virtio_mmio.h"
 #include "uart.h"
 #include "timer.h"
+#include "random.h"
 
 #define V_MAGIC                 0x000
 #define V_VERSION               0x004
@@ -341,6 +342,7 @@ int virtio_net_receive(void* frame, uint32_t capacity)
     if (!ready || !frame || capacity == 0) return -22;
     dma_invalidate(&rx_used, sizeof(rx_used));
     if (rx_used.idx == rx_last_used) return 0;
+    random_add_event();
     uint16_t slot = (uint16_t)(rx_last_used % (uint16_t)queue_size);
     volatile VirtqUsedElem* elem = &rx_used.ring[slot];
     if (elem->id >= (uint32_t)queue_size)

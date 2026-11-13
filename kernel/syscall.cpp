@@ -46,6 +46,8 @@
 #include "elf.h"
 #include "rtc.h"
 #include "sha256.h"
+#include "crypto.h"
+#include "random.h"
 #ifndef HOST_TEST
 #include "mapping.h"
 #endif
@@ -729,7 +731,7 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
         {
             char from[SYSCALL_PATH_MAX]; char to[SYSCALL_PATH_MAX];
             if (copy_path((const char*)frame->x[0], from, from_user) != 0 || copy_path((const char*)frame->x[1], to, from_user) != 0) { result = (uint64_t)-14; break; }
-            int rc = fs_rename(from, to, ucwd(from_user));
+            int rc = fs_rename_replace(from, to, ucwd(from_user));
             result = (uint64_t)(int64_t)(rc == 0 ? 0 : rc == -1 ? -2 : rc == -2 ? -17 : rc == -6 ? -5 : -22);
             break;
         }
@@ -1781,6 +1783,24 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
             if (!ok) { result = (uint64_t)-14; break; }
             if (!frame->x[1] || frame->x[2] == 0 || frame->x[2] > 1048576ULL || !syscall_user_pointer_ok_write((void*)frame->x[1], frame->x[2])) { result = (uint64_t)-14; break; }
             result = (uint64_t)(int64_t)net_http_get_url(url, (int)(frame->x[3] & 1U), frame->x[4] ? ca : 0, (uint8_t*)frame->x[1], (uint32_t)frame->x[2]);
+            break;
+        }
+
+        case SYS_ED25519:
+        {
+            if (!from_user) { result = (uint64_t)-38; break; }
+            uint64_t op = frame->x[0];
+            if (op == 3) { result = (uint64_t)random_ready(); break; }
+            uint64_t a[4];
+            if (op > 2 || !syscall_user_pointer_ok((const void*)frame->x[1], sizeof(a))) { result = (uint64_t)-14; break; }
+            for (int i = 0; i < 4; ++i) a[i] = ((const uint64_t*)frame->x[1])[i];
+            if (!syscall_user_pointer_ok((const void*)a[0], 32) || a[2] > (16ULL << 20) ||
+                (op != 0 && a[2] && !syscall_user_pointer_ok((const void*)a[1], a[2])) ||
+                (op < 2 && !syscall_user_pointer_ok_write((void*)a[3], op == 0 ? 32 : 64)) ||
+                (op == 2 && !syscall_user_pointer_ok((const void*)a[3], 64))) { result = (uint64_t)-14; break; }
+            if (op == 0) { uint8_t pub[32]; int rc = ed25519_pubkey((const uint8_t*)a[0], pub); for (int i = 0; i < 32; ++i) ((uint8_t*)a[3])[i] = pub[i]; result = (uint64_t)(int64_t)rc; }
+            else if (op == 1) { uint8_t sg[64]; int rc = ed25519_sign((const uint8_t*)a[0], (const uint8_t*)a[1], a[2], sg); for (int i = 0; i < 64; ++i) ((uint8_t*)a[3])[i] = sg[i]; result = (uint64_t)(int64_t)rc; }
+            else result = (uint64_t)(int64_t)ed25519_verify((const uint8_t*)a[0], (const uint8_t*)a[1], a[2], (const uint8_t*)a[3]);
             break;
         }
 

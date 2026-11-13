@@ -19,6 +19,8 @@ for n, r, a in [("ssh_bind_new", vp, []), ("ssh_bind_options_set", ctypes.c_int,
                 ("ssh_channel_write_stderr", ctypes.c_int, [vp, ctypes.c_char_p, ctypes.c_uint]),
                 ("ssh_channel_send_eof", ctypes.c_int, [vp]), ("ssh_channel_request_send_exit_status", ctypes.c_int, [vp, ctypes.c_int]),
                 ("ssh_channel_close", ctypes.c_int, [vp]), ("ssh_channel_free", None, [vp]), ("ssh_disconnect", None, [vp]), ("ssh_free", None, [vp]),
+                ("ssh_message_auth_pubkey", vp, [vp]), ("ssh_message_auth_publickey_state", ctypes.c_int, [vp]),
+                ("ssh_message_auth_reply_pk_ok_simple", ctypes.c_int, [vp]), ("ssh_pki_export_pubkey_base64", ctypes.c_int, [vp, ctypes.POINTER(ctypes.c_char_p)]),
                 ("ssh_init", ctypes.c_int, []), ("ssh_get_error", ctypes.c_char_p, [vp])]:
     f = getattr(L, n); f.restype = r; f.argtypes = a
 L.ssh_init()
@@ -91,6 +93,16 @@ def scp_source(ch, recursive, target):
     if not os.path.exists(p): wr(ch, b"\x01no such file or directory\n"); return 1
     scp_src_one(ch, p, recursive); return 0
 
+def authorized_b64():
+    out = set()
+    try:
+        for ln in open(work + "/root/.ssh/authorized_keys"):
+            f = ln.split()
+            if len(f) >= 2 and f[0] == "ssh-ed25519": out.add(f[1])
+    except OSError: pass
+    return out
+os.makedirs(work + "/root/.ssh", exist_ok=True)
+
 def serve(sess, user_holder):
     chan = None; cmd = None; shell = False
     while True:
@@ -99,9 +111,16 @@ def serve(sess, user_holder):
         t = L.ssh_message_type(msg); st = L.ssh_message_subtype(msg)
         if t == 1:
             if st == 2 and L.ssh_message_auth_user(msg) == b"tester" and L.ssh_message_auth_password(msg) == b"s3cret":
-                user_holder.append("tester"); L.ssh_message_auth_reply_success(msg, 0)
+                user_holder.append("password"); L.ssh_message_auth_reply_success(msg, 0)
+            elif st == 4 and L.ssh_message_auth_user(msg) == b"tester":
+                k = L.ssh_message_auth_pubkey(msg); b64 = ctypes.c_char_p()
+                ok = bool(k) and L.ssh_pki_export_pubkey_base64(k, ctypes.byref(b64)) == 0 and b64.value.decode() in authorized_b64()
+                if ok and L.ssh_message_auth_publickey_state(msg) == 1:
+                    user_holder.append("publickey"); L.ssh_message_auth_reply_success(msg, 0)
+                elif ok: L.ssh_message_auth_reply_pk_ok_simple(msg)
+                else: L.ssh_set_auth_methods(sess, 6); L.ssh_message_reply_default(msg)
             else:
-                L.ssh_set_auth_methods(sess, 2); L.ssh_message_reply_default(msg)
+                L.ssh_set_auth_methods(sess, 6); L.ssh_message_reply_default(msg)
         elif t == 2:
             chan = L.ssh_message_channel_request_open_reply_accept(msg)
             if not chan: L.ssh_message_reply_default(msg)
@@ -130,6 +149,7 @@ def serve(sess, user_holder):
                     line += buf.raw; wr(chan, buf.raw)
         elif cmd.startswith("echo "): wr(chan, (cmd[5:] + "\n").encode())
         elif cmd == "whoami": wr(chan, b"tester\n")
+        elif cmd == "authinfo": wr(chan, ("auth=%s\n" % (user_holder[-1] if user_holder else "none")).encode())
         elif cmd.startswith("exit "): status = int(cmd[5:])
         elif cmd == "errtest": L.ssh_channel_write_stderr(chan, b"to stderr\n", 10); wr(chan, b"to stdout\n"); status = 3
         elif cmd == "big": wr(chan, b"".join(b"line %06d abcdefghijklmnopqrstuvwxyz\n" % i for i in range(8000)))
@@ -156,7 +176,7 @@ def listener(port):
         def run(s=s):
             try:
                 if L.ssh_handle_key_exchange(s) == 0:
-                    L.ssh_set_auth_methods(s, 2); serve(s, [])
+                    L.ssh_set_auth_methods(s, 6); serve(s, [])
             except Exception as e: print("session error", e, flush=True)
             L.ssh_disconnect(s); L.ssh_free(s)
         threading.Thread(target=run, daemon=True).start()

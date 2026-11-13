@@ -22,6 +22,8 @@
  * SOFTWARE.
  */
 
+#include "sshkey.h"
+#include "crypto.h"
 #include "ssh.h"
 #include "tls.h"
 #include "crypto.h"
@@ -487,20 +489,52 @@ int ssh_connect(int sock, const SshOpts* o)
         if (send_packet(b, w.n) != 0) return -1;
         if (next_msg(15000U) != 0 || g_payload[0] != MSG_SERVICE_ACC) { if (!g_err[0]) g_err = "server refused the ssh-userauth service"; return -1; }
     }
+    /* authentication: Ed25519 public key first (when an identity is given), then the password */
+    int authed = 0, key_tried = 0;
+    if (o->key_seed && o->key_pub)
     {
+        static uint8_t b[600]; static uint8_t sd[400];
+        uint8_t blob[51]; sshkey_blob(o->key_pub, blob);
+        W sw = {sd, 0, sizeof(sd), false};                          /* data to sign (RFC 4252 section 7) */
+        w_str(&sw, g_sid, 32); w_u8(&sw, MSG_AUTH_REQ); w_cstr(&sw, o->user); w_cstr(&sw, "ssh-connection"); w_cstr(&sw, "publickey");
+        w_u8(&sw, 1); w_cstr(&sw, "ssh-ed25519"); w_str(&sw, blob, 51);
+        uint8_t sig[64];
+        if (sw.bad || ed25519_sign(o->key_seed, sd, sw.n, sig) != 0) { g_err = "public-key signing failed"; return -1; }
+        W w = {b, 0, sizeof(b), false};
+        w_u8(&w, MSG_AUTH_REQ); w_cstr(&w, o->user); w_cstr(&w, "ssh-connection"); w_cstr(&w, "publickey"); w_u8(&w, 1); w_cstr(&w, "ssh-ed25519"); w_str(&w, blob, 51);
+        uint8_t sb[83]; W sg = {sb, 0, sizeof(sb), false}; w_cstr(&sg, "ssh-ed25519"); w_str(&sg, sig, 64); w_str(&w, sb, sg.n);
+        if (w.bad) { g_err = "user name too long"; return -1; }
+        if (send_packet(b, w.n) != 0) return -1;
+        key_tried = 1;
+        for (;;)
+        {
+            if (next_msg(20000U) != 0) { if (!g_err[0]) g_err = "timeout during authentication"; return -1; }
+            uint8_t t = g_payload[0];
+            if (t == MSG_AUTH_BANNER) { R rd = {g_payload, g_payload_len, 1, false}; uint32_t l; const uint8_t* s = r_str(&rd, &l); if (!rd.bad) for (uint32_t i = 0; i < l; ++i) { if (s[i] == '\n') uart_putc('\r'); if (s[i] != '\r') uart_putc((char)s[i]); } continue; }
+            if (t == MSG_AUTH_OK) { authed = 1; break; }
+            if (t == MSG_AUTH_FAIL) break;                                  /* key refused: fall back to the password */
+            g_err = "unexpected message during authentication"; return -1;
+        }
+    }
+    if (!authed)
+    {
+        char pwbuf[128]; const char* pw = o->password;
+        if (!pw && o->get_password) { if (o->get_password(pwbuf, sizeof(pwbuf)) < 0) { g_err = key_tried ? "Permission denied (publickey)" : "no password given"; return -1; } pw = pwbuf; }
+        if (!pw) { g_err = "Permission denied (publickey)"; return -1; }
         static uint8_t b[600]; W w = {b, 0, sizeof(b), false};
-        w_u8(&w, MSG_AUTH_REQ); w_cstr(&w, o->user); w_cstr(&w, "ssh-connection"); w_cstr(&w, "password"); w_u8(&w, 0); w_cstr(&w, o->password);
+        w_u8(&w, MSG_AUTH_REQ); w_cstr(&w, o->user); w_cstr(&w, "ssh-connection"); w_cstr(&w, "password"); w_u8(&w, 0); w_cstr(&w, pw);
+        for (int i = 0; i < (int)sizeof(pwbuf); ++i) pwbuf[i] = 0;
         if (w.bad) { g_err = "user name or password too long"; return -1; }
         if (send_packet(b, w.n) != 0) return -1;
-    }
-    for (;;)
-    {
-        if (next_msg(20000U) != 0) { if (!g_err[0]) g_err = "timeout during authentication"; return -1; }
-        uint8_t t = g_payload[0];
-        if (t == MSG_AUTH_BANNER) { R rd = {g_payload, g_payload_len, 1, false}; uint32_t l; const uint8_t* s = r_str(&rd, &l); if (!rd.bad) for (uint32_t i = 0; i < l; ++i) { if (s[i] == '\n') uart_putc('\r'); if (s[i] != '\r') uart_putc((char)s[i]); } continue; }
-        if (t == MSG_AUTH_OK) break;
-        if (t == MSG_AUTH_FAIL) { g_err = "Permission denied (password authentication failed)"; return -1; }
-        g_err = "unexpected message during authentication"; return -1;
+        for (;;)
+        {
+            if (next_msg(20000U) != 0) { if (!g_err[0]) g_err = "timeout during authentication"; return -1; }
+            uint8_t t = g_payload[0];
+            if (t == MSG_AUTH_BANNER) { R rd = {g_payload, g_payload_len, 1, false}; uint32_t l; const uint8_t* s = r_str(&rd, &l); if (!rd.bad) for (uint32_t i = 0; i < l; ++i) { if (s[i] == '\n') uart_putc('\r'); if (s[i] != '\r') uart_putc((char)s[i]); } continue; }
+            if (t == MSG_AUTH_OK) break;
+            if (t == MSG_AUTH_FAIL) { g_err = "Permission denied (password authentication failed)"; return -1; }
+            g_err = "unexpected message during authentication"; return -1;
+        }
     }
     return 0;
 }

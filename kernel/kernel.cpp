@@ -22,6 +22,7 @@
  * SOFTWARE.
  */
 
+#include "random.h"
 #include "uart.h"
 #include "memory.h"
 #include "fs.h"
@@ -104,6 +105,7 @@ extern "C" void kernel_main()
     smp_boot_secondaries();
     if (smp_online_cpu_count() > 1U) uart_puts("SMP: secondary CPUs released via PSCI.\r\n");
 
+    random_init();
     uart_puts("[6] Initializing storage / VirtIO block...\r\n");
     storage_init();
 
@@ -117,6 +119,7 @@ extern "C" void kernel_main()
 
     uart_puts("[8] Initializing filesystem...\r\n");
     fs_init();
+    random_seed_load();
 
     uart_puts("[9] Initializing VFS...\r\n");
     vfs_init();

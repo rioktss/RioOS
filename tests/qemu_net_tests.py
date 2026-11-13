@@ -310,21 +310,63 @@ def make_rpk(path, name, version, desc, files, depends=""):
     open(path, "wb").write(buf.getvalue())
     return hashlib.sha256(buf.getvalue()).hexdigest()
 
-def write_index(d, rows):
-    open(os.path.join(d, "INDEX"), "w").write("".join("%s %s %s %s | %s\n" % r for r in rows))
+def _ed_key():
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    return Ed25519PrivateKey.generate()
+
+def _pub_hex(k):
+    from cryptography.hazmat.primitives import serialization as S
+    return k.public_key().public_bytes(S.Encoding.Raw, S.PublicFormat.Raw).hex()
+
+def index_text(rows, serial):
+    return "# serial %d\n" % serial + "".join("%s %s %s %s | %s\n" % r for r in rows)
+
+def write_index(d, rows, key=None, serial=1000, sign=True):
+    """repository INDEX (+ INDEX.sig, hex Ed25519 signature) as 'pkg mkindex -s' writes it"""
+    data = index_text(rows, serial).encode()
+    open(os.path.join(d, "INDEX"), "wb").write(data)
+    if sign and key is not None: open(os.path.join(d, "INDEX.sig"), "w").write(key.sign(data).hex() + "\n")
 
 def s_pkg(pki, www, sshw, have_ssh):
+    K = _ed_key(); K2 = _ed_key()
     A = os.path.join(www, "repoA"); B = os.path.join(www, "repoB"); E = os.path.join(www, "repoEvil")
     for d in (A, B, E): os.makedirs(d, exist_ok=True)
     h1 = make_rpk(A + "/hello-1.0.rpk", "hello", "1.0", "hello demo", {"usr/share/hello/msg.txt": b"hello 1.0 from net\n"}, "libgreet>=1.0")
     g1 = make_rpk(A + "/libgreet-1.0.rpk", "libgreet", "1.0", "greeting library", {"usr/share/libgreet/g.txt": b"greet\n"})
-    write_index(A, [("hello", "1.0", "hello-1.0.rpk", h1, "hello demo"), ("libgreet", "1.0", "libgreet-1.0.rpk", g1, "greeting library")])
+    write_index(A, [("hello", "1.0", "hello-1.0.rpk", h1, "hello demo"), ("libgreet", "1.0", "libgreet-1.0.rpk", g1, "greeting library")], K)
     h2 = make_rpk(B + "/hello-1.1.rpk", "hello", "1.1", "hello demo", {"usr/share/hello/msg.txt": b"hello 1.1 from net\n"}, "libgreet>=1.0")
-    write_index(B, [("hello", "1.1", "hello-1.1.rpk", h2, "hello demo")])
+    write_index(B, [("hello", "1.1", "hello-1.1.rpk", h2, "hello demo")], K, serial=1001)
     make_rpk(E + "/evil-1.0.rpk", "evil", "1.0", "tampered", {"usr/share/evil/x.txt": b"pwn\n"})
-    write_index(E, [("evil", "1.0", "evil-1.0.rpk", "0" * 63 + "1", "tampered")])
+    write_index(E, [("evil", "1.0", "evil-1.0.rpk", "0" * 63 + "1", "tampered")], K)
     open(E + "/bad-1.0.rpk", "wb").write(b"junk")
-    guest = [("su", 2), ("123", 2), ("dhcp", 4), ("pkg remote list", 2), ("pkg remote add ftp://x/y", 2), ("pkg remote add http://10.0.2.2:8099/repoA", 2), ("pkg remote list", 2),
+    # signature failure modes: unsigned index, index signed by an untrusted key, index changed after signing
+    U = os.path.join(www, "repoUnsigned"); W = os.path.join(www, "repoWrongKey"); T = os.path.join(www, "repoTamper")
+    for d in (U, W, T): os.makedirs(d, exist_ok=True)
+    rows_u = [("hello", "9.9", "hello-1.0.rpk", h1, "hello demo")]
+    import shutil
+    for d in (U, W, T): shutil.copy(A + "/hello-1.0.rpk", d + "/hello-1.0.rpk")
+    write_index(U, rows_u, K, sign=False); write_index(W, rows_u, K2)
+    write_index(T, rows_u, K); open(T + "/INDEX", "a").write("hello 9.9 hello-1.0.rpk %s | injected\n" % h1)
+    # rollback: a server that first serves a signed index with serial 300, afterwards a validly signed but OLDER one (serial 100)
+    rollsrv = os.path.join(www, "..", "rollsrv.py")
+    idx_new = index_text([("hello", "1.0", "hello-1.0.rpk", h1, "hello demo")], 300).encode(); idx_old = index_text([("hello", "1.0", "hello-1.0.rpk", h1, "hello demo")], 100).encode()
+    open(os.path.join(www, "..", "roll_new.idx"), "wb").write(idx_new); open(os.path.join(www, "..", "roll_new.sig"), "w").write(K.sign(idx_new).hex() + "\n")
+    open(os.path.join(www, "..", "roll_old.idx"), "wb").write(idx_old); open(os.path.join(www, "..", "roll_old.sig"), "w").write(K.sign(idx_old).hex() + "\n")
+    open(rollsrv, "w").write("""import http.server, os, sys
+base = os.path.dirname(os.path.abspath(__file__)); n = [0]
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        if self.path.endswith("/INDEX"): n[0] += 1
+        which = "new" if n[0] <= 1 else "old"
+        if self.path.endswith("/INDEX"): body = open(os.path.join(base, "roll_%s.idx" % which), "rb").read()
+        elif self.path.endswith("/INDEX.sig"): body = open(os.path.join(base, "roll_%s.sig" % which), "rb").read()
+        else: self.send_response(404); self.end_headers(); return
+        self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+http.server.ThreadingHTTPServer(("10.0.2.2", 8098), H).serve_forever()
+""")
+    start([sys.executable, rollsrv])
+    guest = [("su", 2), ("123", 2), ("dhcp", 4), ("pkg trust list", 2), ("pkg trust add %s testkey" % _pub_hex(K), 2), ("pkg trust list", 2), ("pkg remote list", 2), ("pkg remote add ftp://x/y", 2), ("pkg remote add http://10.0.2.2:8099/repoA", 2), ("pkg remote list", 2),
              ("pkg update", 6), ("pkg search greet", 2), ("pkg install nosuchpkg", 2), ("pkg install hello", 15), ("cat /usr/share/hello/msg.txt", 2), ("pkg list", 2), ("pkg verify", 3),
              ("pkg install hello", 2),
              ("pkg remote add http://10.0.2.2:8099/repoB", 2), ("pkg update", 6), ("pkg upgrade", 12), ("cat /usr/share/hello/msg.txt", 2),
@@ -338,7 +380,18 @@ def s_pkg(pki, www, sshw, have_ssh):
              ("pkg remove hello", 3), ("pkg remove libgreet", 3),
              ("pkg remote remove https://10.0.2.2:18441/repoA", 2), ("pkg remote add https://10.0.2.2:18449/repoA", 2), ("pkg update", 8),
              ("pkg remote add https://10.0.2.2:18449/repoA -k", 2), ("pkg remote list", 2), ("pkg update", 8), ("pkg install libgreet", 10), ("pkg list", 2),
-             ("mkdir idx", 1), ("cp /var/cache/pkg/libgreet-1.0.rpk idx/", 2), ("pkg mkindex idx", 3), ("cat idx/INDEX", 2), ("echo pkg-done", 2)]
+             ("pkg remote remove https://10.0.2.2:18449/repoA", 2), ("pkg remote add http://10.0.2.2:8099/repoUnsigned", 2), ("pkg update", 6),
+             ("pkg remote remove http://10.0.2.2:8099/repoUnsigned", 2), ("pkg remote add http://10.0.2.2:8099/repoUnsigned --unsigned", 2), ("pkg remote list", 2), ("pkg update", 6),
+             ("pkg remote remove http://10.0.2.2:8099/repoUnsigned", 2), ("pkg remote add http://10.0.2.2:8099/repoWrongKey", 2), ("pkg update", 6),
+             ("pkg remote remove http://10.0.2.2:8099/repoWrongKey", 2), ("pkg remote add http://10.0.2.2:8099/repoTamper", 2), ("pkg update", 6),
+             ("pkg remote remove http://10.0.2.2:8099/repoTamper", 2), ("pkg remote add http://10.0.2.2:8098/r", 2), ("pkg update", 6), ("pkg update", 6),
+             ("pkg remote remove http://10.0.2.2:8098/r", 2),
+             ("rng", 2), ("pkg keygen k1", 4), ("pkg keygen k1", 3), ("ls /etc/pkg/keys", 2),
+             ("mkdir idx", 1), ("cp /var/cache/pkg/libgreet-1.0.rpk idx/", 2), ("pkg mkindex idx", 3), ("cat idx/INDEX", 2),
+             ("pkg mkindex -s k1 idx", 4), ("ls idx", 2), ("pkg checksig idx/INDEX", 3), ("pkg trust add /etc/pkg/keys/k1.pub", 3), ("pkg checksig idx/INDEX", 3), ("pkg trust list", 2),
+             ("cp idx/libgreet-1.0.rpk lg.rpk", 2), ("pkg checksig lg.rpk", 3), ("pkg sign k1 lg.rpk", 4), ("pkg checksig lg.rpk", 3), ("pkg remove libgreet", 3), ("pkg install lg.rpk", 5), ("pkg remove libgreet", 3),
+             ("echo X >> lg.rpk", 2), ("pkg checksig lg.rpk", 3), ("pkg install lg.rpk", 5), ("pkg list", 2),
+             ("pkg trust remove k1", 2), ("pkg trust remove testkey", 2), ("pkg trust list", 2), ("echo pkg-done", 2)]
     log = run(guest)
     def a(c, n=1): return after(log, c) if n == 1 else after(log, c)
     check("pkg remote list (empty)", "no remotes" in a("pkg remote list"), a("pkg remote list"))
@@ -368,7 +421,26 @@ def s_pkg(pki, www, sshw, have_ssh):
     check("pkg remote add -k marks the remote unverified", "NOT verified" in a("pkg remote list") or "NOT verified" in log, "")
     check("pkg install over -k HTTPS (self-signed server)", "installed libgreet 1.0" in a("pkg install libgreet"), a("pkg install libgreet"))
     sha_g = hashlib.sha256(open(A + "/libgreet-1.0.rpk", "rb").read()).hexdigest()
-    check("pkg mkindex writes sha256 + metadata", ("libgreet 1.0 libgreet-1.0.rpk %s" % sha_g) in a("cat idx/INDEX"), a("cat idx/INDEX"))
+    check("pkg mkindex writes sha256 + metadata", ("libgreet 1.0 libgreet-1.0.rpk %s" % sha_g) in a("cat idx/INDEX") and "# serial" in a("cat idx/INDEX"), a("cat idx/INDEX"))
+    def seg(cmd, nth=0):
+        parts = log.split(">>> " + cmd + "\n")
+        return parts[nth + 1].split("\n>>> ")[0].replace("\r", "") if len(parts) > nth + 1 else ""
+    check("pkg trust: empty store at first", "no trusted keys" in seg("pkg trust list", 0), seg("pkg trust list", 0))
+    check("pkg trust add / list", "trusted key 'testkey'" in a("pkg trust add %s testkey" % _pub_hex(K)) and "testkey" in seg("pkg trust list", 1), seg("pkg trust list", 1))
+    check("pkg update accepts a signed index and names the key", any("index signed by key" in x.split("\n>>> ")[0] for x in log.split(">>> pkg update\n")), "")
+    check("pkg refuses an unsigned index", "INDEX is not signed" in seg("pkg update", 99) or any("INDEX is not signed" in x.split("\n>>> ")[0] for x in log.split(">>> pkg update\n")), "")
+    check("pkg --unsigned remote is accepted with a warning", any("unsigned index accepted" in x.split("\n>>> ")[0] for x in log.split(">>> pkg update\n")), "")
+    check("pkg refuses an index signed by an unknown key", any("unknown or invalid key" in x.split("\n>>> ")[0] for x in log.split(">>> pkg update\n")), "")
+    check("pkg refuses an index changed after signing (tampered)", sum("unknown or invalid key" in x.split("\n>>> ")[0] for x in log.split(">>> pkg update\n")) >= 2, "")
+    check("pkg refuses a rollback to an older signed index", any("ROLLBACK refused" in x.split("\n>>> ")[0] for x in log.split(">>> pkg update\n")), "")
+    check("rng reports a ready entropy estimate", "(ready)" in a("rng"), a("rng"))
+    check("pkg keygen creates the key pair", "key 'k1' created" in a("pkg keygen k1") and "k1.sec" in a("ls /etc/pkg/keys") and "k1.pub" in a("ls /etc/pkg/keys"), a("pkg keygen k1"))
+    check("pkg keygen refuses to overwrite a key", "already exists" in seg("pkg keygen k1", 1), seg("pkg keygen k1", 1))
+    check("pkg mkindex -s signs the index", "signed:" in a("pkg mkindex -s k1 idx") and "INDEX.sig" in a("ls idx"), a("pkg mkindex -s k1 idx"))
+    check("pkg checksig: unknown key -> rejected, after trust -> ok", "not valid for any trusted key" in seg("pkg checksig idx/INDEX", 0) and "signed by key" in seg("pkg checksig idx/INDEX", 1), seg("pkg checksig idx/INDEX", 0) + seg("pkg checksig idx/INDEX", 1))
+    check("pkg: unsigned local package is installed with a warning", "unsigned" in seg("pkg checksig lg.rpk", 0), "")
+    check("pkg sign + install of a signed package", "signed by key" in a("pkg install lg.rpk") and "installed libgreet" in a("pkg install lg.rpk"), a("pkg install lg.rpk"))
+    check("pkg refuses a package modified after signing", "installation refused" in seg("pkg install lg.rpk", 1) and "not valid for any trusted key" in seg("pkg checksig lg.rpk", 2), seg("pkg install lg.rpk", 1))
     check("pkg session finished", "pkg-done" in a("echo pkg-done"), "")
 
 def s_tls(pki, www, sshw, have_ssh):
@@ -415,6 +487,16 @@ def s_ssh(pki, www, sshw, have_ssh):
             ("scp -P 2201 %s:missing.txt m.txt" % H, 5), pw,
             ("scp -P 2201 %s:big.bin big.bin" % H, 5), ("s3cret", 25), ("ls -l big.bin", 2),
             ("ssh -p 2201 -o StrictHostKeyChecking=yes %s echo strict" % H, 5), pw,
+            ("ssh-keygen", 3), ("ls -l /root/.ssh", 2), ("ssh-keygen -y -f /root/.ssh/id_ed25519", 2), ("ssh-keygen -l", 2), ("ssh-keygen", 2),
+            ("ssh -p 2201 %s authinfo" % H, 5), pw,
+            ("scp -P 2201 /root/.ssh/id_ed25519.pub %s:.ssh/authorized_keys" % H, 5), pw,
+            ("ssh -p 2201 %s authinfo" % H, 5), ("echo pk-rc=$?", 2),
+            ("ssh -p 2202 %s authinfo" % H, 5),
+            ("cp /root/.ssh/id_ed25519.pub /root/p2", 1), ("chmod 600 /root/p2", 1), ("ssh -p 2201 -i /root/p2 %s authinfo" % H, 4),
+            ("cp /root/.ssh/id_ed25519 /root/k2", 1), ("ssh-keygen -y -f /root/k2", 2), ("chmod 644 /root/k2", 1), ("ssh -p 2201 -i /root/k2 %s authinfo" % H, 4),
+            ("ssh -p 2201 -i /root/nokey %s authinfo" % H, 4),
+            ("rm /root/.ssh/id_ed25519 /root/.ssh/id_ed25519.pub", 1), ("ssh-keygen -f /root/.ssh/id_ed25519 -C other@test", 3),
+            ("ssh -p 2201 %s authinfo" % H, 5), pw, ("echo wrongkey-done", 2),
             ("ssh -R 10.0.2.2", 3), ("ssh -p 2201 -t %s" % H, 5), pw, ("hi there", 3), ("exit", 3), ("echo ssh-done", 2)]
     log = run(cmds)
     a = lambda c: after(log, c)
@@ -433,6 +515,23 @@ def s_ssh(pki, www, sshw, have_ssh):
     check("scp missing remote file reports an error", "no such file" in a("s3cret") .lower() or "no such file" in log.lower(), "")
     big = a("ls -l big.bin"); check("scp 700 KB download size", "700000" in big, big)
     check("ssh StrictHostKeyChecking=yes with a known host works", "strict" in a("ssh -p 2201 -o StrictHostKeyChecking=yes %s echo strict" % H), a("ssh -p 2201 -o StrictHostKeyChecking=yes %s echo strict" % H))
+    ak = lambda c, n: nth(c, n)
+    kg = a("ssh-keygen")
+    check("ssh-keygen creates an Ed25519 key pair", "Generated Ed25519" in kg and "SHA256:" in kg, kg)
+    ls = a("ls -l /root/.ssh")
+    check("ssh-keygen private key mode 0600, public 0644", "id_ed25519" in ls and "rw-------" in ls and "rw-r--r--" in ls, ls)
+    pub = a("ssh-keygen -y -f /root/.ssh/id_ed25519")
+    check("ssh-keygen -y prints ssh-ed25519 public key", "\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI" in pub.replace("\r",""), pub)
+    check("ssh-keygen -l prints fingerprint", "256 SHA256:" in a("ssh-keygen -l") and "ED25519" in a("ssh-keygen -l"), a("ssh-keygen -l"))
+    check("ssh-keygen refuses to overwrite", "already exists" in nth("ssh-keygen", 2), nth("ssh-keygen", 2))
+    ai = "ssh -p 2201 %s authinfo" % H
+    check("before install: password login (auth=password)", "password:" in nth(ai, 1) and "auth=password" in log, nth(ai, 1))
+    check("after authorized_keys install: key login without password (auth=publickey)", "auth=publickey" in nth(ai, 2) and "password:" not in nth(ai, 2), nth(ai, 2))
+    check("publickey also works against other libssh listener", "auth=" in a("ssh -p 2202 %s authinfo" % H), a("ssh -p 2202 %s authinfo" % H))
+    check("-i with a public key file is rejected", "not a valid" in a("ssh -p 2201 -i /root/p2 %s authinfo" % H).lower() or "invalid" in a("ssh -p 2201 -i /root/p2 %s authinfo" % H).lower(), a("ssh -p 2201 -i /root/p2 %s authinfo" % H))
+    check("-i key with open permissions is refused", "UNPROTECTED PRIVATE KEY" in a("ssh -p 2201 -i /root/k2 %s authinfo" % H), a("ssh -p 2201 -i /root/k2 %s authinfo" % H))
+    check("-i missing file reports error", "not found" in a("ssh -p 2201 -i /root/nokey %s authinfo" % H), a("ssh -p 2201 -i /root/nokey %s authinfo" % H))
+    check("unauthorized key falls back to password", "password:" in nth(ai, 3) and log.count("auth=password") >= 2, nth(ai, 3))
     check("ssh -R forgets a host", "10.0.2.2" in a("ssh -R 10.0.2.2"), a("ssh -R 10.0.2.2"))
     check("ssh interactive shell", "hi there" in a("ssh -p 2201 -t %s" % H) or "hi there" in a("hi there"), a("ssh -p 2201 -t %s" % H))
     check("ssh session finished", "ssh-done" in a("echo ssh-done"), "")

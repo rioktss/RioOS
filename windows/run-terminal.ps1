@@ -50,6 +50,7 @@ Write-Host "RioOS terminal window: QEMU ($Display). Type in the window; scroll w
     -device ramfb `
     -drive "if=none,format=raw,file=$Disk,id=vd0" `
     -device "virtio-blk-device,drive=vd0" `
+    -device "virtio-rng-device" `
     -netdev "user,id=n1,ipv4=on,ipv6=off" `
     -device "virtio-net-device,netdev=n1" `
     -device "virtio-keyboard-device" `

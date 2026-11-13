@@ -28,9 +28,9 @@
 #include "types.h"
 
 /* SSH-2 client (RFC 4251-4254): curve25519-sha256 key exchange, host keys ssh-ed25519 / rsa-sha2-256 / rsa-sha2-512 /
-   ecdsa-sha2-nistp256, aes128-ctr + hmac-sha2-256, password authentication, one "session" channel (exec, shell or
-   scp). Host keys are remembered in ~/.ssh_known_hosts (/etc/ssh_known_hosts for root). Not supported: public-key
-   authentication, port forwarding, compression, rekeying (sessions that transfer more than ~1 GiB). */
+   ecdsa-sha2-nistp256, aes128-ctr + hmac-sha2-256, password and Ed25519 public-key authentication, one "session" channel (exec, shell or
+   scp). Host keys are remembered in ~/.ssh_known_hosts (/etc/ssh_known_hosts for root). Not supported: RSA/ECDSA client keys, encrypted
+   private keys, agent forwarding, port forwarding, compression, rekeying (sessions that transfer more than ~1 GiB). */
 struct SshOpts
 {
     const char* host;      /* name used for the known_hosts entry */
@@ -38,6 +38,9 @@ struct SshOpts
     const char* user;
     const char* password;
     int strict;            /* 0 accept-new (default), 1 yes (refuse unknown hosts), 2 no (accept changed keys) */
+    const uint8_t* key_seed;   /* optional Ed25519 identity (32-byte seed + public key): tried first (public-key authentication) */
+    const uint8_t* key_pub;
+    int (*get_password)(char* out, int cap);   /* optional: asked for a password only when the key is refused or absent (returns <0 to give up) */
 };
 
 int ssh_connect(int sock, const SshOpts* o);          /* transport + host key check + authentication; 0 = ok */

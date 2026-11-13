@@ -73,6 +73,10 @@ int process_set_umask(int, uint32_t) { return 0; }
 void* mmu_user_space_pointer(int, uint64_t) { return 0; }
 int process_uid(int) { return 0; }
 int fs_set_owner_path(const char*, int, uint32_t, uint32_t) { return 0; }
+int ed25519_pubkey(const uint8_t*, uint8_t*) { return -1; }
+int ed25519_sign(const uint8_t*, const uint8_t*, uint64_t, uint8_t*) { return -1; }
+int ed25519_verify(const uint8_t*, const uint8_t*, uint64_t, const uint8_t*) { return -1; }
+int random_ready() { return 1; }
 void tls_random(uint8_t* o, uint32_t n) { for (uint32_t i = 0; i < n; ++i) o[i] = (uint8_t)(i * 31 + 7); }
 int fs_set_mtime_path(const char*, int, uint64_t) { return 0; }
 #include "tty.h"
@@ -115,6 +119,7 @@ int fs_get_type(int id) { return id == 1 ? FS_FILE : -1; }
 int fs_mkdir(const char*, int) { return -1; }
 int fs_rm(const char*, int) { return -1; }
 int fs_rename(const char*, const char*, int) { return -1; }
+int fs_rename_replace(const char*, const char*, int) { return -1; }
 int fs_symlink(const char*, const char*, int) { return -1; }
 int fs_readlink(const char*, int, char*, int) { return -1; }
 int fs_link_hard(const char*, const char*, int) { return -1; }

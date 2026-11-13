@@ -46,6 +46,7 @@ static long rret(uint64_t v) { long r = (long)v; if (r < 0 && r > -4096) { errno
 #define RS_SETITIMER 77
 #define RS_HTTP_GET 78
 #define RS_SHA256 79
+#define RS_ED25519 112
 extern int __rio_sa_restart;
 void __rio_sigreturn(void);
 __asm__(".text\n.global __rio_sigreturn\n__rio_sigreturn:\n mov x8, #67\n svc #0\n 1: b 1b\n");
@@ -582,3 +583,7 @@ long http_get(const char* url, void* buf, size_t cap, int insecure, const char* 
     return rret(user_syscall5(RS_HTTP_GET, (uint64_t)url, (uint64_t)buf, cap, insecure ? 1U : 0U, (uint64_t)cacert));
 }
 void sha256_buf(const void* data, size_t len, unsigned char out[32]) { (void)user_syscall3(RS_SHA256, (uint64_t)data, len, (uint64_t)out); }
+int ed25519_pubkey(const unsigned char seed[32], unsigned char pub[32]) { uint64_t a[4] = {(uint64_t)seed, 0, 0, (uint64_t)pub}; return (int)user_syscall2(RS_ED25519, 0, (uint64_t)a); }
+int ed25519_sign(const unsigned char seed[32], const void* msg, size_t len, unsigned char sig[64]) { uint64_t a[4] = {(uint64_t)seed, (uint64_t)msg, len, (uint64_t)sig}; return (int)user_syscall2(RS_ED25519, 1, (uint64_t)a); }
+int ed25519_verify(const unsigned char pub[32], const void* msg, size_t len, const unsigned char sig[64]) { uint64_t a[4] = {(uint64_t)pub, (uint64_t)msg, len, (uint64_t)sig}; return (int)user_syscall2(RS_ED25519, 2, (uint64_t)a); }
+int rng_ready(void) { return (int)user_syscall2(RS_ED25519, 3, 0); }

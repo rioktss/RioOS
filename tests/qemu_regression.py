@@ -331,6 +331,14 @@ log = run(C("su", "123", "echo 'f(){ return 3; }' > /tmp/s1.sh", "echo 'f a; ech
             "echo hello | read W", "echo W=$W", "usb selftest"), wait=2)
 check("shell-fixes", log, "rc=3", "rc2=1", "W=hello", "usb: no xHCI controller")
 
+print("== session 16: crash-safe fs, RNG, ssh keys")
+shutil.copy(os.path.join(ROOT, "storage", "disk.img"), os.path.join(TMP, "disk.img"))
+log = run(C("su", "123", "rng", "rng seed", "mkdir /tmp/cr", "echo a > /tmp/cr/a", "echo b > /tmp/cr/b", "mv /tmp/cr/a /tmp/cr/c", "rm -r /tmp/cr", "fsck"), wait=2,
+          extra=["-device", "virtio-rng-device"])
+check("rng-fs-boot1", log, "SHA-256 hash DRBG", "(ready)", "virtio-rng       : yes", "none yet", "seed file refreshed", "fsck: clean")
+log = run(C("su", "123", "rng", "ssh-keygen -f /tmp/k -C t@x", "ls -l /tmp/k", "ssh-keygen -l -f /tmp/k", "ssh-keygen -f /tmp/k", "fsck"), wait=2, extra=["-device", "virtio-rng-device"])
+check("rng-seed-persists-and-keygen", log, "loaded from /var/lib/random.seed", "Generated Ed25519 key pair", "rw-------", "256 SHA256:", "already exists", "fsck: clean")
+
 # real-network tests (TLS verification, ssh/scp, httpd, ftpd, pkg over HTTP(S)); skipped when root / TAP / python-cryptography are missing
 if os.environ.get("RIOOS_SKIP_NETTESTS") != "1":
     r = subprocess.run([sys.executable, os.path.join(ROOT, "tests", "qemu_net_tests.py"), QEMU], capture_output=True, text=True)

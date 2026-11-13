@@ -51,6 +51,8 @@ int rsa_verify_pss(const uint8_t* n, uint32_t nlen, const uint8_t* e, uint32_t e
 int ecdsa_verify(int curve, const uint8_t* pub, uint32_t publen, const uint8_t* digest, uint32_t dlen, const uint8_t* sig, uint32_t slen);
 
 /* Ed25519 (RFC 8032) verification, 0 = valid */
+int ed25519_pubkey(const uint8_t seed[32], uint8_t pub[32]);                          /* 0 = ok */
+int ed25519_sign(const uint8_t seed[32], const uint8_t* msg, uint64_t mlen, uint8_t sig[64]);
 int ed25519_verify(const uint8_t pub[32], const uint8_t* msg, uint64_t mlen, const uint8_t sig[64]);
 
 #endif

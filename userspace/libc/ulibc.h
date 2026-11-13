@@ -251,6 +251,11 @@ int setitimer(int which, const struct itimerval* nv, struct itimerval* old);
 int getitimer(int which, struct itimerval* cur);
 long http_get(const char* url, void* buf, size_t cap, int insecure, const char* cacert);   /* HTTP(S) GET, TLS verified unless insecure; body length or -1 */
 void sha256_buf(const void* data, size_t len, unsigned char out[32]);
+/* Ed25519 (kernel crypto): 0 = ok / valid signature */
+int ed25519_pubkey(const unsigned char seed[32], unsigned char pub[32]);
+int ed25519_sign(const unsigned char seed[32], const void* msg, size_t len, unsigned char sig[64]);
+int ed25519_verify(const unsigned char pub[32], const void* msg, size_t len, const unsigned char sig[64]);
+int rng_ready(void);                 /* kernel entropy estimate >= 128 bits */
 int nanosleep(const struct timespec* req, struct timespec* rem);
 int gettimeofday(struct timeval* tv, void* tz);
 int clock_gettime(int clk, struct timespec* ts);

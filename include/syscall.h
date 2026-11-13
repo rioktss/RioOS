@@ -135,6 +135,7 @@ enum SyscallNumber
     SYS_GETCWD     = 108, /* getcwd(buf, cap) -> length */
     SYS_UMASK      = 109, /* umask(mask | ~0 queries) -> old mask */
     SYS_SYSINFO    = 110, /* sysinfo(uint64_t out[4]: total_pages, free_pages, online_cpus, uptime_ms) */
+    SYS_ED25519    = 112, /* ed25519(op, uint64_t a[4]): op 0 pubkey(seed,-,-,pub) 1 sign(seed,msg,len,sig) 2 verify(pub,msg,len,sig) 3 rng-ready */
     SYS_FDATTR     = 111, /* fdattr(fd, op 0 fchmod(mode) / 1 fchown(uid,gid) / 2 futimens(mtime_seconds)) on regular files */
     SYS_TTY        = 97,  /* tty(op 0 tcgetattr / 1 tcsetattr(action in x2) / 2 winsize, ptr) */
     SYS_HTTP_GET   = 78,  /* http_get(url, buf, cap, flags | cacert<<8?) see syscall.cpp: flags bit0 = insecure; x4 = cacert path or 0 -> body length or -errno */

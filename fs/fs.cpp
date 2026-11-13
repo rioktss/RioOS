@@ -204,6 +204,7 @@ struct FsCtx
 {
     FsNode nodes[FS_NODE_CAP];
     uint8_t bitmap[FS_MAX_BITMAP_BYTES];
+    uint8_t bitmap_disk[FS_MAX_BITMAP_BYTES];   /* what the on-disk bitmap holds (or will, once the running transaction commits) */
     uint8_t legacy_metadata[FS_NODE_CAP];
     uint64_t disk_sectors;
     int root_id, mounted, node_count;
@@ -219,6 +220,7 @@ static FsCtx ctxs[FS_MAX_CTX];
 static FsCtx* cur = &ctxs[0];
 #define nodes           (cur->nodes)
 #define bitmap          (cur->bitmap)
+#define bitmap_disk     (cur->bitmap_disk)
 #define legacy_metadata (cur->legacy_metadata)
 #define disk_sectors    (cur->disk_sectors)
 #define root_id         (cur->root_id)
@@ -279,6 +281,7 @@ struct __attribute__((packed)) JnlHeader
     uint32_t checksum;
     uint64_t target[JNL_MAX];
 };
+static int g_rename_replace = 0;   /* set only while rename(2) semantics are requested (fs_rename_replace) */
 static int tx_depth = 0;
 static int tx_count = 0;
 static int jnl_crash_armed = 0;
@@ -466,13 +469,19 @@ static void bitmap_set(uint64_t sector, int value)
         bitmap[sector >> 3] &= (uint8_t)~mask;
 }
 
-static int write_bitmap()
+/* Only bitmap sectors that changed are written: a typical operation then stages one or two sectors in the journal instead of eight. */
+static int write_bitmap(int force_all = 0)
 {
     for (uint64_t s = 0; s < FS_BITMAP_SECTORS; ++s)
     {
         const uint8_t* src = bitmap + s * FS_SECTOR_SIZE;
+        uint8_t* shadow = bitmap_disk + s * FS_SECTOR_SIZE;
+        int same = !force_all;
+        for (uint64_t i = 0; same && i < FS_SECTOR_SIZE; ++i) if (src[i] != shadow[i]) same = 0;
+        if (same) continue;
         if (meta_write(FS_BITMAP_START + s, src) != 0)
             return -1;
+        for (uint64_t i = 0; i < FS_SECTOR_SIZE; ++i) shadow[i] = src[i];
     }
     return meta_flush();
 }
@@ -783,6 +792,7 @@ static int format_fs()
     jnl_enabled = !cur->no_journal && disk_sectors >= FS_DATA_START + 256ULL;
     fs_say("FS: formatting persistent filesystem...\r\n");
     clear_bytes(bitmap, sizeof(bitmap));
+    clear_bytes(bitmap_disk, sizeof(bitmap_disk));
     for (int i = 0; i < FS_MAX_NODES; ++i)
         clear_bytes(&nodes[i], sizeof(nodes[i]));
     reserve_metadata();
@@ -900,6 +910,145 @@ static int create_node(int type, const char* name, int parent)
         return -4;
     }
     return id;
+}
+
+
+/* ---- fsck: consistency check and repair of one mounted filesystem -----------------------------------------------------------
+   The journal keeps metadata updates atomic, so inconsistencies can only come from media errors or bugs. check (repair == 0) only
+   counts problems; repair fixes them inside one journal transaction each: unreachable entries move to /lost+found, bad names are
+   replaced by "#<inode>", duplicate names get a "~<inode>" suffix, entries with impossible extents (or extents that overlap an
+   earlier file) are dropped, and the allocation bitmap is rebuilt from the inode extents. */
+static void fsck_set_name(int i, const char* nm) { str_copy(nodes[i].name, nm, FS_NAME_SIZE); }
+static void fsck_id_name(int i, const char* prefix, const char* base, char* out)
+{
+    char digits[12]; int n = 0; int v = i; do { digits[n++] = (char)('0' + v % 10); v /= 10; } while (v);
+    int p = 0;
+    for (const char* q = base; *q && p < FS_NAME_SIZE - 14; ++q) out[p++] = *q;
+    for (const char* q = prefix; *q; ++q) out[p++] = *q;
+    while (n) out[p++] = digits[--n];
+    out[p] = 0;
+}
+static int fsck_lost_found(int repair)
+{
+    int lf = find_child(0, "lost+found");
+    if (lf >= 0) return nodes[lf].type == FS_DIR ? lf : -1;
+    if (!repair) return -1;
+    int id = alloc_node();
+    if (id < 0) return -1;
+    clear_bytes(&nodes[id], sizeof(nodes[id]));
+    nodes[id].used = 1; nodes[id].type = FS_DIR; nodes[id].parent = 0; nodes[id].mode = 0700U; nodes[id].uid = 0; nodes[id].gid = 0;
+    nodes[id].mtime = rtc_now(); fsck_set_name(id, "lost+found");
+    if (save_inode(id) != 0) { nodes[id].used = 0; return -1; }
+    return id;
+}
+static void fsck_drop(int i) { clear_bytes(&nodes[i], sizeof(nodes[i])); (void)save_inode(i); }
+
+static int fsck_run(int repair, FsckInfo* inf)
+{
+    FsckInfo local; if (!inf) { clear_bytes(&local, sizeof(local)); inf = &local; }
+    if (repair && fs_ro) return -30;
+    FsTx fs_tx_scope;
+    #define FSCK_ERR(counter) do { ++inf->problems; ++inf->counter; } while (0)
+    
+    if (!nodes[0].used || nodes[0].type != FS_DIR || nodes[0].parent != -1 || !str_equal(nodes[0].name, "/"))
+    {
+        ++inf->problems;
+        if (repair)
+        {
+            clear_bytes(&nodes[0], sizeof(nodes[0]));
+            nodes[0].used = 1; nodes[0].type = FS_DIR; nodes[0].parent = -1; nodes[0].mode = 0755U; nodes[0].mtime = rtc_now();
+            str_copy(nodes[0].name, "/", FS_NAME_SIZE);
+            (void)save_inode(0); ++inf->fixed;
+        }
+    }
+    /* pass 1: per-inode sanity (type, extent, size, mode, name) */
+    for (int i = 1; i < FS_MAX_NODES; ++i)
+    {
+        if (!nodes[i].used) continue;
+        int drop = 0, dirty = 0;
+        if (nodes[i].type != FS_FILE && nodes[i].type != FS_DIR && nodes[i].type != FS_SYMLINK) { FSCK_ERR(bad_extents); drop = 1; }
+        else if (nodes[i].type == FS_DIR)
+        {
+            if (nodes[i].size || nodes[i].first_sector || nodes[i].sector_count) { FSCK_ERR(bad_extents); if (repair) { nodes[i].size = 0; nodes[i].first_sector = 0; nodes[i].sector_count = 0; dirty = 1; } }
+        }
+        else
+        {
+            uint64_t need = nodes[i].size <= FS_MAX_FILE_SIZE ? (nodes[i].size + FS_SECTOR_SIZE - 1ULL) / FS_SECTOR_SIZE : ~0ULL;
+            int bad = nodes[i].size > FS_MAX_FILE_SIZE || need != nodes[i].sector_count ||
+                      (nodes[i].type == FS_SYMLINK && (nodes[i].size == 0 || nodes[i].size > 255));
+            if (!bad && need)
+                bad = nodes[i].first_sector < FS_DATA_START || nodes[i].first_sector >= disk_sectors ||
+                      nodes[i].sector_count > disk_sectors - nodes[i].first_sector ||
+                      (jnl_enabled && nodes[i].first_sector + nodes[i].sector_count > jnl_start());
+            if (!bad && !need && nodes[i].first_sector != 0) bad = 1;
+            if (bad) { FSCK_ERR(bad_extents); drop = 1; }
+        }
+        if (drop) { if (repair) { fsck_drop(i); ++inf->fixed; } continue; }
+        if ((nodes[i].mode & ~0777U) != 0 || nodes[i].uid > 0x7FFFFFFFU || nodes[i].gid > 0x7FFFFFFFU)
+        { FSCK_ERR(bad_modes); if (repair) { nodes[i].mode &= 0777U; if (nodes[i].uid > 0x7FFFFFFFU) nodes[i].uid = 0; if (nodes[i].gid > 0x7FFFFFFFU) nodes[i].gid = 0; dirty = 1; } }
+        int badname = nodes[i].name[0] == 0 || str_len(nodes[i].name) >= FS_NAME_SIZE || str_equal(nodes[i].name, ".") || str_equal(nodes[i].name, "..");
+        for (int k = 0; !badname && nodes[i].name[k]; ++k) if (nodes[i].name[k] == '/') badname = 1;
+        if (badname)
+        {
+            FSCK_ERR(bad_names);
+            if (repair) { char nm[FS_NAME_SIZE]; fsck_id_name(i, "", "#", nm); nodes[i].name[FS_NAME_SIZE - 1] = 0; fsck_set_name(i, nm); dirty = 1; }
+        }
+        if (dirty && repair) { (void)save_inode(i); ++inf->fixed; }
+    }
+    /* pass 2: reachability (parent exists, is a directory, chain reaches the root without a loop) */
+    for (int i = 1; i < FS_MAX_NODES; ++i)
+    {
+        if (!nodes[i].used) continue;
+        int ok = nodes[i].parent >= 0 && nodes[i].parent < FS_MAX_NODES && nodes[nodes[i].parent].used && nodes[nodes[i].parent].type == FS_DIR;
+        if (ok)
+        {
+            int p = i, depth = 0;
+            while (p != 0 && depth <= FS_MAX_NODES) { p = nodes[p].parent; ++depth; if (p < 0 || p >= FS_MAX_NODES || !nodes[p].used) { p = -1; break; } }
+            ok = p == 0;
+        }
+        if (ok) continue;
+        FSCK_ERR(orphans);
+        if (!repair) continue;
+        int lf = fsck_lost_found(1);
+        if (lf < 0) { fsck_drop(i); ++inf->fixed; continue; }
+        nodes[i].parent = lf;
+        if (find_child(lf, nodes[i].name) >= 0 && find_child(lf, nodes[i].name) != i) { char nm[FS_NAME_SIZE]; fsck_id_name(i, "#", "", nm); fsck_set_name(i, nm); }
+        (void)save_inode(i); ++inf->fixed;
+    }
+    /* pass 3: duplicate sibling names */
+    for (int a = 1; a < FS_MAX_NODES; ++a)
+    {
+        if (!nodes[a].used) continue;
+        for (int b = a + 1; b < FS_MAX_NODES; ++b)
+            if (nodes[b].used && nodes[a].parent == nodes[b].parent && str_equal(nodes[a].name, nodes[b].name))
+            {
+                FSCK_ERR(dup_names);
+                if (repair)
+                {
+                    char nm[FS_NAME_SIZE]; fsck_id_name(b, "~", nodes[b].name, nm); fsck_set_name(b, nm);
+                    (void)save_inode(b); ++inf->fixed;
+                }
+            }
+    }
+    /* pass 4: extents of different files must not overlap (hard links share one extent exactly) */
+    for (int a = 1; a < FS_MAX_NODES; ++a)
+    {
+        if (!nodes[a].used || nodes[a].type == FS_DIR || nodes[a].sector_count == 0) continue;
+        uint64_t a0 = nodes[a].first_sector, a1 = a0 + nodes[a].sector_count;
+        for (int b = a + 1; b < FS_MAX_NODES; ++b)
+        {
+            if (!nodes[b].used || nodes[b].type == FS_DIR || nodes[b].sector_count == 0) continue;
+            uint64_t b0 = nodes[b].first_sector, b1 = b0 + nodes[b].sector_count;
+            if (a0 == b0 && a1 == b1 && nodes[a].type == FS_FILE && nodes[b].type == FS_FILE && nodes[a].size == nodes[b].size) continue;
+            if (a0 < b1 && b0 < a1)
+            {
+                FSCK_ERR(overlaps);
+                if (repair) { fsck_drop(b); ++inf->fixed; }
+            }
+        }
+    }
+    #undef FSCK_ERR
+    return (int)(inf->problems - (repair ? inf->fixed : 0));
 }
 
 static int create_path(const char* path, int cwd, int type)
@@ -1026,6 +1175,7 @@ static void fs_assign_legacy_owner_policy()
 
 /* Mount the filesystem found on cur->dev into the current context (cur). allow_format: blank device -> format. */
 static void quota_load();
+static int fsck_run(int repair, FsckInfo* inf);
 static int mount_current(int allow_format)
 {
     root_id = -1;
@@ -1034,6 +1184,7 @@ static int mount_current(int allow_format)
     for (int i = 0; i < FS_NODE_CAP; ++i)
         clear_bytes(&nodes[i], sizeof(nodes[i]));
     clear_bytes(bitmap, sizeof(bitmap));
+    clear_bytes(bitmap_disk, sizeof(bitmap_disk));
     clear_bytes(legacy_metadata, sizeof(legacy_metadata));
 
     if (!storage_ready())
@@ -1066,6 +1217,11 @@ static int mount_current(int allow_format)
     {
         if (load_all_inodes() != 0) { fs_say("FS: inode table read failed.\r\n"); return -11; }
         root_id = 0;
+        for (uint64_t b = 0; b < FS_BITMAP_SECTORS; ++b)          /* remember what the on-disk bitmap holds (write_bitmap writes only differences) */
+        {
+            if (storage_read_sector(FS_BITMAP_START + b, io_buffer) != 0) { clear_bytes(bitmap_disk + b * FS_SECTOR_SIZE, FS_SECTOR_SIZE); continue; }
+            for (uint64_t i = 0; i < FS_SECTOR_SIZE; ++i) bitmap_disk[b * FS_SECTOR_SIZE + i] = io_buffer[i];
+        }
 
         /* Old images may keep data where the journal now lives: then run without it. */
         if (jnl_enabled)
@@ -1076,8 +1232,15 @@ static int mount_current(int allow_format)
 
         /* Rebuild the allocation bitmap from authoritative inode extents.
            This also repairs a stale/corrupt on-disk bitmap during mount. */
-        if (rebuild_bitmap_from_inodes() != 0) { fs_say("FS: extent integrity check failed.\r\n"); return -12; }
-        if (!validate_mounted_fs()) { fs_say("FS: inode integrity check failed.\r\n"); return -13; }
+        if (rebuild_bitmap_from_inodes() != 0 || !validate_mounted_fs())
+        {
+            fs_say("FS: inconsistency found, repairing...\r\n");
+            FsckInfo fi;
+            if (!fs_ro) (void)fsck_run(1, &fi);
+            if (rebuild_bitmap_from_inodes() != 0) { fs_say("FS: extent integrity check failed.\r\n"); return -12; }
+            if (!validate_mounted_fs()) { fs_say("FS: inode integrity check failed.\r\n"); return -13; }
+            fs_say("FS: repaired.\r\n");
+        }
         fs_assign_legacy_owner_policy();
         if (write_bitmap() != 0) { fs_say("FS: bitmap repair failed.\r\n"); return -14; }
         for (int i = 0; i < FS_MAX_NODES; ++i)
@@ -1626,6 +1789,9 @@ static int rm_node_recursive(int id)
         if (rc != 0) return rc;
     }
 
+    /* Every entry is removed in its own journal transaction (children first), so a crash leaves a consistent tree with
+       some entries already gone; a tree of 100+ entries could never fit into one transaction. */
+    FsTx fs_tx_scope;
     FsNode old; copy_node(&old, &nodes[id]);
     clear_bytes(&nodes[id], sizeof(nodes[id]));
     if (save_inode(id) != 0) { copy_node(&nodes[id], &old); return -4; }
@@ -1638,7 +1804,6 @@ static int rm_node_recursive(int id)
 int fs_rm_recursive(const char* path, int cwd)
 {
     FS_RW_CHECK();
-    FsTx fs_tx_scope;
     int id = fs_resolve_nofollow(path, cwd);
     if (id < 0) return -1;
     if (id == root_id) return -3;
@@ -1658,13 +1823,21 @@ int fs_rename(const char* from, const char* to, int cwd)
     const char* base = 0;
     char temp[192];
 
-    int dest = fs_resolve(to, cwd);
+    int dest = g_rename_replace ? fs_resolve_nofollow(to, cwd) : fs_resolve(to, cwd);
     if (dest >= 0)
     {
         if (nodes[dest].type != FS_DIR)
-            return dest == id ? 0 : -2;
-        parent = dest;                 /* move into an existing directory */
-        base = nodes[id].name;
+        {
+            if (dest == id) return 0;
+            if (!g_rename_replace || nodes[id].type == FS_DIR) return -2;
+            parent = nodes[dest].parent;           /* rename(2): replace an existing file or symlink atomically */
+            base = nodes[dest].name;
+        }
+        else
+        {
+            parent = dest;                 /* move into an existing directory */
+            base = nodes[id].name;
+        }
     }
     else
     {
@@ -1717,19 +1890,39 @@ int fs_rename(const char* from, const char* to, int cwd)
 
     int existing = find_child(parent, base);
     if (existing == id) return 0;      /* already there */
-    if (existing >= 0) return -2;
+    FsNode victim; int have_victim = 0;
+    if (existing >= 0)
+    {
+        if (!g_rename_replace || nodes[existing].mount_ctx > 0) return -2;
+        if (nodes[existing].type == FS_DIR || nodes[id].type == FS_DIR) return -2;   /* only files and symlinks are replaced */
+        if (nodes[id].type == FS_FILE && nodes[existing].type == FS_FILE && nodes[id].sector_count &&
+            nodes[id].first_sector == nodes[existing].first_sector) return 0;        /* two names of one file: nothing to do */
+        copy_node(&victim, &nodes[existing]); have_victim = 1;
+    }
 
     char new_name[FS_NAME_SIZE];
     str_copy(new_name, base, FS_NAME_SIZE);
 
     FsNode old; copy_node(&old, &nodes[id]);
+    if (have_victim)
+    {
+        clear_bytes(&nodes[existing], sizeof(nodes[existing]));
+        if (save_inode(existing) != 0) { copy_node(&nodes[existing], &victim); return -6; }
+    }
     nodes[id].parent = parent;
     nodes[id].mtime = rtc_now();
     str_copy(nodes[id].name, new_name, FS_NAME_SIZE);
     if (save_inode(id) != 0)
     {
         copy_node(&nodes[id], &old);
+        if (have_victim) { copy_node(&nodes[existing], &victim); (void)save_inode(existing); }
         return -6;
+    }
+    if (have_victim)
+    {
+        if (!(victim.type == FS_FILE && extent_shared_with_others(existing, victim.first_sector, victim.sector_count)))
+            free_sectors(victim.first_sector, victim.sector_count);
+        if (write_bitmap() != 0) return -6;
     }
     return storage_flush() == 0 ? 0 : -6;
 }
@@ -1956,6 +2149,7 @@ int fs_fsck(int repair, FsckInfo* out)
     if (!out) return -22;
     clear_bytes(out, sizeof(*out));
     if (repair) { FS_RW_CHECK(); }
+    (void)fsck_run(repair, out);                              /* structure: names, extents, orphans, duplicates, overlaps */
     for (int i = 0; i < FS_MAX_NODES; ++i)
     {
         if (!nodes[i].used) continue;
@@ -2281,6 +2475,13 @@ int fs_rename(const char* from, const char* to, int cwd)
     fb[p] = 0;
     act(a.ctx);
     return fs_rename_impl(fa, fb, 0);
+}
+int fs_rename_replace(const char* from, const char* to, int cwd)
+{
+    g_rename_replace = 1;
+    int rc = fs_rename(from, to, cwd);
+    g_rename_replace = 0;
+    return rc;
 }
 uint64_t fs_file_size(int id) { if (!gid_ok(id)) return 0; act(id >> 12); return fs_file_size_impl(id & 0xFFF); }
 int fs_get_type(int id) { if (!gid_ok(id)) return -1; act(id >> 12); return fs_get_type_impl(id & 0xFFF); }

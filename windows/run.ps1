@@ -28,6 +28,7 @@ if (-not (Test-Path $Disk)) {
     "-kernel" $Kernel `
     "-drive" "if=none,format=raw,file=$Disk,id=vd0" `
     "-device" "virtio-blk-device,drive=vd0" `
+    "-device" "virtio-rng-device" `
     "-netdev" "user,id=n1,ipv4=on,ipv6=off" `
     "-device" "virtio-net-device,netdev=n1"
 

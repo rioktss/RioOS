@@ -92,6 +92,7 @@ exec "$QEMU" \
     -device ramfb \
     -drive "if=none,format=raw,file=$DISK,id=vd0" \
     -device virtio-blk-device,drive=vd0 \
+    -device virtio-rng-device \
     -netdev "user,id=n1,ipv4=on,ipv6=off${NETFWD}" \
     -device virtio-net-device,netdev=n1 \
     -device virtio-keyboard-device \

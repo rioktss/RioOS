@@ -310,6 +310,7 @@ static uint8_t recbuf[16640 + 64];
 static uint8_t plain[16640 + 64];
 static uint8_t hsbuf[20000];
 
+#ifdef HOST_TEST
 static void random_bytes(uint8_t* out, uint32_t n)
 {
     static uint64_t counter = 0;
@@ -325,6 +326,10 @@ static void random_bytes(uint8_t* out, uint32_t n)
         for (uint32_t k = 0; k < 32 && i + k < n; ++k) out[i + k] = h[k];
     }
 }
+#else
+#include "random.h"
+static void random_bytes(uint8_t* out, uint32_t n) { random_get(out, n); }
+#endif
 void tls_random(uint8_t* out, uint32_t n) { random_bytes(out, n); }
 void tls_aes128_expand(uint8_t rk[176], const uint8_t key[16]) { aes_key((Aes*)rk, key); }
 void tls_aes128_encrypt_block(const uint8_t rk[176], const uint8_t in[16], uint8_t out[16]) { aes_block((const Aes*)rk, in, out); }

@@ -25,6 +25,7 @@
 #include "types.h"
 #include "uart.h"
 #include "console.h"
+#include "random.h"
 
 #define UART_BASE 0x09000000ULL
 
@@ -202,6 +203,7 @@ int uart_try_getc()
     if ((*UART_FR) & (1U << 4))
         return -1;
 
+    random_add_event();
     return (int)(*UART_DR & 0xFFU);
 }
 
@@ -213,6 +215,7 @@ void uart_poll_job_keys(int (*filter)(int))
     while (((*UART_FR) & (1U << 4)) == 0)
     {
         int c = (int)(*UART_DR & 0xFFU);
+        random_add_event();
         if (filter && filter(c)) continue;
         unsigned next = (rx_head + 1U) & 255U;
         if (next == rx_tail) break;              /* ring full: stop draining */

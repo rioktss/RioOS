@@ -27,6 +27,7 @@
 #include "timer.h"
 #include "memory.h"
 #include "virtio_mmio.h"
+#include "random.h"
 
 /* QEMU virt: virtio-mmio transport region begins at 0x0a000000.
  * The driver normally discovers the exact instance from the FDT at RAM+0,
@@ -372,6 +373,7 @@ static int submit_request(uint32_t type, uint64_t sector, const uint8_t* write_d
         return result;
     }
 
+    random_add_event();
     if (request_status != STATUS_OK)
     {
         return -5;

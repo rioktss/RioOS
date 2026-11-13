@@ -91,6 +91,7 @@ int fs_rm_recursive(const char* path, int cwd);
 /* Move/rename. 0 ok; -1 source missing; -2 destination exists; -3 root;
    -4 into itself; -5 bad destination; -6 I/O error. */
 int fs_rename(const char* from, const char* to, int cwd);
+int fs_rename_replace(const char* from, const char* to, int cwd);   /* rename(2): atomically replaces an existing file or symlink */
 int fs_mkdir_p(const char* path, int cwd);
 uint64_t fs_file_size(int id);
 int fs_get_type(int id);
@@ -113,7 +114,8 @@ int fs_persistent();
    Node ids are global: (mount index << 12) | inode index (mount 0 = root). Storage device numbers (storage_dev_*):
    1 = RAM disk 0, 5 = RAM disk 1 (tmpfs), 3 = NVMe, 4 = AHCI/SATA when not the root disk. */
 /* hard links, fsck, quota */
-struct FsckInfo { int inodes, dirs, files, symlinks, hardlinks; int structure_ok, bitmap_ok, repaired; uint64_t sectors_used, leaked, missing; };
+struct FsckInfo { int inodes, dirs, files, symlinks, hardlinks; int structure_ok, bitmap_ok, repaired; uint64_t sectors_used, leaked, missing;
+                  uint32_t problems, fixed, orphans, bad_names, dup_names, bad_extents, overlaps, bad_modes; };   /* problems found / fixed by the structural pass */
 int fs_link_hard(const char* target, const char* linkpath, int cwd);   /* node id or -errno; same-mount regular files with data only */
 int fs_link_count(int id);
 int fs_fsck(const char* path, int cwd, int repair, FsckInfo* out);   /* path = a mount root or NULL (root fs) */
