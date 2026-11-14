@@ -26,6 +26,7 @@
 #include "mmu.h"
 #include "uart.h"
 #include "string.h"
+#include "fd.h"
 
 #define MAX_PROCESSES 48
 #define PROCESS_NAME_SIZE 32
@@ -66,6 +67,13 @@ struct Process
     uint64_t start_ms;
     int cwd;             /* filesystem node of the working directory, -1 = shell's */
     uint32_t umask_bits;
+    uint64_t rl_cur[PROC_RLIMIT_N], rl_max[PROC_RLIMIT_N];   /* setrlimit, inherited by fork */
+    uint64_t cpu_user_ms, cpu_sys_ms;                        /* charged by the timer tick */
+    uint64_t child_user_ms, child_sys_ms;                    /* totals of exited children */
+    uint64_t ctx_switches;
+    int in_syscall;
+    uint32_t cpu_mask;                                       /* sched_setaffinity: allowed CPUs (0 = all) */
+    uint32_t sig_serial;                                     /* counts raised signals (signalfd + EPOLLET) */
     char args[PROCESS_ARGS_SIZE];
 };
 
@@ -116,6 +124,12 @@ static void reset_mt_fields(Process* p)
     p->start_ms = 0;
     p->cwd = -1;
     p->umask_bits = 022;
+    for (int i = 0; i < PROC_RLIMIT_N; ++i) p->rl_cur[i] = p->rl_max[i] = PROC_RLIM_INF;
+    p->rl_cur[PROC_RLIMIT_NOFILE] = p->rl_max[PROC_RLIMIT_NOFILE] = FD_MAX_DESCRIPTORS;
+    p->rl_cur[PROC_RLIMIT_STACK] = p->rl_max[PROC_RLIMIT_STACK] = 65536;
+    p->rl_cur[PROC_RLIMIT_CORE] = p->rl_max[PROC_RLIMIT_CORE] = 0;
+    p->cpu_user_ms = p->cpu_sys_ms = p->child_user_ms = p->child_sys_ms = p->ctx_switches = 0;
+    p->in_syscall = 0; p->cpu_mask = 0; p->sig_serial = 0;
     p->args[0] = '\0';
 }
 
@@ -254,6 +268,14 @@ int process_mark_exit(int pid, int code)
     }
     processes[slot].exit_code = code;
     processes[slot].state = PROCESS_ZOMBIE;
+    {   /* RUSAGE_CHILDREN: the parent accumulates what this process and its own waited children used */
+        int ps = processes[slot].ppid >= 0 ? find_slot_locked(processes[slot].ppid) : -1;
+        if (ps >= 0)
+        {
+            processes[ps].child_user_ms += processes[slot].cpu_user_ms + processes[slot].child_user_ms;
+            processes[ps].child_sys_ms += processes[slot].cpu_sys_ms + processes[slot].child_sys_ms;
+        }
+    }
     process_irq_restore(flags);
     return 0;
 }
@@ -527,7 +549,7 @@ int process_sig_raise_info(int pid, int sig, int sender, int code, uint64_t valu
     if (slot >= 0 && processes[slot].state != PROCESS_ZOMBIE
         && !(processes[slot].sig_handler[sig] == 1 && sig != 9 && sig != 19))   /* ignored signals are discarded */
     {
-        processes[slot].sig_pending |= (1U << sig);
+        processes[slot].sig_pending |= (1U << sig); ++processes[slot].sig_serial;
         processes[slot].sig_sender[sig] = sender; processes[slot].sig_code[sig] = code; processes[slot].sig_value[sig] = value;
     }
     process_irq_restore(f);
@@ -640,6 +662,92 @@ int process_sig_set_mask(int pid, uint32_t mask)
     if (slot >= 0) processes[slot].sig_mask = mask & ~SIG_UNBLOCKABLE;
     process_irq_restore(f); return slot >= 0 ? 0 : -3;
 }
+/* ---- resource limits, CPU accounting, CPU affinity ---- */
+int process_rlimit_get(int pid, int res, uint64_t* cur, uint64_t* max)
+{
+    if (res < 0 || res >= PROC_RLIMIT_N) return -22;
+    uint64_t f = process_irq_save(); int slot = find_slot_locked(pid);
+    if (slot >= 0) { if (cur) *cur = processes[slot].rl_cur[res]; if (max) *max = processes[slot].rl_max[res]; }
+    process_irq_restore(f); return slot >= 0 ? 0 : -3;
+}
+uint64_t process_rlimit_cur(int pid, int res)
+{
+    uint64_t c = PROC_RLIM_INF;
+    if (res >= 0 && res < PROC_RLIMIT_N && process_rlimit_get(pid, res, &c, 0) != 0) c = PROC_RLIM_INF;
+    return c;
+}
+/* raising the hard limit needs root; the soft limit may not exceed the hard limit */
+int process_rlimit_set(int pid, int res, uint64_t cur, uint64_t max, int privileged)
+{
+    if (res < 0 || res >= PROC_RLIMIT_N || cur > max) return -22;
+    uint64_t f = process_irq_save(); int slot = find_slot_locked(pid); int rc = 0;
+    if (slot < 0) rc = -3;
+    else if (max > processes[slot].rl_max[res] && !privileged) rc = -1;
+    else if (res == PROC_RLIMIT_NOFILE && max > FD_MAX_DESCRIPTORS && max != PROC_RLIM_INF) rc = -22;
+    else { processes[slot].rl_cur[res] = cur; processes[slot].rl_max[res] = max; }
+    process_irq_restore(f); return rc;
+}
+int process_rlimit_inherit(int parent, int child)
+{
+    uint64_t f = process_irq_save(); int ps = find_slot_locked(parent); int cs = find_slot_locked(child);
+    if (ps >= 0 && cs >= 0)
+    {
+        for (int i = 0; i < PROC_RLIMIT_N; ++i) { processes[cs].rl_cur[i] = processes[ps].rl_cur[i]; processes[cs].rl_max[i] = processes[ps].rl_max[i]; }
+        processes[cs].cpu_mask = processes[ps].cpu_mask;
+    }
+    process_irq_restore(f); return (ps >= 0 && cs >= 0) ? 0 : -1;
+}
+void process_set_in_syscall(int pid, int v)
+{
+    uint64_t f = process_irq_save(); int slot = find_slot_locked(pid);
+    if (slot >= 0) processes[slot].in_syscall = v;
+    process_irq_restore(f);
+}
+/* One timer tick of `ms` milliseconds on the CPU the process is running on.  Enforces RLIMIT_CPU: SIGXCPU (24) once the soft
+   limit (seconds) is reached and again every second, SIGKILL at the hard limit. */
+void process_account_tick(int pid, uint64_t ms)
+{
+    uint64_t f = process_irq_save(); int slot = find_slot_locked(pid);
+    if (slot >= 0 && processes[slot].state != PROCESS_ZOMBIE)
+    {
+        Process* p = &processes[slot];
+        uint64_t before = (p->cpu_user_ms + p->cpu_sys_ms) / 1000U;
+        if (p->in_syscall) p->cpu_sys_ms += ms; else p->cpu_user_ms += ms;
+        uint64_t total_s = (p->cpu_user_ms + p->cpu_sys_ms) / 1000U;
+        if (total_s != before)
+        {
+            if (p->rl_max[PROC_RLIMIT_CPU] != PROC_RLIM_INF && total_s >= p->rl_max[PROC_RLIMIT_CPU]) p->sig_pending |= (1U << 9);
+            else if (p->rl_cur[PROC_RLIMIT_CPU] != PROC_RLIM_INF && total_s >= p->rl_cur[PROC_RLIMIT_CPU] && !(p->sig_handler[24] == 1)) p->sig_pending |= (1U << 24);
+        }
+    }
+    process_irq_restore(f);
+}
+int process_rusage(int pid, int children, uint64_t out[4])
+{
+    uint64_t f = process_irq_save(); int slot = find_slot_locked(pid);
+    if (slot >= 0)
+    {
+        out[0] = children ? processes[slot].child_user_ms : processes[slot].cpu_user_ms;
+        out[1] = children ? processes[slot].child_sys_ms : processes[slot].cpu_sys_ms;
+        out[2] = 0; out[3] = processes[slot].ctx_switches;
+    }
+    process_irq_restore(f); return slot >= 0 ? 0 : -3;
+}
+void process_count_switch(int pid)
+{
+    uint64_t f = process_irq_save(); int slot = find_slot_locked(pid);
+    if (slot >= 0) ++processes[slot].ctx_switches;
+    process_irq_restore(f);
+}
+uint32_t process_sig_serial(int pid) { PROC_GET(processes[slot].sig_serial, 0U) }
+uint32_t process_cpu_mask(int pid) { PROC_GET(processes[slot].cpu_mask, 0U) }
+int process_set_cpu_mask(int pid, uint32_t mask)
+{
+    uint64_t f = process_irq_save(); int slot = find_slot_locked(pid);
+    if (slot >= 0) processes[slot].cpu_mask = mask;
+    process_irq_restore(f); return slot >= 0 ? 0 : -3;
+}
+
 int process_sig_inherit(int parent, int child)
 {
     uint64_t f = process_irq_save(); int ps = find_slot_locked(parent); int cs = find_slot_locked(child);

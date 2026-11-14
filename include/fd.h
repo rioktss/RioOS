@@ -71,6 +71,7 @@ int fd_set_nonblock(int descriptor, int value);
 int fd_get_flags(int descriptor);
 int fd_is_blocking(int descriptor);      /* blocking-capable kind and not O_NONBLOCK */
 int fd_is_socket(int descriptor);
+int64_t fd_poll_gen(int descriptor);     /* EPOLLET arrival counter: (1<<32)|gen, 0 when the kind has none */
 int fd_poll_mask(int descriptor);        /* Linux poll bits: IN 1, OUT 4, ERR 8, HUP 16, NVAL 32 */
 int fd_socket(int type_and_flags);       /* inet: 1 stream (TCP) / 2 dgram (UDP) | SOCK_NONBLOCK 0x800 | SOCK_CLOEXEC 0x1000 */
 int fd_sock_bind(int descriptor, uint32_t ip, uint16_t port);
@@ -92,6 +93,10 @@ int fd_unix_connect(int descriptor, const char* path);
 int64_t fd_sendmsg(int descriptor, const void* buf, uint64_t len, const int* fds, int nfds);
 int64_t fd_recvmsg(int descriptor, void* buf, uint64_t cap, int* fds, int* nfds, int maxfds);
 
+int fd_signalfd(int descriptor, uint32_t mask, int flags);          /* descriptor -1 creates; returns the descriptor */
+int fd_inotify_init(int flags);
+int fd_inotify_add_watch(int descriptor, const char* path, uint32_t mask, int cwd);   /* watch id or -errno */
+int fd_inotify_rm_watch(int descriptor, int wd);
 int fd_timerfd_create(int flags);
 int fd_timerfd_settime(int descriptor, uint64_t first_ms, uint64_t interval_ms, uint64_t* old);   /* first_ms 0 disarms */
 int fd_timerfd_gettime(int descriptor, uint64_t out[2]);

@@ -74,6 +74,7 @@ int mmu_user_fault(uint64_t far, int is_write);
 int mmu_user_space_clone(int src_pid, int dst_pid);
 int mmu_user_space_replace(int pid, int built_pid);
 int mmu_user_brk(int pid, uint64_t new_brk, uint64_t* out);
+uint64_t mmu_user_vsize(int pid);          /* heap + mmap bytes reserved (RLIMIT_AS / RLIMIT_DATA) */
 int mmu_user_mmap(int pid, uint64_t length, uint32_t prot, uint64_t* out);
 int mmu_user_mmap_shared(int pid, uint64_t length, uint32_t prot, uint64_t* out);
 int mmu_user_install_frame(int pid, uint64_t va, uint64_t frame);

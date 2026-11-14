@@ -898,7 +898,48 @@ typedef struct { unsigned long bits[1]; } cpu_set_t;
 #define CPU_ISSET(c, s) (((s)->bits[0] >> (c)) & 1UL)
 #define CPU_COUNT(s) __builtin_popcountl((s)->bits[0])
 int sched_getcpu(void);
-int sched_getaffinity(pid_t pid, size_t size, cpu_set_t* set);   /* mask of online CPUs; pinning (sched_setaffinity) is not supported */
+int sched_getaffinity(pid_t pid, size_t size, cpu_set_t* set);
+int sched_setaffinity(pid_t pid, size_t size, const cpu_set_t* set);   /* enforced by the SMP scheduler at the next reschedule */
+/* signalfd / inotify */
+#define SFD_NONBLOCK 0x800
+#define SFD_CLOEXEC 0x1000
+struct signalfd_siginfo { uint32_t ssi_signo; int32_t ssi_errno; int32_t ssi_code; uint32_t ssi_pid; uint32_t ssi_uid; int32_t ssi_fd; uint32_t ssi_tid; uint32_t ssi_band; uint32_t ssi_overrun; uint32_t ssi_trapno; int32_t ssi_status; int32_t ssi_int; uint64_t ssi_ptr; uint64_t ssi_utime; uint64_t ssi_stime; uint64_t ssi_addr; uint8_t pad[48]; };
+int signalfd(int fd, const sigset_t* mask, int flags);
+#define IN_NONBLOCK 0x800
+#define IN_CLOEXEC 0x1000
+#define IN_ACCESS 0x1
+#define IN_MODIFY 0x2
+#define IN_ATTRIB 0x4
+#define IN_CLOSE_WRITE 0x8
+#define IN_CLOSE_NOWRITE 0x10
+#define IN_CLOSE (IN_CLOSE_WRITE | IN_CLOSE_NOWRITE)
+#define IN_OPEN 0x20
+#define IN_MOVED_FROM 0x40
+#define IN_MOVED_TO 0x80
+#define IN_MOVE (IN_MOVED_FROM | IN_MOVED_TO)
+#define IN_CREATE 0x100
+#define IN_DELETE 0x200
+#define IN_DELETE_SELF 0x400
+#define IN_MOVE_SELF 0x800
+#define IN_ALL_EVENTS 0xFFF
+#define IN_UNMOUNT 0x2000
+#define IN_Q_OVERFLOW 0x4000
+#define IN_IGNORED 0x8000
+#define IN_ONLYDIR 0x01000000
+#define IN_DONT_FOLLOW 0x02000000
+#define IN_MASK_ADD 0x20000000
+#define IN_ISDIR 0x40000000
+#define IN_ONESHOT 0x80000000U
+struct inotify_event { int wd; uint32_t mask; uint32_t cookie; uint32_t len; char name[]; };
+int inotify_init(void); int inotify_init1(int flags);
+int inotify_add_watch(int fd, const char* path, uint32_t mask); int inotify_rm_watch(int fd, int wd);
+/* iconv */
+typedef void* iconv_t;
+iconv_t iconv_open(const char* to, const char* from);
+size_t iconv(iconv_t cd, char** inbuf, size_t* inleft, char** outbuf, size_t* outleft);
+int iconv_close(iconv_t cd);
+#define SIGXCPU 24
+#define SIGXFSZ 25
 #define SEM_FAILED ((sem_t*)0)
 sem_t* sem_open(const char* name, int oflag, ...); int sem_close(sem_t* s); int sem_unlink(const char* name);
 /* epoll (level- and edge-triggered over poll) */

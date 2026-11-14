@@ -93,6 +93,11 @@ int fs_rm_recursive(const char* path, int cwd);
 int fs_rename(const char* from, const char* to, int cwd);
 int fs_rename_replace(const char* from, const char* to, int cwd);   /* rename(2): atomically replaces an existing file or symlink */
 int fs_mkdir_p(const char* path, int cwd);
+/* Change notification (inotify): when non-null, called after every successful metadata/content change.
+   dir = node whose directory entry changed (-1 if none), node = the node concerned, name = entry name (may be empty),
+   mask = IN_* bits (IN_CREATE 0x100, IN_DELETE 0x200, IN_MODIFY 2, IN_ATTRIB 4, IN_MOVED_FROM 0x40, IN_MOVED_TO 0x80,
+   IN_DELETE_SELF 0x400, IN_MOVE_SELF 0x800, | IN_ISDIR 0x40000000), cookie pairs MOVED_FROM with MOVED_TO. */
+extern void (*fs_event_hook)(int dir, int node, const char* name, uint32_t mask, uint32_t cookie);
 uint64_t fs_file_size(int id);
 int fs_get_type(int id);
 const char* fs_get_name(int id);

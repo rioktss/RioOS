@@ -46,6 +46,12 @@
 #define K_UMASK 109
 #define K_SYSINFO 110
 #define K_FDATTR 111
+#define K_FDGEN 113
+#define K_RLIMIT 114
+#define K_AFFINITY 115
+#define K_SIGNALFD 116
+#define K_INOTIFY 117
+#define K_RUSAGE 118
 
 static long kret(uint64_t v) { long r = (long)v; if (r < 0 && r > -4096) { errno = (int)-r; return -1; } return r; }
 static void copy_str(char* d, const char* s, size_t cap) { size_t i = 0; if (!cap) return; while (s[i] && i + 1 < cap) { d[i] = s[i]; ++i; } d[i] = 0; }
@@ -672,32 +678,30 @@ int uname(struct utsname* u)
     gethostname(u->nodename, sizeof(u->nodename));
     return 0;
 }
-static struct rlimit rl_tab[10];
-static int rl_init;
-static void rl_setup(void)
-{
-    if (rl_init) return; rl_init = 1;
-    for (int i = 0; i < 10; ++i) rl_tab[i].rlim_cur = rl_tab[i].rlim_max = RLIM_INFINITY;
-    rl_tab[RLIMIT_NOFILE].rlim_cur = rl_tab[RLIMIT_NOFILE].rlim_max = USER_FD_MAX_DESCRIPTORS;
-    rl_tab[RLIMIT_STACK].rlim_cur = rl_tab[RLIMIT_STACK].rlim_max = 65536;
-    rl_tab[RLIMIT_CORE].rlim_cur = rl_tab[RLIMIT_CORE].rlim_max = 0;
-}
 int getrlimit(int res, struct rlimit* r)
 {
     if (res < 0 || res > 9 || !r) { errno = EINVAL; return -1; }
-    rl_setup(); *r = rl_tab[res]; return 0;
+    uint64_t out[2] = {0, 0};
+    if (kret(user_syscall5(K_RLIMIT, 0, (uint64_t)res, 0, 0, (uint64_t)out)) < 0) return -1;
+    r->rlim_cur = (rlim_t)out[0]; r->rlim_max = (rlim_t)out[1]; return 0;
 }
+/* enforced by the kernel: NOFILE (descriptor allocation), FSIZE (SIGXFSZ/EFBIG), NPROC (fork -> EAGAIN, non-root), CPU (SIGXCPU at the
+   soft limit, SIGKILL at the hard limit), AS/DATA (heap + mmap growth -> ENOMEM). Inherited by fork. STACK/CORE/RSS/MEMLOCK are only recorded. */
 int setrlimit(int res, const struct rlimit* r)
 {
     if (res < 0 || res > 9 || !r || r->rlim_cur > r->rlim_max) { errno = EINVAL; return -1; }
-    rl_setup();
-    if (r->rlim_max > rl_tab[res].rlim_max && getuid() != 0) { errno = EPERM; return -1; }
-    rl_tab[res] = *r; return 0;                     /* recorded, not enforced by the kernel */
+    return kret(user_syscall5(K_RLIMIT, 1, (uint64_t)res, (uint64_t)r->rlim_cur, (uint64_t)r->rlim_max, 0)) < 0 ? -1 : 0;
 }
 int getrusage(int who, struct rusage* ru)
 {
     if ((who != RUSAGE_SELF && who != RUSAGE_CHILDREN) || !ru) { errno = EINVAL; return -1; }
-    memset(ru, 0, sizeof(*ru)); return 0;           /* the kernel keeps no per-process CPU accounting */
+    uint64_t v[4] = {0, 0, 0, 0};
+    memset(ru, 0, sizeof(*ru));
+    if (kret(user_syscall2(K_RUSAGE, who == RUSAGE_CHILDREN ? 1 : 0, (uint64_t)v)) < 0) return -1;
+    ru->ru_utime.tv_sec = (long)(v[0] / 1000U); ru->ru_utime.tv_usec = (long)(v[0] % 1000U) * 1000L;
+    ru->ru_stime.tv_sec = (long)(v[1] / 1000U); ru->ru_stime.tv_usec = (long)(v[1] % 1000U) * 1000L;
+    ru->ru_nvcsw = (long)v[3];
+    return 0;
 }
 long sysconf(int name)
 {
@@ -912,7 +916,7 @@ int clock_nanosleep(int clk, int flags, const struct timespec* req, struct times
 }
 
 /* ---- epoll over poll(); the descriptor is an eventfd that only reserves the number ----------------------------------------------- */
-struct EpEntry { int fd; uint32_t events; epoll_data_t data; uint32_t last; int disabled; };
+struct EpEntry { int fd; uint32_t events; epoll_data_t data; uint32_t last; int disabled; uint32_t gen; int has_gen; };
 #define EP_MAX_WATCH 64
 #define EP_MAX_INST 8
 struct EpInst { int fd; int used; int n; EpEntry e[EP_MAX_WATCH]; };
@@ -920,11 +924,19 @@ static EpInst eps[EP_MAX_INST];
 static EpInst* ep_find(int fd) { for (int i = 0; i < EP_MAX_INST; ++i) if (eps[i].used && eps[i].fd == fd) return &eps[i]; return 0; }
 int __rio_ep_active = 0;
 void __rio_epoll_close(int fd) { EpInst* e = ep_find(fd); if (e) { e->used = 0; --__rio_ep_active; } }
-/* I/O on a watched descriptor re-arms its edge: the next readiness is reported as a new event */
+/* Edge detection.  The kernel keeps an arrival counter per descriptor (data, EOF, error, new connection), so an edge for
+   EPOLLIN/EPOLLHUP/EPOLLERR is "the counter moved since the last report", also when the data arrived while this process
+   was doing nothing.  EPOLLOUT edges are not-writable -> writable transitions; I/O on the descriptor re-arms them. */
 void __rio_epoll_rearm(int fd)
 {
     for (int k = 0; k < EP_MAX_INST; ++k)
-        if (eps[k].used) for (int i = 0; i < eps[k].n; ++i) if (eps[k].e[i].fd == fd) eps[k].e[i].last = 0;
+        if (eps[k].used) for (int i = 0; i < eps[k].n; ++i) if (eps[k].e[i].fd == fd) eps[k].e[i].last &= ~(uint32_t)EPOLLOUT;
+}
+static int ep_gen(int fd, uint32_t* g)
+{
+    long r = (long)user_syscall1(K_FDGEN, (uint64_t)fd);
+    if (r <= 0) return 0;                       /* kind without a counter (file, tty) or error */
+    *g = (uint32_t)((unsigned long)r & 0xFFFFFFFFUL); return 1;
 }
 int epoll_create1(int flags)
 {
@@ -946,14 +958,14 @@ int epoll_ctl(int ep, int op, int fd, struct epoll_event* ev)
         if (!ev) { errno = EFAULT; return -1; }
         if (idx >= 0) { errno = EEXIST; return -1; }
         if (e->n >= EP_MAX_WATCH) { errno = ENOSPC; return -1; }
-        e->e[e->n].fd = fd; e->e[e->n].events = ev->events; e->e[e->n].data = ev->data; e->e[e->n].last = 0; e->e[e->n].disabled = 0; ++e->n; return 0;
+        e->e[e->n].fd = fd; e->e[e->n].events = ev->events; e->e[e->n].data = ev->data; e->e[e->n].last = 0; e->e[e->n].disabled = 0; { uint32_t g; e->e[e->n].has_gen = ep_gen(fd, &g); e->e[e->n].gen = g - 1U; } ++e->n; return 0;
     }
     if (idx < 0) { errno = ENOENT; return -1; }
     if (op == EPOLL_CTL_DEL) { e->e[idx] = e->e[--e->n]; return 0; }
     if (op == EPOLL_CTL_MOD)
     {
         if (!ev) { errno = EFAULT; return -1; }
-        e->e[idx].events = ev->events; e->e[idx].data = ev->data; e->e[idx].last = 0; e->e[idx].disabled = 0; return 0;
+        e->e[idx].events = ev->events; e->e[idx].data = ev->data; e->e[idx].last = 0; e->e[idx].disabled = 0; { uint32_t g; e->e[idx].has_gen = ep_gen(e->e[idx].fd, &g); e->e[idx].gen = g - 1U; } return 0;
     }
     errno = EINVAL; return -1;
 }
@@ -972,7 +984,7 @@ int epoll_wait(int ep, struct epoll_event* evs, int maxevents, int timeout_ms)
             if (ev & (EPOLLIN | EPOLLRDHUP)) pe |= POLLIN;
             if (ev & EPOLLOUT) pe |= POLLOUT;
             pf[np].fd = e->e[i].fd; pf[np].events = pe; pf[np].revents = 0; map[np++] = i;
-            if ((ev & EPOLLET) && e->e[i].last) et_armed = 1;
+            if ((ev & EPOLLET) && !e->e[i].has_gen && e->e[i].last) et_armed = 1;
         }
         long wait = -1;
         if (timeout_ms >= 0) { unsigned long now = clock_ms(); wait = now >= deadline ? 0 : (long)(deadline - now); }
@@ -990,7 +1002,14 @@ int epoll_wait(int ep, struct epoll_event* evs, int maxevents, int timeout_ms)
             if (pf[k].revents & POLLHUP) ready |= EPOLLHUP | (en->events & EPOLLRDHUP);
             ready &= (en->events | EPOLLERR | EPOLLHUP | EPOLLRDHUP);
             uint32_t report = ready;
-            if (en->events & EPOLLET) { report = ready & ~en->last; en->last = ready; }
+            if (en->events & EPOLLET)
+            {
+                uint32_t g = 0, outb = ready & EPOLLOUT, inb = ready & ~(uint32_t)EPOLLOUT;
+                report = outb & ~(en->last & EPOLLOUT);
+                if (en->has_gen && ep_gen(en->fd, &g)) { if (inb && g != en->gen) { report |= inb; en->gen = g; } }
+                else report |= inb & ~(en->last & ~(uint32_t)EPOLLOUT);
+                en->last = ready;
+            }
             if (!report) continue;
             evs[out].events = report; evs[out].data = en->data; ++out;
             if (en->events & EPOLLONESHOT) en->disabled = 1;
@@ -1012,8 +1031,209 @@ int sched_getcpu(void)
 int sched_getaffinity(pid_t pid, size_t size, cpu_set_t* set)
 {
     if (!set || size < sizeof(cpu_set_t)) { errno = EINVAL; return -1; }
-    if (pid != 0 && pid != getpid()) { struct stat st; (void)st; if (kill(pid, 0) < 0) return -1; }
-    long n = sysconf(_SC_NPROCESSORS_ONLN); if (n < 1) n = 1; if (n > 64) n = 64;
-    set->bits[0] = n >= 64 ? ~0UL : ((1UL << n) - 1UL);
-    return (int)sizeof(cpu_set_t);
+    long m = kret(user_syscall3(K_AFFINITY, 0, (uint64_t)pid, 0));
+    if (m < 0) return -1;
+    set->bits[0] = (unsigned long)m;
+    return 0;
+}
+int sched_setaffinity(pid_t pid, size_t size, const cpu_set_t* set)
+{
+    if (!set || size < sizeof(cpu_set_t)) { errno = EINVAL; return -1; }
+    return kret(user_syscall3(K_AFFINITY, 1, (uint64_t)pid, (uint64_t)set->bits[0])) < 0 ? -1 : 0;
+}
+
+/* ---- signalfd / inotify ---------------------------------------------------------------------------------------------------------- */
+int signalfd(int fd, const sigset_t* mask, int flags)
+{
+    if (!mask) { errno = EINVAL; return -1; }
+    long r = kret(user_syscall3(K_SIGNALFD, (uint64_t)(int64_t)fd, (uint64_t)(*(const uint32_t*)mask), (uint64_t)flags));
+    return (int)r;
+}
+int inotify_init1(int flags)
+{
+    return (int)kret(user_syscall2(K_INOTIFY, 0, (uint64_t)flags));
+}
+int inotify_init(void) { return inotify_init1(0); }
+int inotify_add_watch(int fd, const char* path, uint32_t mask)
+{
+    if (!path) { errno = EFAULT; return -1; }
+    return (int)kret(user_syscall4(K_INOTIFY, 1, (uint64_t)fd, (uint64_t)path, (uint64_t)mask));
+}
+int inotify_rm_watch(int fd, int wd)
+{
+    return kret(user_syscall4(K_INOTIFY, 2, (uint64_t)fd, (uint64_t)wd, 0)) < 0 ? -1 : 0;
+}
+
+/* ---- iconv: UTF-8, UTF-16(LE/BE), UTF-32(LE/BE), WCHAR_T, ASCII, ISO-8859-1 (//TRANSLIT -> '?', //IGNORE skips) -------------------------- */
+enum { CS_UTF8 = 1, CS_ASCII, CS_L1, CS_U16LE, CS_U16BE, CS_U16, CS_U32LE, CS_U32BE, CS_U32 };
+struct IconvState { int from, to; int translit, ignore; int bom_out_done; int from_be; int from_known; };
+static int cs_lookup(const char* name, int* translit, int* ignore)
+{
+    char b[40]; size_t n = 0;
+    while (name[n] && n < sizeof(b) - 1) { char c = name[n]; if (c >= 'a' && c <= 'z') c = (char)(c - 32); b[n++] = c; }
+    b[n] = 0;
+    char* sl = strstr(b, "//");
+    if (sl) { if (strstr(sl, "TRANSLIT")) *translit = 1; if (strstr(sl, "IGNORE")) *ignore = 1; *sl = 0; }
+    if (!strcmp(b, "UTF-8") || !strcmp(b, "UTF8") || !strcmp(b, "") ) return CS_UTF8;
+    if (!strcmp(b, "ASCII") || !strcmp(b, "US-ASCII") || !strcmp(b, "ANSI_X3.4-1968") || !strcmp(b, "646")) return CS_ASCII;
+    if (!strcmp(b, "ISO-8859-1") || !strcmp(b, "ISO8859-1") || !strcmp(b, "LATIN1") || !strcmp(b, "L1") || !strcmp(b, "ISO_8859-1")) return CS_L1;
+    if (!strcmp(b, "UTF-16LE") || !strcmp(b, "UCS-2LE")) return CS_U16LE;
+    if (!strcmp(b, "UTF-16BE") || !strcmp(b, "UCS-2BE")) return CS_U16BE;
+    if (!strcmp(b, "UTF-16") || !strcmp(b, "UCS-2")) return CS_U16;
+    if (!strcmp(b, "UTF-32LE") || !strcmp(b, "UCS-4LE") || !strcmp(b, "WCHAR_T")) return CS_U32LE;
+    if (!strcmp(b, "UTF-32BE") || !strcmp(b, "UCS-4BE")) return CS_U32BE;
+    if (!strcmp(b, "UTF-32") || !strcmp(b, "UCS-4")) return CS_U32;
+    return 0;
+}
+iconv_t iconv_open(const char* to, const char* from)
+{
+    if (!to || !from) { errno = EINVAL; return (iconv_t)-1; }
+    int tr = 0, ig = 0, tr2 = 0, ig2 = 0;
+    int t = cs_lookup(to, &tr, &ig), f = cs_lookup(from, &tr2, &ig2);
+    if (!t || !f) { errno = EINVAL; return (iconv_t)-1; }
+    IconvState* st = (IconvState*)calloc(1, sizeof(IconvState));
+    if (!st) { errno = ENOMEM; return (iconv_t)-1; }
+    st->from = f; st->to = t; st->translit = tr; st->ignore = ig;
+    st->from_be = (f == CS_U16BE || f == CS_U32BE); st->from_known = !(f == CS_U16 || f == CS_U32);
+    return (iconv_t)st;
+}
+int iconv_close(iconv_t cd)
+{
+    if (cd == (iconv_t)-1 || !cd) { errno = EBADF; return -1; }
+    free(cd); return 0;
+}
+/* decode one code point: returns bytes used, 0 = incomplete input, -1 = invalid */
+static int cs_decode(IconvState* st, const unsigned char* p, size_t n, uint32_t* cp)
+{
+    switch (st->from)
+    {
+        case CS_ASCII: if (n < 1) return 0; if (p[0] > 0x7F) return -1; *cp = p[0]; return 1;
+        case CS_L1: if (n < 1) return 0; *cp = p[0]; return 1;
+        case CS_UTF8:
+        {
+            if (n < 1) return 0;
+            unsigned c = p[0];
+            if (c < 0x80) { *cp = c; return 1; }
+            int len; uint32_t v, min;
+            if (c >= 0xC2 && c <= 0xDF) { len = 2; v = c & 0x1F; min = 0x80; }
+            else if ((c & 0xF0) == 0xE0) { len = 3; v = c & 0x0F; min = 0x800; }
+            else if (c >= 0xF0 && c <= 0xF4) { len = 4; v = c & 0x07; min = 0x10000; }
+            else return -1;
+            for (int i = 1; i < len; ++i)
+            {
+                if ((size_t)i >= n) return 0;
+                if ((p[i] & 0xC0) != 0x80) return -1;
+                v = (v << 6) | (p[i] & 0x3F);
+            }
+            if (v < min || v > 0x10FFFF || (v >= 0xD800 && v <= 0xDFFF)) return -1;
+            *cp = v; return len;
+        }
+        case CS_U16LE: case CS_U16BE: case CS_U16:
+        {
+            if (n < 2) return 0;
+            if (!st->from_known)
+            {   /* BOM decides the byte order; without one UTF-16 is little endian here */
+                st->from_known = 1;
+                if (p[0] == 0xFE && p[1] == 0xFF) { st->from_be = 1; if (n < 4) { *cp = 0xFEFF; return 2; } }
+                else if (p[0] == 0xFF && p[1] == 0xFE) st->from_be = 0;
+                else st->from_be = 0;
+                if (p[0] == 0xFE && p[1] == 0xFF) return -2;
+                if (p[0] == 0xFF && p[1] == 0xFE) return -2;
+            }
+            uint32_t u = st->from_be ? (uint32_t)(p[0] << 8 | p[1]) : (uint32_t)(p[1] << 8 | p[0]);
+            if (u >= 0xD800 && u <= 0xDBFF)
+            {
+                if (n < 4) return 0;
+                uint32_t l = st->from_be ? (uint32_t)(p[2] << 8 | p[3]) : (uint32_t)(p[3] << 8 | p[2]);
+                if (l < 0xDC00 || l > 0xDFFF) return -1;
+                *cp = 0x10000 + ((u - 0xD800) << 10) + (l - 0xDC00); return 4;
+            }
+            if (u >= 0xDC00 && u <= 0xDFFF) return -1;
+            *cp = u; return 2;
+        }
+        default:
+        {
+            if (n < 4) return 0;
+            if (!st->from_known)
+            {
+                st->from_known = 1;
+                if (p[0] == 0 && p[1] == 0 && p[2] == 0xFE && p[3] == 0xFF) { st->from_be = 1; return -2; }
+                if (p[0] == 0xFF && p[1] == 0xFE && p[2] == 0 && p[3] == 0) { st->from_be = 0; return -2; }
+            }
+            uint32_t u = st->from_be ? ((uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]) : ((uint32_t)p[3] << 24 | p[2] << 16 | p[1] << 8 | p[0]);
+            if (u > 0x10FFFF || (u >= 0xD800 && u <= 0xDFFF)) return -1;
+            *cp = u; return 4;
+        }
+    }
+}
+/* encode one code point into out (capacity cap): returns bytes, 0 = no room, -1 = not representable */
+static int cs_encode(IconvState* st, uint32_t cp, unsigned char* out, size_t cap)
+{
+    switch (st->to)
+    {
+        case CS_ASCII: if (cp > 0x7F) return -1; if (cap < 1) return 0; out[0] = (unsigned char)cp; return 1;
+        case CS_L1: if (cp > 0xFF) return -1; if (cap < 1) return 0; out[0] = (unsigned char)cp; return 1;
+        case CS_UTF8:
+            if (cp < 0x80) { if (cap < 1) return 0; out[0] = (unsigned char)cp; return 1; }
+            if (cp < 0x800) { if (cap < 2) return 0; out[0] = (unsigned char)(0xC0 | cp >> 6); out[1] = (unsigned char)(0x80 | (cp & 0x3F)); return 2; }
+            if (cp < 0x10000) { if (cap < 3) return 0; out[0] = (unsigned char)(0xE0 | cp >> 12); out[1] = (unsigned char)(0x80 | ((cp >> 6) & 0x3F)); out[2] = (unsigned char)(0x80 | (cp & 0x3F)); return 3; }
+            if (cap < 4) return 0;
+            out[0] = (unsigned char)(0xF0 | cp >> 18); out[1] = (unsigned char)(0x80 | ((cp >> 12) & 0x3F)); out[2] = (unsigned char)(0x80 | ((cp >> 6) & 0x3F)); out[3] = (unsigned char)(0x80 | (cp & 0x3F)); return 4;
+        case CS_U16LE: case CS_U16BE: case CS_U16:
+        {
+            int be = st->to == CS_U16BE; int need = cp >= 0x10000 ? 4 : 2; int bom = (st->to == CS_U16 && !st->bom_out_done) ? 2 : 0;
+            if (cap < (size_t)(need + bom)) return 0;
+            int o = 0;
+            if (bom) { out[0] = 0xFF; out[1] = 0xFE; o = 2; st->bom_out_done = 1; }
+            uint32_t u[2]; int nu;
+            if (cp >= 0x10000) { uint32_t v = cp - 0x10000; u[0] = 0xD800 + (v >> 10); u[1] = 0xDC00 + (v & 0x3FF); nu = 2; } else { u[0] = cp; nu = 1; }
+            for (int i = 0; i < nu; ++i) { if (be) { out[o++] = (unsigned char)(u[i] >> 8); out[o++] = (unsigned char)u[i]; } else { out[o++] = (unsigned char)u[i]; out[o++] = (unsigned char)(u[i] >> 8); } }
+            return o;
+        }
+        default:
+        {
+            int be = st->to == CS_U32BE; int bom = (st->to == CS_U32 && !st->bom_out_done) ? 4 : 0;
+            if (cap < (size_t)(4 + bom)) return 0;
+            int o = 0;
+            if (bom) { out[0] = 0xFF; out[1] = 0xFE; out[2] = 0; out[3] = 0; o = 4; st->bom_out_done = 1; }
+            if (be) { out[o++] = (unsigned char)(cp >> 24); out[o++] = (unsigned char)(cp >> 16); out[o++] = (unsigned char)(cp >> 8); out[o++] = (unsigned char)cp; }
+            else { out[o++] = (unsigned char)cp; out[o++] = (unsigned char)(cp >> 8); out[o++] = (unsigned char)(cp >> 16); out[o++] = (unsigned char)(cp >> 24); }
+            return o;
+        }
+    }
+}
+size_t iconv(iconv_t cd, char** inbuf, size_t* inleft, char** outbuf, size_t* outleft)
+{
+    if (cd == (iconv_t)-1 || !cd) { errno = EBADF; return (size_t)-1; }
+    IconvState* st = (IconvState*)cd;
+    if (!inbuf || !*inbuf)
+    {   /* reset the shift state; emit nothing more (the encodings here are stateless apart from the BOM) */
+        st->bom_out_done = 0; st->from_known = !(st->from == CS_U16 || st->from == CS_U32); return 0;
+    }
+    size_t irrev = 0;
+    while (*inleft > 0)
+    {
+        uint32_t cp = 0;
+        int used = cs_decode(st, (const unsigned char*)*inbuf, *inleft, &cp);
+        if (used == -2) { *inbuf += (st->from == CS_U16 ? 2 : 4); *inleft -= (st->from == CS_U16 ? 2 : 4); continue; }   /* consumed a BOM */
+        if (used == 0) { errno = EINVAL; return (size_t)-1; }
+        if (used < 0)
+        {
+            if (st->ignore) { *inbuf += 1; *inleft -= 1; ++irrev; continue; }
+            errno = EILSEQ; return (size_t)-1;
+        }
+        unsigned char tmp[8];
+        int w = cs_encode(st, cp, tmp, sizeof(tmp));
+        if (w < 0)
+        {
+            if (st->translit) { cp = '?'; w = cs_encode(st, cp, tmp, sizeof(tmp)); ++irrev; }
+            else if (st->ignore) { *inbuf += used; *inleft -= (size_t)used; ++irrev; continue; }
+            else { errno = EILSEQ; return (size_t)-1; }
+        }
+        if (w == 0 || (size_t)w > *outleft) { errno = E2BIG; return (size_t)-1; }
+        if (st->to == CS_U16 || st->to == CS_U32) { /* cs_encode already inserted the BOM into tmp when due */ }
+        memcpy(*outbuf, tmp, (size_t)w);
+        *outbuf += w; *outleft -= (size_t)w; *inbuf += used; *inleft -= (size_t)used;
+    }
+    return irrev;
 }

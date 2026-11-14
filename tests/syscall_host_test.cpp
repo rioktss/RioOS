@@ -79,6 +79,24 @@ int ed25519_verify(const uint8_t*, const uint8_t*, uint64_t, const uint8_t*) { r
 int random_ready() { return 1; }
 void tls_random(uint8_t* o, uint32_t n) { for (uint32_t i = 0; i < n; ++i) o[i] = (uint8_t)(i * 31 + 7); }
 int fs_set_mtime_path(const char*, int, uint64_t) { return 0; }
+uint32_t net_tcp_gen(int, int) { return 0; }
+uint32_t net_udp_gen(int, int) { return 0; }
+uint64_t process_rlimit_cur(int, int) { return ~0ULL; }
+int process_sig_raise(int, int) { return 0; }
+uint32_t process_sig_pending_raw(int) { return 0; }
+uint32_t process_sig_serial(int) { return 0; }
+int process_sig_take_set(int, uint32_t) { return 0; }
+int process_sig_info_get(int, int, int*, int*, uint64_t*) { return 0; }
+int process_set_in_syscall_dummy;
+void process_set_in_syscall(int, int) {}
+int process_rlimit_get(int, int, uint64_t* c, uint64_t* m) { if (c) *c = ~0ULL; if (m) *m = ~0ULL; return 0; }
+int process_rlimit_set(int, int, uint64_t, uint64_t, int) { return 0; }
+int process_is_user(int) { return 1; }
+int process_set_cpu_mask(int, uint32_t) { return 0; }
+uint32_t process_cpu_mask(int) { return 0; }
+int process_rusage(int, int, uint64_t o[4]) { o[0] = o[1] = o[2] = o[3] = 0; return 0; }
+void (*fs_event_hook)(int, int, const char*, uint32_t, uint32_t) = 0;
+int fs_resolve_nofollow(const char*, int) { return -1; }
 #include "tty.h"
 int64_t tty_read(uint8_t* buf, uint64_t len) { uint64_t g = 0; while (g < len) { int c = uart_try_getc(); if (c < 0) break; buf[g++] = (uint8_t)c; } return (int64_t)g; }
 int uart_has_data();

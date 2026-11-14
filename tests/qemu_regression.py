@@ -320,7 +320,10 @@ check("smp-scheduler", log, "smptest done fails=0", "PASS work-spreads-across-cp
 if "FAIL " in log:
     fails += 1; total += 1; print("  FAIL  smp-scheduler: a FAIL line was printed")
 log = run(C("su", "123", "posixtest"), wait=150)
-check("posix-libc", log, "posixtest done fails=0", "PASS rx-backref", "PASS epoll-edge-reports-once", "PASS futex-wake-cross-process", "PASS sem-wait-cross-process", "PASS flock-blocks-until-released", "PASS tcsetattr-raw", "PASS glob-star", "PASS getopt_long")
+check("posix-libc", log, "posixtest done fails=0", "PASS rx-backref", "PASS epoll-edge-reports-once", "PASS futex-wake-cross-process", "PASS sem-wait-cross-process", "PASS flock-blocks-until-released", "PASS tcsetattr-raw", "PASS glob-star", "PASS getopt_long",
+      "PASS epoll-edge-new-data-without-read", "PASS epoll-edge-unix-socket", "PASS rlimit-nofile-enforced", "PASS rlimit-fsize-enforced", "PASS rlimit-fsize-sigxfsz-kills", "PASS rlimit-as-enforced",
+      "PASS rlimit-cpu-sigxcpu", "PASS rlimit-cpu-hard-kills", "PASS rlimit-raise-needs-root", "PASS getrusage-self-cpu", "PASS getrusage-children", "PASS setaffinity-ok", "PASS signalfd-read", "PASS signalfd-blocking-read",
+      "PASS inotify-create-modify", "PASS inotify-rename-pair", "PASS inotify-delete-self-ignored", "PASS inotify-blocking-read", "PASS iconv-utf8-to-utf16le", "PASS iconv-translit", "PASS iconv-e2big")
 if "FAIL " in log:
     fails += 1; total += 1; print("  FAIL  posix-libc: a FAIL line was printed")
 log = run(C("su", "123", "sigtest"), wait=60)

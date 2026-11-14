@@ -28,6 +28,7 @@
 #include "timer.h"
 #include "uart.h"
 #include "smp.h"
+#include "process.h"
 
 /* Slots THREAD_MAX..THREAD_TOTAL-1 are the per-CPU idle contexts of the secondary CPUs; they are never picked from the pool. */
 #define THREAD_TOTAL (THREAD_MAX + SMP_MAX_CPUS)
@@ -150,6 +151,7 @@ static int pick_smp(int cpu, int cu)
         int st = sched[i].state;
         if (st != SCHED_READY && !(st == SCHED_RUNNING && i == cu)) continue;
         if (i == 0 && cpu != 0) continue;
+        if (tpid[i] >= 0) { uint32_t cm = process_cpu_mask(tpid[i]); if (cm && !(cm & (1U << cpu))) continue; }   /* sched_setaffinity */
         uint32_t prio = sched_effective_priority(&sched[i]);
         if (best < 0 || prio > best_prio) { best = i; best_prio = prio; }
     }
@@ -359,6 +361,7 @@ void thread_timer_tick()
         return;
 
     ++run_ticks[current];
+    if (tpid[current] >= 0) process_account_tick(tpid[current], 1000U / 100U);   /* 100 Hz tick (timer_start_periodic(100U)) */
 
     /* Age every waiting thread; the running one resets. */
     sched_account(sched, THREAD_MAX, current);

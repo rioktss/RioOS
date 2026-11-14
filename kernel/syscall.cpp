@@ -185,7 +185,25 @@ static FutexWaiter futex_waiters[FUTEX_MAX];
 struct PollFdK { int32_t fd; short events; short revents; };
 #define SYS_POLL_MAX 64
 
+static void syscall_dispatch_inner(ExceptionFrame* frame, int from_user);
+/* RLIMIT_AS / RLIMIT_DATA: the dynamic part of the address space (heap + mmap area) may not grow past the limit */
+__attribute__((unused)) static int as_limit_ok(int me, uint64_t extra)
+{
+    uint64_t lim = process_rlimit_cur(me, PROC_RLIMIT_AS), ld = process_rlimit_cur(me, PROC_RLIMIT_DATA);
+    if (ld < lim) lim = ld;
+    if (lim == PROC_RLIM_INF) return 1;
+    return mmu_user_vsize(me) + ((extra + 4095ULL) & ~4095ULL) <= lim;
+}
 void syscall_dispatch(ExceptionFrame* frame, int from_user)
+{
+    /* system time accounting: timer ticks that land while the process is inside a system call are charged as "sys" */
+    int me = from_user ? user_current_pid() : -1;
+    if (me >= 0) process_set_in_syscall(me, 1);
+    syscall_dispatch_inner(frame, from_user);
+    if (me >= 0) process_set_in_syscall(me, 0);
+}
+
+static void syscall_dispatch_inner(ExceptionFrame* frame, int from_user)
 {
     if (frame == 0) return;
 
@@ -1176,6 +1194,41 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
             break;
         }
 
+        case SYS_FDGEN:
+        {
+            if (select_fd_owner(from_user) != 0) { result = (uint64_t)-24; break; }
+            int fdn = frame->x[0] < FD_MAX_DESCRIPTORS ? (int)frame->x[0] : -1;
+            result = (uint64_t)fd_poll_gen(fdn);
+            break;
+        }
+
+        case SYS_SIGNALFD:
+        {
+            if (!from_user) { result = (uint64_t)-38; break; }
+            if (select_fd_owner(from_user) != 0) { result = (uint64_t)-24; break; }
+            int64_t fdn = (int64_t)frame->x[0];
+            if (fdn >= (int64_t)FD_MAX_DESCRIPTORS || fdn < -1) { result = (uint64_t)-9; break; }
+            result = (uint64_t)(int64_t)fd_signalfd((int)fdn, (uint32_t)frame->x[1], (int)frame->x[2]);
+            break;
+        }
+
+        case SYS_INOTIFY:
+        {
+            if (!from_user) { result = (uint64_t)-38; break; }
+            if (select_fd_owner(from_user) != 0) { result = (uint64_t)-24; break; }
+            if (frame->x[0] == 0) { result = (uint64_t)(int64_t)fd_inotify_init((int)frame->x[1]); break; }
+            int fdn = frame->x[1] < FD_MAX_DESCRIPTORS ? (int)frame->x[1] : -1;
+            if (frame->x[0] == 1)
+            {
+                char path[SYSCALL_PATH_MAX];
+                if (copy_path((const char*)frame->x[2], path, from_user) != 0) { result = (uint64_t)-14; break; }
+                result = (uint64_t)(int64_t)fd_inotify_add_watch(fdn, path, (uint32_t)frame->x[3], ucwd(from_user));
+            }
+            else if (frame->x[0] == 2) result = (uint64_t)(int64_t)fd_inotify_rm_watch(fdn, (int)frame->x[2]);
+            else result = (uint64_t)-22;
+            break;
+        }
+
         case SYS_EVENTFD:
         {
             if (select_fd_owner(from_user) != 0) { result = (uint64_t)-24; break; }
@@ -1507,6 +1560,61 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
             break;
         }
 
+        case SYS_RLIMIT:
+        {
+            if (!from_user) { result = (uint64_t)-38; break; }
+            int me = user_current_pid();
+            int res = (int)frame->x[1];
+            if (frame->x[0] == 0)
+            {
+                uint64_t* out = (uint64_t*)frame->x[4];
+                if (!out || !syscall_user_pointer_ok_write(out, 16)) { result = (uint64_t)-14; break; }
+                uint64_t c = 0, m = 0;
+                int rc = process_rlimit_get(me, res, &c, &m);
+                if (rc == 0) { out[0] = c; out[1] = m; }
+                result = (uint64_t)(int64_t)rc;
+            }
+            else
+            {
+                int rc = process_rlimit_set(me, res, frame->x[2], frame->x[3], process_uid(me) == 0);
+                result = (uint64_t)(int64_t)(rc == -1 ? -1 : rc);          /* -1 = EPERM, -22 = EINVAL */
+            }
+            break;
+        }
+
+        case SYS_AFFINITY:
+        {
+            if (!from_user) { result = (uint64_t)-38; break; }
+            int me = user_current_pid();
+            int target = (int)frame->x[1] == 0 ? me : (int)frame->x[1];
+#ifdef HOST_TEST
+            uint32_t ncpu = 1;
+#else
+            uint32_t ncpu = smp_sched_on ? smp_online_cpu_count() : 1U;
+#endif
+            uint32_t all = ncpu >= 32 ? 0xFFFFFFFFU : ((1U << ncpu) - 1U);
+            if (!process_is_user(target)) { result = (uint64_t)-3; break; }            /* ESRCH */
+            if (frame->x[0] == 0) { uint32_t m = process_cpu_mask(target); result = m ? (m & all) : all; break; }
+            if (target != me && process_uid(me) != 0 && process_uid(me) != process_uid(target)) { result = (uint64_t)-1; break; }   /* EPERM */
+            uint32_t want = (uint32_t)frame->x[2] & all;
+            if (want == 0) { result = (uint64_t)-22; break; }
+            (void)process_set_cpu_mask(target, want == all ? 0U : want);
+            result = 0;
+            break;
+        }
+
+        case SYS_RUSAGE:
+        {
+            if (!from_user) { result = (uint64_t)-38; break; }
+            uint64_t* out = (uint64_t*)frame->x[1];
+            if (!out || !syscall_user_pointer_ok_write(out, 32)) { result = (uint64_t)-14; break; }
+            uint64_t v[4] = {0, 0, 0, 0};
+            int rc = process_rusage(user_current_pid(), frame->x[0] != 0, v);
+            if (rc == 0) { for (int i = 0; i < 4; ++i) out[i] = v[i]; }
+            result = (uint64_t)(int64_t)rc;
+            break;
+        }
+
         case SYS_TTY:
         {
             uint64_t op = frame->x[0];
@@ -1644,6 +1752,16 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
         case SYS_FORK:
         {
             if (!from_user) { result = (uint64_t)-38; break; }
+            {
+                int me = user_current_pid();
+                uint64_t lim = process_rlimit_cur(me, PROC_RLIMIT_NPROC);
+                if (lim != PROC_RLIM_INF && process_uid(me) != 0)
+                {
+                    uint64_t mine = 0;
+                    for (int s = 0; s < 64; ++s) { int q = process_pid_at(s); if (q >= 0 && process_is_user(q) && process_get_state(q) != PROCESS_ZOMBIE && process_uid(q) == process_uid(me)) ++mine; }
+                    if (mine >= lim) { result = (uint64_t)-11; break; }       /* EAGAIN */
+                }
+            }
             result = (uint64_t)(int64_t)task_fork(frame);
             break;
         }
@@ -1838,6 +1956,15 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
         {
             if (!from_user) { result = (uint64_t)-38; break; }
             uint64_t out = 0;
+            {
+                int me = user_current_pid();
+                uint64_t lim = process_rlimit_cur(me, PROC_RLIMIT_AS), ld = process_rlimit_cur(me, PROC_RLIMIT_DATA);
+                if (ld < lim) lim = ld;
+                uint64_t curbrk = 0;
+                if (lim != PROC_RLIM_INF && frame->x[0] != 0 && mmu_user_brk(me, 0, &curbrk) == 0 && frame->x[0] > curbrk &&
+                    mmu_user_vsize(me) + (frame->x[0] - curbrk) > lim)
+                { result = (uint64_t)(int64_t)-12; break; }
+            }
             int rc = mmu_user_brk(user_current_pid(), frame->x[0], &out);
             result = rc == 0 ? out : (uint64_t)(int64_t)-12;
             break;
@@ -1852,6 +1979,7 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
             int64_t fdn = (int64_t)frame->x[2];
             uint64_t off = frame->x[3];
             if (length == 0 || length > (4ULL << 20)) { result = (uint64_t)-22; break; }
+            if (!as_limit_ok(me, length)) { result = (uint64_t)-12; break; }
             uint64_t base = 0;
             uint32_t map_prot = (fdn >= 0) ? (prot | MMU_USER_WRITE) & ~MMU_USER_EXEC : prot;
             int rc = mmu_user_mmap(me, length, map_prot, &base);
@@ -1891,6 +2019,7 @@ void syscall_dispatch(ExceptionFrame* frame, int from_user)
             if (mflags & MAP_FIXED_FLAG) { result = (uint64_t)-22; break; }          /* MAP_FIXED is not supported */
             if (length == 0 || length > (4ULL << 20) || prot == 0 || (prot & ~7U) != 0) { result = (uint64_t)-22; break; }
             if ((mflags & MAP_SHARED_FLAG) != 0 && (mflags & MAP_PRIVATE_FLAG) != 0) { result = (uint64_t)-22; break; }
+            if (!as_limit_ok(me, length)) { result = (uint64_t)-12; break; }
             if ((mflags & MAP_SHARED_FLAG) == 0)
             {
                 /* private: same as the legacy mapping call */

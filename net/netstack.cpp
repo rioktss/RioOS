@@ -164,6 +164,7 @@ struct UdpSocketState
     uint16_t queue_head;
     uint16_t queue_count;
     uint32_t dropped;
+    uint32_t evgen;
     UdpDatagram queue[UDP_QUEUE_DEPTH];
 };
 
@@ -184,6 +185,7 @@ struct TcpSocketState
     uint32_t rcv_nxt;
     uint16_t rx_head;
     uint16_t rx_count;
+    uint32_t evgen;                     /* bumped on data, FIN, RST and queued connections (epoll EPOLLET) */
     uint8_t parent;                     /* listener handle for a not-yet-accepted child (0 = none) */
     uint8_t accept_count;
     uint8_t accept_q[TCP_ACCEPT_QUEUE];
@@ -507,7 +509,7 @@ static void udp_input(uint32_t source_ip, uint32_t dest_ip,
         packet->length = (uint16_t)(udp_length - UDP_HEADER_SIZE);
         for (uint32_t n = 0; n < packet->length; ++n)
             packet->payload[n] = bytes[UDP_HEADER_SIZE + n];
-        ++socket->queue_count;
+        ++socket->queue_count; ++socket->evgen;
         return; /* ports are exclusive: exactly one socket receives a packet */
     }
 }
@@ -1038,7 +1040,7 @@ static void tcp_input(const uint8_t* src6, uint32_t source_ip, uint32_t dest_ip,
     {
         if (socket->parent) { socket->used = 0; socket->state = TCP_STATE_CLOSED; socket->parent = 0; return; }
         if (!socket->peer_closed) socket->state = TCP_STATE_RESET;   /* RST after the peer's FIN: the stream already ended cleanly */
-        socket->peer_closed = 1;
+        socket->peer_closed = 1; ++socket->evgen;
         return;
     }
 
@@ -1056,7 +1058,7 @@ static void tcp_input(const uint8_t* src6, uint32_t source_ip, uint32_t dest_ip,
             TcpSocketState* listener = socket->parent ? &tcp_sockets[socket->parent - 1U] : 0;
             if (listener && listener->used && listener->state == TCP_STATE_LISTEN && listener->accept_count < TCP_ACCEPT_QUEUE)
             {
-                listener->accept_q[listener->accept_count++] = (uint8_t)((socket - tcp_sockets) + 1);
+                listener->accept_q[listener->accept_count++] = (uint8_t)((socket - tcp_sockets) + 1); ++listener->evgen;
                 socket->parent = 0;
             }
             else { socket->used = 0; socket->state = TCP_STATE_CLOSED; socket->parent = 0; return; }
@@ -1098,7 +1100,7 @@ static void tcp_input(const uint8_t* src6, uint32_t source_ip, uint32_t dest_ip,
             for (uint32_t i = 0; i < payload_length; ++i)
                 socket->rx_buffer[(tail + i) % TCP_RX_BUFFER_SIZE] = bytes[header_length + i];
             socket->rx_count = (uint16_t)(socket->rx_count + payload_length);
-            socket->rcv_nxt += payload_length;
+            socket->rcv_nxt += payload_length; ++socket->evgen;
             accepted_payload = 1;
         }
         should_ack = 1; /* ACK duplicates/out-of-order data to request the expected byte. */
@@ -1109,7 +1111,7 @@ static void tcp_input(const uint8_t* src6, uint32_t source_ip, uint32_t dest_ip,
         uint32_t fin_position = sequence + payload_length;
         if ((accepted_payload || payload_length == 0) && fin_position == socket->rcv_nxt)
         {
-            ++socket->rcv_nxt;
+            ++socket->rcv_nxt; ++socket->evgen;
             socket->peer_closed = 1;
             if (socket->state == TCP_STATE_FIN_WAIT) socket->state = TCP_STATE_CLOSED;
             else if (socket->state == TCP_STATE_ESTABLISHED) socket->state = TCP_STATE_CLOSE_WAIT;
@@ -1422,6 +1424,17 @@ int net_tcp_poll(int owner_pid, int socket_handle)
     if (socket->state == TCP_STATE_CLOSED) m |= 4 | 16;
     if (socket->peer_closed && socket->fin_sent) m |= 16;
     return m;
+}
+
+uint32_t net_tcp_gen(int owner_pid, int socket_handle)
+{
+    TcpSocketState* socket = tcp_get_socket(owner_pid, socket_handle);
+    return socket ? socket->evgen : 0;
+}
+uint32_t net_udp_gen(int owner_pid, int socket_handle)
+{
+    UdpSocketState* socket = udp_get_socket(owner_pid, socket_handle);
+    return socket ? socket->evgen : 0;
 }
 
 int net_udp_poll(int owner_pid, int socket_handle)

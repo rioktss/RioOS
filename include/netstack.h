@@ -67,6 +67,8 @@ int net_tcp_close(int owner_pid, int socket_handle);
 void net_tcp_close_all_for(int owner_pid);
 int net_tcp_poll(int owner_pid, int socket_handle);   /* Linux poll bits: IN 1, OUT 4, ERR 8, HUP 16, NVAL 32 */
 int net_udp_poll(int owner_pid, int socket_handle);
+uint32_t net_tcp_gen(int owner_pid, int socket_handle);   /* arrival counter for EPOLLET */
+uint32_t net_udp_gen(int owner_pid, int socket_handle);
 int net_tcp_shutdown_wr(int owner_pid, int socket_handle);
 int net_tcp_info(int owner_pid, int socket_handle, uint32_t* remote_ip, uint16_t* remote_port, uint16_t* local_port);
 int net_udp_local_port(int owner_pid, int socket_handle);

@@ -120,6 +120,30 @@ int process_sig_clear_all(int pid);
 /* alarm(): returns the previous remaining milliseconds; ms == 0 cancels */
 uint64_t process_alarm_set(int pid, uint64_t ms, uint64_t now);
 void process_alarm_check(int pid, uint64_t now);
+/* resource limits (setrlimit): resource numbers are the Linux ones; values are bytes / seconds / counts, ~0 = unlimited */
+#define PROC_RLIMIT_CPU 0
+#define PROC_RLIMIT_FSIZE 1
+#define PROC_RLIMIT_DATA 2
+#define PROC_RLIMIT_STACK 3
+#define PROC_RLIMIT_CORE 4
+#define PROC_RLIMIT_RSS 5
+#define PROC_RLIMIT_NPROC 6
+#define PROC_RLIMIT_NOFILE 7
+#define PROC_RLIMIT_MEMLOCK 8
+#define PROC_RLIMIT_AS 9
+#define PROC_RLIMIT_N 10
+#define PROC_RLIM_INF (~0ULL)
+int process_rlimit_get(int pid, int res, uint64_t* cur, uint64_t* max);
+uint64_t process_rlimit_cur(int pid, int res);                       /* PROC_RLIM_INF when unknown */
+int process_rlimit_set(int pid, int res, uint64_t cur, uint64_t max, int privileged);   /* -22, -1 EPERM, -3 */
+int process_rlimit_inherit(int parent, int child);                   /* fork: limits and CPU mask */
+void process_set_in_syscall(int pid, int v);
+void process_account_tick(int pid, uint64_t ms);                     /* timer tick: user/sys time + RLIMIT_CPU */
+int process_rusage(int pid, int children, uint64_t out[4]);          /* user_ms, sys_ms, 0, voluntary switches */
+void process_count_switch(int pid);
+uint32_t process_sig_serial(int pid);                                 /* number of signals raised so far */
+uint32_t process_cpu_mask(int pid);                                  /* 0 = no restriction */
+int process_set_cpu_mask(int pid, uint32_t mask);
 int process_set_creds(int pid, uint32_t uid, uint32_t gid);
 uint32_t process_uid(int pid);
 uint32_t process_gid(int pid);

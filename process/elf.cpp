@@ -38,7 +38,7 @@
 #define PF_X             1U
 #define PF_W             2U
 #define PF_R             4U
-#define MAX_ELF_SIZE    (256ULL * 1024ULL)
+#define MAX_ELF_SIZE    (512ULL * 1024ULL)
 #define MAX_PHDRS       32
 
 struct __attribute__((packed)) Elf64_Ehdr

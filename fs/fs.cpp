@@ -2424,13 +2424,47 @@ static void ctx_rel_path(int c, int loc, char* out, int cap)
     out[p] = 0;
 }
 
+/* ---- change notification (see fs.h): events are computed from the public, mount-aware layer ---- */
+void (*fs_event_hook)(int dir, int node, const char* name, uint32_t mask, uint32_t cookie) = 0;
+static uint32_t ev_cookie_next = 1;
+struct EvSnap { int id; int parent; int isdir; int links; char name[FS_NAME_SIZE]; };
+static void ev_snap_id(int id, EvSnap* s)
+{
+    s->id = id; s->parent = -1; s->isdir = 0; s->links = 1; s->name[0] = 0;
+    if (id < 0 || !gid_ok(id)) { s->id = -1; return; }
+    s->parent = fs_get_parent(id); s->isdir = fs_get_type(id) == FS_DIR; s->links = fs_link_count(id);
+    str_copy(s->name, fs_get_name(id), FS_NAME_SIZE);
+}
+static void ev_snap(const char* path, int cwd, int follow, EvSnap* s)
+{
+    ev_snap_id(follow ? fs_resolve(path, cwd) : fs_resolve_nofollow(path, cwd), s);
+}
+static int ev_alive(const EvSnap* s)
+{
+    return s->id >= 0 && gid_ok(s->id) && fs_get_parent(s->id) == s->parent && str_equal(fs_get_name(s->id), s->name);
+}
+static void ev_emit(const EvSnap* s, uint32_t mask, uint32_t cookie)
+{
+    if (!fs_event_hook || s->id < 0) return;
+    fs_event_hook(s->parent, s->id, s->name, mask | (s->isdir ? 0x40000000U : 0U), cookie);
+}
+static void ev_created(const char* path, int cwd) { if (!fs_event_hook) return; EvSnap s; ev_snap(path, cwd, 0, &s); ev_emit(&s, 0x100U, 0); }
+static void ev_changed(const char* path, int cwd, uint32_t mask) { if (!fs_event_hook) return; EvSnap s; ev_snap(path, cwd, 1, &s); ev_emit(&s, mask, 0); }
+static void ev_removed(const EvSnap* s)
+{
+    if (!fs_event_hook || s->id < 0) return;
+    ev_emit(s, 0x200U, 0);                                              /* IN_DELETE in the parent directory */
+    if (s->links > 1 && !s->isdir) { EvSnap t = *s; ev_emit(&t, 4U, 0); }   /* other hard links remain: only IN_ATTRIB */
+    else ev_emit(s, 0x400U, 0);                                         /* IN_DELETE_SELF */
+}
+
 int fs_check_access_as(int id, uint32_t uid, uint32_t gid, uint32_t requested)
 { if (!gid_ok(id)) return -2; act(id >> 12); return fs_check_access_as_impl(id & 0xFFF, uid, gid, requested); }
 int fs_check_access(int id, uint32_t requested) { return fs_check_access_as(id, current_uid, current_gid, requested); }
 int fs_get_root() { return 0; }
 int fs_resolve(const char* path, int cwd) { Route r; route(path, cwd, &r, 1, 1); int v = fs_resolve_impl(r.rest, r.cwd); return enc(r.ctx, v); }
 int fs_resolve_nofollow(const char* path, int cwd) { Route r; route(path, cwd, &r, 1); int v = fs_resolve_nofollow_impl(r.rest, r.cwd); return enc(r.ctx, v); }
-int fs_symlink(const char* target, const char* linkpath, int cwd) { Route r; route(linkpath, cwd, &r, 0); int v = fs_symlink_impl(target, r.rest, r.cwd); return enc(r.ctx, v); }
+int fs_symlink(const char* target, const char* linkpath, int cwd) { Route r; route(linkpath, cwd, &r, 0); int v = fs_symlink_impl(target, r.rest, r.cwd); int g = enc(r.ctx, v); if (g >= 0) ev_created(linkpath, cwd); return g; }
 int fs_readlink(const char* path, int cwd, char* out, int cap) { Route r; route(path, cwd, &r, 1); return fs_readlink_impl(r.rest, r.cwd, out, cap); }
 int fs_link_target_of(int id, char* out, int cap) { if (!gid_ok(id)) return -1; act(id >> 12); return fs_link_target_of_impl(id & 0xFFF, out, cap); }
 void fs_set_readonly(int ro) { act(0); fs_set_readonly_impl(ro); }
@@ -2444,18 +2478,62 @@ int fs_sync()
 }
 void fs_journal_status(FsJournalInfo* out) { act(0); fs_journal_status_impl(out); }
 int fs_journal_crash_test(const char* path, int cwd) { Route r; route(path, cwd, &r, 0); return fs_journal_crash_test_impl(r.rest, r.cwd); }
-int fs_mkdir(const char* path, int cwd) { Route r; route(path, cwd, &r, 0); int v = fs_mkdir_impl(r.rest, r.cwd); return enc(r.ctx, v); }
-int fs_touch(const char* path, int cwd) { Route r; route(path, cwd, &r, 0); int v = fs_touch_impl(r.rest, r.cwd); return enc(r.ctx, v); }
-int fs_mkdir_p(const char* path, int cwd) { Route r; route(path, cwd, &r, 0); int v = fs_mkdir_p_impl(r.rest, r.cwd); return enc(r.ctx, v); }
-int fs_write_data(const char* path, int cwd, const uint8_t* data, uint64_t size) { Route r; route(path, cwd, &r, 0, 1); return fs_write_data_impl(r.rest, r.cwd, data, size); }
-int fs_write(const char* path, int cwd, const char* content) { Route r; route(path, cwd, &r, 0, 1); return fs_write_impl(r.rest, r.cwd, content); }
+int fs_mkdir(const char* path, int cwd) { Route r; route(path, cwd, &r, 0); int v = fs_mkdir_impl(r.rest, r.cwd); int g = enc(r.ctx, v); if (g >= 0) ev_created(path, cwd); return g; }
+int fs_touch(const char* path, int cwd)
+{
+    int existed = fs_event_hook ? fs_resolve_nofollow(path, cwd) >= 0 : 0;
+    Route r; route(path, cwd, &r, 0); int v = fs_touch_impl(r.rest, r.cwd); int g = enc(r.ctx, v);
+    if (g >= 0) { if (existed) ev_changed(path, cwd, 4U); else ev_created(path, cwd); }
+    return g;
+}
+int fs_mkdir_p(const char* path, int cwd)
+{
+    int existed = fs_event_hook ? fs_resolve_nofollow(path, cwd) >= 0 : 1;
+    Route r; route(path, cwd, &r, 0); int v = fs_mkdir_p_impl(r.rest, r.cwd); int g = enc(r.ctx, v);
+    if (g >= 0 && !existed) ev_created(path, cwd);
+    return g;
+}
+int fs_write_data(const char* path, int cwd, const uint8_t* data, uint64_t size)
+{
+    int existed = fs_event_hook ? fs_resolve(path, cwd) >= 0 : 1;
+    Route r; route(path, cwd, &r, 0, 1); int rc = fs_write_data_impl(r.rest, r.cwd, data, size);
+    if (rc == 0 && fs_event_hook) { if (!existed) ev_created(path, cwd); if (existed || size) ev_changed(path, cwd, 2U); }
+    return rc;
+}
+int fs_write(const char* path, int cwd, const char* content)
+{
+    int existed = fs_event_hook ? fs_resolve(path, cwd) >= 0 : 1;
+    Route r; route(path, cwd, &r, 0, 1); int rc = fs_write_impl(r.rest, r.cwd, content);
+    if (rc == 0 && fs_event_hook) { if (!existed) ev_created(path, cwd); if (existed || (content && content[0])) ev_changed(path, cwd, 2U); }
+    return rc;
+}
 int fs_read_file(const char* path, int cwd, uint8_t* buffer, uint64_t capacity, uint64_t* out_size) { Route r; route(path, cwd, &r, 1, 1); return fs_read_file_impl(r.rest, r.cwd, buffer, capacity, out_size); }
 int fs_read_file_for_update(const char* path, int cwd, uint8_t* buffer, uint64_t capacity, uint64_t* out_size) { Route r; route(path, cwd, &r, 1, 1); return fs_read_file_for_update_impl(r.rest, r.cwd, buffer, capacity, out_size); }
 int fs_cat(const char* path, int cwd) { Route r; route(path, cwd, &r, 1, 1); return fs_cat_impl(r.rest, r.cwd); }
 int fs_cat_numbered(const char* path, int cwd) { Route r; route(path, cwd, &r, 1, 1); return fs_cat_numbered_impl(r.rest, r.cwd); }
-int fs_rm(const char* path, int cwd) { Route r; route(path, cwd, &r, 1); return fs_rm_impl(r.rest, r.cwd); }
-int fs_rm_recursive(const char* path, int cwd) { Route r; route(path, cwd, &r, 1); return fs_rm_recursive_impl(r.rest, r.cwd); }
-int fs_rename(const char* from, const char* to, int cwd)
+int fs_rm(const char* path, int cwd)
+{
+    EvSnap s; s.id = -1; if (fs_event_hook) ev_snap(path, cwd, 0, &s);
+    Route r; route(path, cwd, &r, 1); int rc = fs_rm_impl(r.rest, r.cwd);
+    if (rc == 0 && s.id >= 0) { if (!ev_alive(&s)) ev_removed(&s); }
+    return rc;
+}
+#define EV_TREE_MAX 96
+static void ev_collect(int id, EvSnap* out, int* n, int depth)
+{
+    if (*n >= EV_TREE_MAX || depth > 12) return;
+    if (fs_get_type(id) == FS_DIR) { int c = fs_get_child_count(id); for (int i = 0; i < c; ++i) { int ch = fs_get_child(id, i); if (ch >= 0) ev_collect(ch, out, n, depth + 1); } }
+    ev_snap_id(id, &out[(*n)++]);                                       /* children first, like the order of deletion */
+}
+int fs_rm_recursive(const char* path, int cwd)
+{
+    static EvSnap tree[EV_TREE_MAX]; int nt = 0;
+    if (fs_event_hook) { int id = fs_resolve_nofollow(path, cwd); if (id >= 0) ev_collect(id, tree, &nt, 0); }
+    Route r; route(path, cwd, &r, 1); int rc = fs_rm_recursive_impl(r.rest, r.cwd);
+    for (int i = 0; i < nt; ++i) if (tree[i].id >= 0 && !ev_alive(&tree[i])) ev_removed(&tree[i]);
+    return rc;
+}
+static int fs_rename_core(const char* from, const char* to, int cwd)
 {
     Route a, b;
     route(from, cwd, &a, 1);
@@ -2475,6 +2553,21 @@ int fs_rename(const char* from, const char* to, int cwd)
     fb[p] = 0;
     act(a.ctx);
     return fs_rename_impl(fa, fb, 0);
+}
+int fs_rename(const char* from, const char* to, int cwd)
+{
+    EvSnap src, dst; src.id = dst.id = -1;
+    if (fs_event_hook) { ev_snap(from, cwd, 0, &src); ev_snap(to, cwd, 0, &dst); }
+    int rc = fs_rename_core(from, to, cwd);
+    if (rc == 0 && src.id >= 0 && fs_event_hook)
+    {
+        EvSnap now; ev_snap(to, cwd, 0, &now);
+        if (dst.id >= 0 && dst.id != src.id && !ev_alive(&dst)) { EvSnap d = dst; ev_emit(&d, 0x400U, 0); }   /* replaced target is gone */
+        uint32_t ck = ev_cookie_next++;
+        ev_emit(&src, 0x40U, ck);                                       /* IN_MOVED_FROM (old directory, old name) */
+        if (now.id >= 0) { ev_emit(&now, 0x80U, ck); ev_emit(&now, 0x800U, 0); }   /* IN_MOVED_TO, IN_MOVE_SELF */
+    }
+    return rc;
 }
 int fs_rename_replace(const char* from, const char* to, int cwd)
 {
@@ -2506,16 +2599,17 @@ uint32_t fs_get_mode(int id) { if (!gid_ok(id)) return 0; act(id >> 12); return 
 uint64_t fs_get_mtime(int id) { if (!gid_ok(id)) return 0; act(id >> 12); return fs_get_mtime_impl(id & 0xFFF); }
 uint32_t fs_get_uid(int id) { if (!gid_ok(id)) return 0; act(id >> 12); return fs_get_uid_impl(id & 0xFFF); }
 uint32_t fs_get_gid(int id) { if (!gid_ok(id)) return 0; act(id >> 12); return fs_get_gid_impl(id & 0xFFF); }
-int fs_set_mode(int id, uint32_t mode) { if (!gid_ok(id)) return -1; act(id >> 12); return fs_set_mode_impl(id & 0xFFF, mode); }
-int fs_set_owner(int id, uint32_t uid, uint32_t gid) { if (!gid_ok(id)) return -1; act(id >> 12); return fs_set_owner_impl(id & 0xFFF, uid, gid); }
-int fs_set_owner_path(const char* path, int cwd, uint32_t uid, uint32_t gid) { Route r; route(path, cwd, &r, 1, 1); return fs_set_owner_path_impl(r.rest, r.cwd, uid, gid); }
+static void ev_attrib_id(int id) { if (!fs_event_hook) return; EvSnap s; ev_snap_id(id, &s); ev_emit(&s, 4U, 0); }
+int fs_set_mode(int id, uint32_t mode) { if (!gid_ok(id)) return -1; act(id >> 12); int rc = fs_set_mode_impl(id & 0xFFF, mode); if (rc == 0) ev_attrib_id(id); return rc; }
+int fs_set_owner(int id, uint32_t uid, uint32_t gid) { if (!gid_ok(id)) return -1; act(id >> 12); int rc = fs_set_owner_impl(id & 0xFFF, uid, gid); if (rc == 0) ev_attrib_id(id); return rc; }
+int fs_set_owner_path(const char* path, int cwd, uint32_t uid, uint32_t gid) { Route r; route(path, cwd, &r, 1, 1); int rc = fs_set_owner_path_impl(r.rest, r.cwd, uid, gid); if (rc == 0) ev_changed(path, cwd, 4U); return rc; }
 int fs_stat_path(const char* path, int cwd, FsStat* out) { Route r; route(path, cwd, &r, 1, 1); return fs_stat_path_impl(r.rest, r.cwd, out); }
 int fs_lstat_path(const char* path, int cwd, FsStat* out) { Route r; route(path, cwd, &r, 1); return fs_lstat_path_impl(r.rest, r.cwd, out); }
-int fs_truncate(const char* path, int cwd, uint64_t size) { Route r; route(path, cwd, &r, 0, 1); return fs_truncate_impl(r.rest, r.cwd, size); }
+int fs_truncate(const char* path, int cwd, uint64_t size) { Route r; route(path, cwd, &r, 0, 1); int rc = fs_truncate_impl(r.rest, r.cwd, size); if (rc == 0) ev_changed(path, cwd, 2U); return rc; }
 uint64_t fs_total_sectors() { act(0); return fs_total_sectors_impl(); }
 uint64_t fs_used_sectors() { act(0); return fs_used_sectors_impl(); }
-int fs_set_mode_path(const char* path, int cwd, uint32_t mode) { Route r; route(path, cwd, &r, 1, 1); return fs_set_mode_path_impl(r.rest, r.cwd, mode); }
-int fs_set_mtime_path(const char* path, int cwd, uint64_t mtime) { Route r; route(path, cwd, &r, 1, 1); return fs_set_mtime_path_impl(r.rest, r.cwd, mtime); }
+int fs_set_mode_path(const char* path, int cwd, uint32_t mode) { Route r; route(path, cwd, &r, 1, 1); int rc = fs_set_mode_path_impl(r.rest, r.cwd, mode); if (rc == 0) ev_changed(path, cwd, 4U); return rc; }
+int fs_set_mtime_path(const char* path, int cwd, uint64_t mtime) { Route r; route(path, cwd, &r, 1, 1); int rc = fs_set_mtime_path_impl(r.rest, r.cwd, mtime); if (rc == 0) ev_changed(path, cwd, 4U); return rc; }
 int fs_persistent() { return ctxs[0].mounted; }
 void fs_init() { fs_init_impl(); act(0); }
 
@@ -2536,6 +2630,7 @@ int fs_link_hard(const char* target, const char* linkpath, int cwd)
     fb[p] = 0;
     act(a.ctx);
     int v = fs_link_hard_impl(fa, fb, 0);
+    if (v >= 0) { ev_created(linkpath, cwd); ev_changed(target, cwd, 4U); }
     return enc(a.ctx, v);
 }
 int fs_link_count(int id) { if (!gid_ok(id)) return 0; act(id >> 12); return fs_link_count_impl(id & 0xFFF); }

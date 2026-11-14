@@ -179,6 +179,7 @@ int task_fork(ExceptionFrame* frame)
     (void)process_set_start(pid, timer_millis());
     (void)process_set_creds(pid, process_uid(parent), process_gid(parent));
     (void)process_sig_inherit(parent, pid);
+    (void)process_rlimit_inherit(parent, pid);
     (void)process_set_cwd(pid, process_cwd(parent));
     (void)process_set_umask(pid, process_umask(parent));
 

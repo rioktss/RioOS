@@ -251,6 +251,13 @@ int main(int argc, char** argv)
       write(p3[1], "ab", 2); n = epoll_wait(ep, out, 4, 500); int first = n; n = epoll_wait(ep, out, 4, 80);
       chk("epoll-edge-reports-once", first == 1 && n == 0);
       read(p3[0], b, 2); write(p3[1], "c", 1); n = epoll_wait(ep, out, 4, 500); chk("epoll-edge-rearms", n == 1);
+      write(p3[1], "d", 1); n = epoll_wait(ep, out, 4, 500); int e1 = n; write(p3[1], "e", 1); n = epoll_wait(ep, out, 4, 500); int e2 = n; n = epoll_wait(ep, out, 4, 60);
+      chk("epoll-edge-new-data-without-read", e1 == 1 && e2 == 1 && n == 0);
+      read(p3[0], b, 2);
+      { int uu[2]; if (socketpair(AF_UNIX, SOCK_STREAM, 0, uu) == 0)
+        { epoll_event ue; ue.events = EPOLLIN | EPOLLET; ue.data.fd = uu[0]; epoll_ctl(ep, EPOLL_CTL_ADD, uu[0], &ue);
+          write(uu[1], "1", 1); n = epoll_wait(ep, out, 4, 500); int u1 = n; write(uu[1], "2", 1); n = epoll_wait(ep, out, 4, 500); int u2 = n; n = epoll_wait(ep, out, 4, 60);
+          chk("epoll-edge-unix-socket", u1 == 1 && u2 == 1 && n == 0); epoll_ctl(ep, EPOLL_CTL_DEL, uu[0], 0); close(uu[0]); close(uu[1]); } }
       read(p3[0], b, 1); epoll_ctl(ep, EPOLL_CTL_DEL, p3[0], 0);
       ev.events = EPOLLIN | EPOLLONESHOT; ev.data.fd = p3[0]; epoll_ctl(ep, EPOLL_CTL_ADD, p3[0], &ev);
       write(p3[1], "d", 1); n = epoll_wait(ep, out, 4, 500); int o1 = n; write(p3[1], "e", 1); n = epoll_wait(ep, out, 4, 80);
@@ -330,6 +337,178 @@ int main(int argc, char** argv)
     { openlog("posixtest", LOG_PID, LOG_USER); syslog(LOG_INFO, "hello %d", 42); closelog();
       int fd = open("/var/log/messages", O_RDONLY); char buf[2048]; long n = fd >= 0 ? read(fd, buf, sizeof buf - 1) : -1; if (fd >= 0) close(fd); if (n < 0) n = 0; buf[n] = 0;
       chk("syslog-appends", n > 0 && strstr(buf, "posixtest[") && strstr(buf, "hello 42")); }
+
+    /* ---- resource limits (enforced), rusage ---- */
+    { struct rlimit rl; chk("getrlimit-nofile", getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur == rl.rlim_max && rl.rlim_cur >= 16);
+      pid_t c = fork(); if (c == 0) { struct rlimit r2 = {8, 8}; if (setrlimit(RLIMIT_NOFILE, &r2) != 0) _exit(1); int n = 0, e = 0; int fds[32];
+        for (; n < 32; ++n) { fds[n] = open("/tmp/pt_a.txt", O_RDONLY); if (fds[n] < 0) { e = errno; break; } }
+        struct rlimit r3 = {64, 64}; errno = 0; int up = setrlimit(RLIMIT_NOFILE, &r3);
+        _exit(n == 5 && e == EMFILE && up == -1 ? 0 : 10 + n); }
+      int st = 0; waitpid(c, &st, 0); chk("rlimit-nofile-enforced", st == 0 || printf("  status %d\n", (st >> 8) & 0xFF) < 0);
+      /* inherited by children */
+      c = fork(); if (c == 0) { struct rlimit r2 = {9, 9}; setrlimit(RLIMIT_NOFILE, &r2); pid_t g = fork(); if (g == 0) { struct rlimit r4; getrlimit(RLIMIT_NOFILE, &r4); _exit(r4.rlim_cur == 9 ? 0 : 1); } int gs = 0; waitpid(g, &gs, 0); _exit(gs == 0 ? 0 : 2); }
+      st = 0; waitpid(c, &st, 0); chk("rlimit-inherited-by-fork", st == 0);
+      /* raising the hard limit needs root; a non-root child may not */
+      c = fork(); if (c == 0) { struct rlimit r2 = {8, 8}; setrlimit(RLIMIT_CORE, &r2); setuid(1000, 1000); struct rlimit r3 = {64, 64}; errno = 0; _exit(setrlimit(RLIMIT_CORE, &r3) == -1 && errno == EPERM ? 0 : 1); }
+      st = 0; waitpid(c, &st, 0); chk("rlimit-raise-needs-root", st == 0);
+      c = fork(); if (c == 0) { struct rlimit r2 = {10, 10}; setrlimit(RLIMIT_FSIZE, &r2); signal(SIGXFSZ, SIG_IGN);
+        int fd = open("/tmp/pt_fsize", O_WRONLY | O_CREAT | O_TRUNC); long a = write(fd, "0123456789ABCDEFGHIJ", 20); errno = 0; long b = write(fd, "x", 1); int e = errno; close(fd);
+        struct stat sb; stat("/tmp/pt_fsize", &sb); unlink("/tmp/pt_fsize"); _exit(a == 10 && b == -1 && e == EFBIG && sb.st_size == 10 ? 0 : 1); }
+      st = 0; waitpid(c, &st, 0); chk("rlimit-fsize-enforced", st == 0);
+      c = fork(); if (c == 0) { struct rlimit r2 = {5, 5}; setrlimit(RLIMIT_FSIZE, &r2); int fd = open("/tmp/pt_fsize2", O_WRONLY | O_CREAT | O_TRUNC); write(fd, "0123456789", 10); write(fd, "x", 1); _exit(0); }
+      st = 0; waitpid(c, &st, 0); unlink("/tmp/pt_fsize2"); chk("rlimit-fsize-sigxfsz-kills", st != 0 && (st & 0x7F) == SIGXFSZ);
+      c = fork(); if (c == 0) { void* a = mmap(0, 65536, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0); if (a == MAP_FAILED) _exit(1); munmap(a, 65536);
+        struct rlimit r2 = {1 << 20, 1 << 20}; setrlimit(RLIMIT_AS, &r2);
+        errno = 0; void* b = mmap(0, 3 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        int e1 = (b == MAP_FAILED && errno == ENOMEM); errno = 0; void* m = malloc(8 << 20); int e2 = m == 0;
+        struct rlimit r3 = {RLIM_INFINITY, RLIM_INFINITY}; setrlimit(RLIMIT_AS, &r3); void* d = mmap(0, 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        _exit(e1 && e2 && d != MAP_FAILED ? 0 : 2); }
+      st = 0; waitpid(c, &st, 0); chk("rlimit-as-enforced", st == 0);
+      c = fork(); if (c == 0) { static volatile int got = 0; struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_handler = [](int) { got = 1; }; sigaction(SIGXCPU, &sa, 0);
+        struct rlimit r2 = {1, 3}; setrlimit(RLIMIT_CPU, &r2); unsigned long t0 = clock_ms(); volatile unsigned long x = 0;
+        while (!got && clock_ms() - t0 < 20000) x++;
+        _exit(got ? 0 : 1); }
+      st = 0; waitpid(c, &st, 0); chk("rlimit-cpu-sigxcpu", st == 0);
+      c = fork(); if (c == 0) { struct rlimit r2 = {1, 1}; setrlimit(RLIMIT_CPU, &r2); signal(SIGXCPU, SIG_IGN); volatile unsigned long x = 0; unsigned long t0 = clock_ms(); while (clock_ms() - t0 < 20000) x++; _exit(0); }
+      st = 0; waitpid(c, &st, 0); chk("rlimit-cpu-hard-kills", (st & 0x7F) == SIGKILL);
+      { unsigned long t0 = clock_ms(); volatile unsigned long x = 0; while (clock_ms() - t0 < 400) x++;
+        struct rusage ru; chk("getrusage-self-cpu", getrusage(RUSAGE_SELF, &ru) == 0 && (ru.ru_utime.tv_sec * 1000 + ru.ru_utime.tv_usec / 1000) >= 100 && ru.ru_utime.tv_sec < 100); }
+      c = fork(); if (c == 0) { unsigned long t0 = clock_ms(); volatile unsigned long x = 0; while (clock_ms() - t0 < 300) x++; _exit(0); }
+      st = 0; struct rusage cr; wait4(c, &st, 0, &cr); struct rusage ru2; getrusage(RUSAGE_CHILDREN, &ru2);
+      chk("getrusage-children", (ru2.ru_utime.tv_sec * 1000 + ru2.ru_utime.tv_usec / 1000) >= 100); }
+
+    /* ---- CPU affinity ---- */
+    { cpu_set_t cs; CPU_ZERO(&cs); long on = sysconf(_SC_NPROCESSORS_ONLN);
+      { int ra = sched_getaffinity(0, sizeof cs, &cs); int okk = ra == 0 && CPU_COUNT(&cs) == on; if (!okk) printf("  ret=%d mask=%lx online=%ld\n", ra, cs.bits[0], on); chk("getaffinity-online", okk); }
+      cpu_set_t bad; CPU_ZERO(&bad); CPU_SET(40, &bad); errno = 0; chk("setaffinity-einval", sched_setaffinity(0, sizeof bad, &bad) == -1 && errno == EINVAL);
+      errno = 0; chk("setaffinity-esrch", sched_setaffinity(31999, sizeof cs, &cs) == -1 && errno == ESRCH);
+      cpu_set_t one; CPU_ZERO(&one); CPU_SET(on > 1 ? 1 : 0, &one);
+      chk("setaffinity-ok", sched_setaffinity(0, sizeof one, &one) == 0);
+      cpu_set_t back; CPU_ZERO(&back); sched_getaffinity(0, sizeof back, &back); chk("getaffinity-reflects-set", CPU_COUNT(&back) == 1 && CPU_ISSET(on > 1 ? 1 : 0, &back));
+      if (on > 1)
+      { int ok = 0; for (int i = 0; i < 60 && !ok; ++i) { usleep(20000); ok = sched_getcpu() == 1; } chk("setaffinity-pins-to-cpu1", ok);
+        int c1 = 0; for (int i = 0; i < 20; ++i) { usleep(5000); if (sched_getcpu() == 1) ++c1; } chk("setaffinity-stays-pinned", c1 >= 19); }
+      pid_t c = fork(); if (c == 0) { cpu_set_t cc; CPU_ZERO(&cc); sched_getaffinity(0, sizeof cc, &cc); _exit(CPU_COUNT(&cc) == 1 ? 0 : 1); }
+      int st = 0; waitpid(c, &st, 0); chk("affinity-inherited-by-fork", st == 0);
+      sched_setaffinity(0, sizeof cs, &cs); CPU_ZERO(&back); sched_getaffinity(0, sizeof back, &back); chk("setaffinity-restore", CPU_COUNT(&back) == on); }
+
+    /* ---- signalfd ---- */
+    { sigset_t m; sigemptyset(&m); sigaddset(&m, SIGUSR1); sigaddset(&m, SIGUSR2); sigprocmask(SIG_BLOCK, &m, 0);
+      int sfd = signalfd(-1, &m, SFD_NONBLOCK); chk("signalfd-create", sfd >= 0);
+      struct signalfd_siginfo si; errno = 0; chk("signalfd-eagain", read(sfd, &si, sizeof si) == -1 && errno == EAGAIN);
+      chk("signalfd-not-ready", (ready(sfd, POLLIN, 0) & POLLIN) == 0);
+      kill(getpid(), SIGUSR1); chk("signalfd-poll-ready", (ready(sfd, POLLIN, 500) & POLLIN) != 0);
+      memset(&si, 0, sizeof si); long n = read(sfd, &si, sizeof si);
+      chk("signalfd-read", n == 128 && si.ssi_signo == SIGUSR1 && si.ssi_pid == (uint32_t)getpid());
+      errno = 0; chk("signalfd-consumed", read(sfd, &si, sizeof si) == -1 && errno == EAGAIN);
+      kill(getpid(), SIGUSR1); kill(getpid(), SIGUSR2); struct signalfd_siginfo two[2]; n = read(sfd, two, sizeof two);
+      chk("signalfd-multi-read", n == 256 && ((two[0].ssi_signo == SIGUSR1 && two[1].ssi_signo == SIGUSR2) || (two[0].ssi_signo == SIGUSR2 && two[1].ssi_signo == SIGUSR1)));
+      errno = 0; chk("signalfd-short-buffer-einval", ({ kill(getpid(), SIGUSR1); char tiny[16]; long r = read(sfd, tiny, sizeof tiny); r == -1 && errno == EINVAL; }));
+      read(sfd, &si, sizeof si);
+      /* blocking read woken by a signal sent from a child */
+      int bfd = signalfd(-1, &m, 0); pid_t par = getpid(); pid_t c = fork(); if (c == 0) { usleep(80000); kill(par, SIGUSR2); _exit(0); }
+      unsigned long t0 = clock_ms(); n = read(bfd, &si, sizeof si); chk("signalfd-blocking-read", n == 128 && si.ssi_signo == SIGUSR2 && si.ssi_pid == (uint32_t)c && clock_ms() - t0 >= 40);
+      int st = 0; waitpid(c, &st, 0);
+      /* epoll (level and edge) */
+      int ep = epoll_create1(0); epoll_event ev; ev.events = EPOLLIN | EPOLLET; ev.data.fd = sfd; epoll_ctl(ep, EPOLL_CTL_ADD, sfd, &ev); epoll_event out[2];
+      kill(getpid(), SIGUSR1); chk("signalfd-epoll-edge", epoll_wait(ep, out, 2, 500) == 1 && out[0].data.fd == sfd);
+      read(sfd, &si, sizeof si); kill(getpid(), SIGUSR2); chk("signalfd-epoll-edge-again", epoll_wait(ep, out, 2, 500) == 1);
+      read(sfd, &si, sizeof si); close(ep);
+      /* update the mask of an existing signalfd */
+      sigset_t m1; sigemptyset(&m1); sigaddset(&m1, SIGUSR1); chk("signalfd-update-mask", signalfd(sfd, &m1, 0) == sfd);
+      kill(getpid(), SIGUSR2); errno = 0; int e0 = read(sfd, &si, sizeof si) == -1 && errno == EAGAIN; kill(getpid(), SIGUSR1); int e1 = read(sfd, &si, sizeof si) == 128;
+      chk("signalfd-mask-filters", e0 && e1);
+      sigset_t pend; sigpending(&pend); chk("signalfd-leaves-other-pending", sigismember(&pend, SIGUSR2) == 1);
+      sigset_t un; sigemptyset(&un); sigaddset(&un, SIGUSR2);
+      struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_handler = SIG_IGN; sigaction(SIGUSR2, &sa, 0);
+      sigprocmask(SIG_UNBLOCK, &un, 0); close(sfd); close(bfd);
+      errno = 0; chk("signalfd-bad-fd", signalfd(2, &m, 0) == -1 && errno == EINVAL); }
+
+    /* ---- inotify ---- */
+    { mkdir("/tmp/pt_in", 0777); int in = inotify_init1(IN_NONBLOCK); chk("inotify-init", in >= 0);
+      int wd = inotify_add_watch(in, "/tmp/pt_in", IN_ALL_EVENTS); chk("inotify-add-watch", wd > 0);
+      char buf[1024]; errno = 0; chk("inotify-eagain", read(in, buf, sizeof buf) == -1 && errno == EAGAIN);
+      errno = 0; chk("inotify-add-enoent", inotify_add_watch(in, "/tmp/pt_in/nope", IN_ALL_EVENTS) == -1 && errno == ENOENT);
+      errno = 0; chk("inotify-add-einval", inotify_add_watch(in, "/tmp/pt_in", 0) == -1 && errno == EINVAL);
+      wr_file("/tmp/pt_in/one", "abc");
+      chk("inotify-poll-ready", (ready(in, POLLIN, 300) & POLLIN) != 0);
+      long n = read(in, buf, sizeof buf); int cr = 0, mo = 0, ok = n > 0; unsigned long mask_seen = 0;
+      for (long o = 0; o < n && ok;) { struct inotify_event* e = (struct inotify_event*)(buf + o); if (e->wd != wd) ok = 0;
+        if ((e->mask & IN_CREATE) && !strcmp(e->name, "one")) cr = 1; if ((e->mask & IN_MODIFY) && !strcmp(e->name, "one")) mo = 1; mask_seen |= e->mask; o += 16 + e->len; }
+      chk("inotify-create-modify", ok && cr && mo); chk("inotify-open-close-write", (mask_seen & IN_OPEN) && (mask_seen & IN_CLOSE_WRITE));
+      rename("/tmp/pt_in/one", "/tmp/pt_in/two"); n = read(in, buf, sizeof buf); uint32_t ckf = 0, ckt = 0; int fr = 0, to = 0;
+      for (long o = 0; o < n;) { struct inotify_event* e = (struct inotify_event*)(buf + o); if (e->mask & IN_MOVED_FROM) { fr = !strcmp(e->name, "one"); ckf = e->cookie; } if (e->mask & IN_MOVED_TO) { to = !strcmp(e->name, "two"); ckt = e->cookie; } o += 16 + e->len; }
+      chk("inotify-rename-pair", fr && to && ckf != 0 && ckf == ckt);
+      chmod("/tmp/pt_in/two", 0600); n = read(in, buf, sizeof buf); int at = 0;
+      for (long o = 0; o < n;) { struct inotify_event* e = (struct inotify_event*)(buf + o); if ((e->mask & IN_ATTRIB) && !strcmp(e->name, "two")) at = 1; o += 16 + e->len; }
+      chk("inotify-attrib", at);
+      unlink("/tmp/pt_in/two"); n = read(in, buf, sizeof buf); int de = 0;
+      for (long o = 0; o < n;) { struct inotify_event* e = (struct inotify_event*)(buf + o); if ((e->mask & IN_DELETE) && !strcmp(e->name, "two")) de = 1; o += 16 + e->len; }
+      chk("inotify-delete", de);
+      mkdir("/tmp/pt_in/sub", 0777); n = read(in, buf, sizeof buf); int sd = 0;
+      for (long o = 0; o < n;) { struct inotify_event* e = (struct inotify_event*)(buf + o); if ((e->mask & IN_CREATE) && (e->mask & IN_ISDIR) && !strcmp(e->name, "sub")) sd = 1; o += 16 + e->len; }
+      chk("inotify-mkdir-isdir", sd); rmdir("/tmp/pt_in/sub"); read(in, buf, sizeof buf);
+      /* watching a single file: events without a name, DELETE_SELF then IGNORED */
+      wr_file("/tmp/pt_in/solo", "x"); int in2 = inotify_init1(IN_NONBLOCK); int w2 = inotify_add_watch(in2, "/tmp/pt_in/solo", IN_MODIFY | IN_DELETE_SELF | IN_ATTRIB);
+      wr_file("/tmp/pt_in/solo", "yy"); n = read(in2, buf, sizeof buf); struct inotify_event* e0 = (struct inotify_event*)buf;
+      chk("inotify-file-modify", n >= 16 && e0->wd == w2 && (e0->mask & IN_MODIFY) && e0->len == 0);
+      unlink("/tmp/pt_in/solo"); n = read(in2, buf, sizeof buf); int ds = 0, ig = 0;
+      for (long o = 0; o < n;) { struct inotify_event* e = (struct inotify_event*)(buf + o); if (e->mask & IN_DELETE_SELF) ds = 1; if (e->mask & IN_IGNORED) ig = 1; o += 16 + e->len; }
+      chk("inotify-delete-self-ignored", ds && ig);
+      /* rm_watch, mask update, one-shot, small buffer */
+      while (read(in, buf, sizeof buf) > 0) { }
+      chk("inotify-rm-watch", inotify_rm_watch(in, wd) == 0); n = read(in, buf, sizeof buf); chk("inotify-rm-watch-ignored", n >= 16 && (((struct inotify_event*)buf)->mask & IN_IGNORED) && ((struct inotify_event*)buf)->wd == wd);
+      errno = 0; chk("inotify-rm-watch-einval", inotify_rm_watch(in, wd) == -1 && errno == EINVAL);
+      wd = inotify_add_watch(in, "/tmp/pt_in", IN_CREATE | IN_ONESHOT); wr_file("/tmp/pt_in/os1", ""); wr_file("/tmp/pt_in/os2", ""); n = read(in, buf, sizeof buf); int cnt = 0, ig3 = 0;
+      for (long o = 0; o < n;) { struct inotify_event* e = (struct inotify_event*)(buf + o); if (e->mask & IN_CREATE) ++cnt; if (e->mask & IN_IGNORED) ig3 = 1; o += 16 + e->len; }
+      chk("inotify-oneshot", cnt == 1 && ig3);
+      int w3 = inotify_add_watch(in, "/tmp/pt_in", IN_CREATE); int w4 = inotify_add_watch(in, "/tmp/pt_in", IN_DELETE | IN_MASK_ADD); chk("inotify-same-node-same-wd", w3 == w4 && w3 > 0);
+      wr_file("/tmp/pt_in/os3", ""); unlink("/tmp/pt_in/os3"); n = read(in, buf, sizeof buf); int c3 = 0, d3 = 0;
+      for (long o = 0; o < n;) { struct inotify_event* e = (struct inotify_event*)(buf + o); if (e->mask & IN_CREATE) c3 = 1; if (e->mask & IN_DELETE) d3 = 1; o += 16 + e->len; }
+      chk("inotify-mask-add", c3 && d3);
+      wr_file("/tmp/pt_in/os4", ""); errno = 0; chk("inotify-short-buffer-einval", read(in, buf, 8) == -1 && errno == EINVAL); read(in, buf, sizeof buf);
+      /* blocking read woken by a change made by a child; epoll */
+      int bin = inotify_init(); inotify_add_watch(bin, "/tmp/pt_in", IN_CREATE); pid_t c = fork(); if (c == 0) { usleep(80000); wr_file("/tmp/pt_in/child_made", ""); _exit(0); }
+      unsigned long t0 = clock_ms(); n = read(bin, buf, sizeof buf); struct inotify_event* eb = (struct inotify_event*)buf;
+      chk("inotify-blocking-read", n > 0 && (eb->mask & IN_CREATE) && !strcmp(eb->name, "child_made") && clock_ms() - t0 >= 40); int st = 0; waitpid(c, &st, 0);
+      int ep = epoll_create1(0); epoll_event ev; ev.events = EPOLLIN; ev.data.fd = in; epoll_ctl(ep, EPOLL_CTL_ADD, in, &ev); epoll_event out[2];
+      while (read(in, buf, sizeof buf) > 0) { }
+      chk("inotify-epoll-idle", epoll_wait(ep, out, 2, 30) == 0); unlink("/tmp/pt_in/child_made"); chk("inotify-epoll-ready", epoll_wait(ep, out, 2, 500) == 1 && out[0].data.fd == in); close(ep);
+      /* descriptor-layer events: open / read access / close */
+      read(in, buf, sizeof buf); inotify_rm_watch(in, w3); int w5 = inotify_add_watch(in, "/tmp/pt_in/os4", IN_ACCESS | IN_OPEN | IN_CLOSE_NOWRITE);
+      { int f = open("/tmp/pt_in/os4", O_RDONLY); char cb[4]; wr_file("/tmp/pt_in/os4", "data"); (void)cb; close(f); (void)w5; }
+      for (int k = 0; k < 6; ++k) { char t[64]; snprintf(t, sizeof t, "/tmp/pt_in/os%d", k); unlink(t); }
+      close(in); close(in2); close(bin); rmdir("/tmp/pt_in"); }
+
+    /* ---- iconv ---- */
+    { iconv_t cd = iconv_open("UTF-16LE", "UTF-8"); chk("iconv-open", cd != (iconv_t)-1);
+      char in[] = "h\xc3\xa9\xe2\x82\xac\xf0\x9f\x98\x80"; char out[32]; char* ip = in; char* op = out; size_t il = strlen(in), ol = sizeof out;
+      size_t r = iconv(cd, &ip, &il, &op, &ol); size_t got = sizeof out - ol;
+      chk("iconv-utf8-to-utf16le", r != (size_t)-1 && il == 0 && got == 10 && (unsigned char)out[0] == 'h' && (unsigned char)out[2] == 0xE9 && (unsigned char)out[4] == 0xAC && (unsigned char)out[5] == 0x20 && (unsigned char)out[6] == 0x3D && (unsigned char)out[7] == 0xD8 && (unsigned char)out[9] == 0xDE);
+      iconv_close(cd); cd = iconv_open("UTF-8", "UTF-16LE"); char back[32]; ip = out; op = back; il = got; ol = sizeof back; r = iconv(cd, &ip, &il, &op, &ol); *op = 0;
+      chk("iconv-utf16le-roundtrip", r != (size_t)-1 && !strcmp(back, in)); iconv_close(cd);
+      cd = iconv_open("ISO-8859-1", "UTF-8"); char s1[] = "caf\xc3\xa9"; char l1[8]; ip = s1; op = l1; il = strlen(s1); ol = sizeof l1; r = iconv(cd, &ip, &il, &op, &ol);
+      chk("iconv-latin1", r != (size_t)-1 && sizeof l1 - ol == 4 && (unsigned char)l1[3] == 0xE9); iconv_close(cd);
+      cd = iconv_open("UTF-8", "ISO-8859-1"); char l2[] = {'a', (char)0xE9, 'z'}; char u2[8]; ip = l2; op = u2; il = 3; ol = sizeof u2; iconv(cd, &ip, &il, &op, &ol);
+      chk("iconv-latin1-to-utf8", sizeof u2 - ol == 4 && (unsigned char)u2[1] == 0xC3 && (unsigned char)u2[2] == 0xA9); iconv_close(cd);
+      cd = iconv_open("ASCII", "UTF-8"); char s3[] = "ab\xc3\xa9"; char a3[8]; ip = s3; op = a3; il = strlen(s3); ol = sizeof a3; errno = 0; r = iconv(cd, &ip, &il, &op, &ol);
+      chk("iconv-eilseq-unrepresentable", r == (size_t)-1 && errno == EILSEQ && il == 2 && sizeof a3 - ol == 2); iconv_close(cd);
+      cd = iconv_open("ASCII//TRANSLIT", "UTF-8"); ip = s3; op = a3; il = strlen(s3); ol = sizeof a3; r = iconv(cd, &ip, &il, &op, &ol);
+      chk("iconv-translit", r == 1 && il == 0 && sizeof a3 - ol == 3 && a3[2] == '?'); iconv_close(cd);
+      cd = iconv_open("ASCII//IGNORE", "UTF-8"); ip = s3; op = a3; il = strlen(s3); ol = sizeof a3; r = iconv(cd, &ip, &il, &op, &ol);
+      chk("iconv-ignore", il == 0 && sizeof a3 - ol == 2); iconv_close(cd);
+      cd = iconv_open("UTF-8", "UTF-8"); char bad[] = "a\xc3\x28"; ip = bad; op = back; il = 3; ol = sizeof back; errno = 0; r = iconv(cd, &ip, &il, &op, &ol);
+      chk("iconv-invalid-utf8-eilseq", r == (size_t)-1 && errno == EILSEQ && il == 2);
+      char part[] = "\xe2\x82"; ip = part; op = back; il = 2; ol = sizeof back; errno = 0; r = iconv(cd, &ip, &il, &op, &ol); chk("iconv-incomplete-einval", r == (size_t)-1 && errno == EINVAL && il == 2);
+      char big[] = "abcdef"; ip = big; op = back; il = 6; ol = 3; errno = 0; r = iconv(cd, &ip, &il, &op, &ol); chk("iconv-e2big", r == (size_t)-1 && errno == E2BIG && il == 3 && ol == 0); iconv_close(cd);
+      cd = iconv_open("UTF-16", "UTF-8"); char ab[] = "A"; ip = ab; op = out; il = 1; ol = sizeof out; iconv(cd, &ip, &il, &op, &ol);
+      chk("iconv-utf16-bom", sizeof out - ol == 4 && (unsigned char)out[0] == 0xFF && (unsigned char)out[1] == 0xFE && out[2] == 'A'); iconv_close(cd);
+      cd = iconv_open("UTF-8", "UTF-16"); unsigned char be[] = {0xFE, 0xFF, 0x00, 0x41, 0x20, 0xAC}; ip = (char*)be; op = back; il = 6; ol = sizeof back; r = iconv(cd, &ip, &il, &op, &ol); *op = 0;
+      chk("iconv-utf16-bom-be", r != (size_t)-1 && !strcmp(back, "A\xe2\x82\xac")); iconv_close(cd);
+      cd = iconv_open("UTF-32LE", "UTF-8"); char e32[] = "\xf0\x9f\x98\x80"; ip = e32; op = out; il = 4; ol = sizeof out; iconv(cd, &ip, &il, &op, &ol);
+      chk("iconv-utf32le", sizeof out - ol == 4 && (unsigned char)out[0] == 0x00 && (unsigned char)out[1] == 0xF6 && (unsigned char)out[2] == 0x01); iconv_close(cd);
+      errno = 0; chk("iconv-unknown-charset", iconv_open("UTF-8", "KLINGON") == (iconv_t)-1 && errno == EINVAL);
+      errno = 0; chk("iconv-close-bad", iconv_close((iconv_t)-1) == -1 && errno == EBADF); }
 
     printf("posixtest done fails=%d\n", fails);
     return fails ? 1 : 0;

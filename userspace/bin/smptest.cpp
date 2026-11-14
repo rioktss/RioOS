@@ -123,7 +123,7 @@ int main(int argc, char** argv)
     }
     printf("smptest: online cpus = %ld\n", ncpu);
     sh = (Shared*)mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0); chk("shared-map", sh != (Shared*)MAP_FAILED);
-    cpu_set_t cs; chk("sched_getaffinity", sched_getaffinity(0, sizeof cs, &cs) > 0 && CPU_COUNT(&cs) == ncpu && sched_getcpu() >= 0 && sched_getcpu() < ncpu);
+    cpu_set_t cs; chk("sched_getaffinity", sched_getaffinity(0, sizeof cs, &cs) == 0 && CPU_COUNT(&cs) == ncpu && sched_getcpu() >= 0 && sched_getcpu() < ncpu);
 
     memset((void*)sh, 0, sizeof *sh);
     unsigned long t0 = clock_ms(); int n = (int)(ncpu > 1 ? ncpu : 2) * 2;

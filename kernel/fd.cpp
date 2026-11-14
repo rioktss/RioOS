@@ -28,6 +28,7 @@
 #include "netstack.h"
 #include "tty.h"
 #include "timer.h"
+#include "process.h"
 
 #define FD_KIND_NONE 0
 #define FD_KIND_STDIN 1
@@ -41,6 +42,8 @@
 #define FD_KIND_EVENT 9
 #define FD_KIND_UNIX 10
 #define FD_KIND_TIMER 11
+#define FD_KIND_SIGNAL 12
+#define FD_KIND_INOTIFY 13
 
 #define POLL_IN 1
 #define POLL_OUT 4
@@ -98,14 +101,32 @@ struct PipeState
     uint32_t read_pos;
     uint32_t write_pos;
     uint32_t size;
+    uint32_t gen;                       /* bumped on every write / last-writer close (epoll EPOLLET) */
     uint8_t data[FD_PIPE_CAPACITY];
 };
 
 
 /* ---- timerfd ---- */
 #define TF_MAX 16
-struct TimerFd { int used; uint64_t interval_ms; uint64_t next_ms; uint64_t expirations; };
+struct TimerFd { int used; uint64_t interval_ms; uint64_t next_ms; uint64_t expirations; uint32_t gen; };
 static TimerFd timerfds[TF_MAX];
+
+/* ---- signalfd: signals of a mask are read as 128-byte signalfd_siginfo records instead of being delivered ---- */
+#define SF_MAX 8
+struct SigFd { int used; uint32_t mask; };
+static SigFd sigfds[SF_MAX];
+
+/* ---- inotify: change events for watched files and directories (fed by fs_event_hook and by the descriptor layer) ---- */
+#define IN_INST_MAX 4
+#define IN_WATCH_MAX 16
+#define IN_QUEUE_MAX 64
+#define IN_NAME_MAX 64
+struct InoWatch { int wd; int node; uint32_t mask; };            /* wd 0 = free slot */
+struct InoEv { int wd; uint32_t mask; uint32_t cookie; int len; char name[IN_NAME_MAX]; };
+struct Ino { int used; int next_wd; InoWatch w[IN_WATCH_MAX]; InoEv q[IN_QUEUE_MAX]; int qh, qn; int overflow; uint32_t gen; };
+static Ino inos[IN_INST_MAX];
+static int ino_active;
+static void ino_file_event(const char* path, int cwd, uint32_t mask);
 
 /* ---- flock (advisory, per open file description) ---- */
 #define FL_MAX 64
@@ -114,7 +135,7 @@ static FLock flocks[FL_MAX];
 
 /* ---- eventfd ---- */
 #define EV_MAX 32
-struct EventState { int used; int semaphore; uint64_t counter; };
+struct EventState { int used; int semaphore; uint64_t counter; uint32_t gen; };
 static EventState events[EV_MAX];
 
 /* ---- AF_UNIX sockets (stream + datagram), socketpair, named listeners, SCM_RIGHTS ---- */
@@ -135,6 +156,7 @@ struct UnixSock
     char path[108];
     uint32_t rd, wr, size;
     uint64_t tot_w, tot_r;
+    uint32_t gen;        /* bumped on data arrival, EOF and new connections (epoll EPOLLET) */
     int backlog[UX_BACKLOG]; int nback;
     int fdq_obj[UX_FDQ]; uint64_t fdq_end[UX_FDQ]; int nfdq;
     uint8_t ring[UX_RING];
@@ -250,10 +272,18 @@ static int descriptor_valid_in(FdTable* table, int descriptor)
     return object >= 0 && object < FD_OPEN_FILES && open_files[object].used;
 }
 
+/* RLIMIT_NOFILE of the process that owns the table (enforced for allocation of new descriptors) */
+static int fd_limit_of(FdTable* table)
+{
+    uint64_t lim = table ? process_rlimit_cur(table->owner_pid, PROC_RLIMIT_NOFILE) : FD_MAX_DESCRIPTORS;
+    return lim > FD_MAX_DESCRIPTORS ? FD_MAX_DESCRIPTORS : (int)lim;
+}
+
 static int free_descriptor(FdTable* table, int minimum)
 {
     if (!table) return -1;
-    for (int i = minimum; i < FD_MAX_DESCRIPTORS; ++i)
+    int limit = fd_limit_of(table);
+    for (int i = minimum; i < limit; ++i)
         if (!table->entries[i].used) return i;
     return -1;
 }
@@ -319,7 +349,7 @@ static void ux_free(int idx)
     if (idx < 0 || idx >= UX_MAX || !usocks[idx].used) return;
     UnixSock* u = &usocks[idx];
     int peer = u->peer;
-    if (peer >= 0 && usocks[peer].used) { usocks[peer].peer = -1; usocks[peer].peer_closed = 1; }
+    if (peer >= 0 && usocks[peer].used) { usocks[peer].peer = -1; usocks[peer].peer_closed = 1; ++usocks[peer].gen; }
     if (u->state == 1)
     {
         for (int i = 0; i < u->nback; ++i)
@@ -327,7 +357,7 @@ static void ux_free(int idx)
             int srv = u->backlog[i];
             if (srv < 0 || !usocks[srv].used) continue;
             int cl = usocks[srv].peer;
-            if (cl >= 0 && usocks[cl].used) { usocks[cl].peer = -1; usocks[cl].peer_closed = 1; }
+            if (cl >= 0 && usocks[cl].used) { usocks[cl].peer = -1; usocks[cl].peer_closed = 1; ++usocks[cl].gen; }
             usocks[srv].used = 0;
         }
         u->nback = 0;
@@ -364,13 +394,19 @@ static void release_object(int object)
         if (file->kind == FD_KIND_PIPE_READ && pipes[pipe_id].readers > 0)
             --pipes[pipe_id].readers;
         if (file->kind == FD_KIND_PIPE_WRITE && pipes[pipe_id].writers > 0)
-            --pipes[pipe_id].writers;
+            { --pipes[pipe_id].writers; ++pipes[pipe_id].gen; }
     }
     if (file->kind == FD_KIND_SOCK_TCP && file->aux > 0) (void)net_tcp_close(file->owner, file->aux);
     else if (file->kind == FD_KIND_SOCK_UDP && file->aux > 0) (void)net_udp_close(file->owner, file->aux);
     else if (file->kind == FD_KIND_EVENT && file->aux >= 0 && file->aux < EV_MAX) events[file->aux].used = 0;
     else if (file->kind == FD_KIND_TIMER && file->aux >= 0 && file->aux < TF_MAX) timerfds[file->aux].used = 0;
-    else if (file->kind == FD_KIND_FILE) { for (int i = 0; i < FL_MAX; ++i) { if (flocks[i].used && flocks[i].obj == object) flocks[i].used = 0; } }
+    else if (file->kind == FD_KIND_SIGNAL && file->aux >= 0 && file->aux < SF_MAX) sigfds[file->aux].used = 0;
+    else if (file->kind == FD_KIND_INOTIFY && file->aux >= 0 && file->aux < IN_INST_MAX) { inos[file->aux].used = 0; if (--ino_active <= 0) { ino_active = 0; fs_event_hook = 0; } }
+    else if (file->kind == FD_KIND_FILE)
+    {
+        for (int i = 0; i < FL_MAX; ++i) { if (flocks[i].used && flocks[i].obj == object) flocks[i].used = 0; }
+        if (ino_active) ino_file_event(file->path, file->cwd, can_write(file->flags) ? 0x8U : 0x10U);   /* IN_CLOSE_WRITE / IN_CLOSE_NOWRITE */
+    }
     if (file->kind == FD_KIND_UNIX) { int ux = file->aux; clear_object(object); ux_free(ux); maybe_destroy_pipe(pipe_id); return; }
     clear_object(object);
     maybe_destroy_pipe(pipe_id);
@@ -415,6 +451,9 @@ void fd_init()
     for (int i = 0; i < FD_OPEN_FILES; ++i) clear_object(i);
     for (int i = 0; i < EV_MAX; ++i) events[i].used = 0;
     for (int i = 0; i < TF_MAX; ++i) timerfds[i].used = 0;
+    for (int i = 0; i < SF_MAX; ++i) sigfds[i].used = 0;
+    for (int i = 0; i < IN_INST_MAX; ++i) inos[i].used = 0;
+    ino_active = 0; fs_event_hook = 0;
     for (int i = 0; i < FL_MAX; ++i) flocks[i].used = 0;
     for (int i = 0; i < UX_MAX; ++i) usocks[i].used = 0;
     for (int i = 0; i < FD_PIPE_MAX; ++i)
@@ -543,6 +582,7 @@ int fd_open(const char* path, uint32_t flags, int cwd)
     table->entries[descriptor].used = 1;
     table->entries[descriptor].object = object;
     table->entries[descriptor].cloexec = want_cloexec;
+    if (ino_active) ino_file_event(path, cwd, 0x20U);                           /* IN_OPEN */
     return descriptor;
 }
 
@@ -567,6 +607,7 @@ int fd_dup2(int old_descriptor, int new_descriptor)
     if (!descriptor_valid_in(table, old_descriptor)) return -9;
     if (new_descriptor < 0 || new_descriptor >= FD_MAX_DESCRIPTORS) return -9;
     if (old_descriptor == new_descriptor) return new_descriptor;
+    if (new_descriptor >= fd_limit_of(table)) return -9;      /* EBADF: beyond RLIMIT_NOFILE */
 
     int object = table->entries[old_descriptor].object;
     if (table->entries[new_descriptor].used) close_entry(table, new_descriptor);
@@ -583,7 +624,7 @@ int fd_pipe(int descriptors[2])
     int first = free_descriptor(table, 3);
     if (first < 0) return -24;
     int second = -1;
-    for (int i = first + 1; i < FD_MAX_DESCRIPTORS; ++i)
+    for (int i = first + 1; i < fd_limit_of(table); ++i)
         if (!table->entries[i].used) { second = i; break; }
     if (second < 0) return -24;
 
@@ -637,10 +678,10 @@ static void tf_update(TimerFd* tf)
     if (tf->interval_ms)
     {
         uint64_t n = 1 + (now - tf->next_ms) / tf->interval_ms;
-        tf->expirations += n;
+        tf->expirations += n; ++tf->gen;
         tf->next_ms += n * tf->interval_ms;
     }
-    else { tf->expirations += 1; tf->next_ms = 0; }
+    else { tf->expirations += 1; tf->next_ms = 0; ++tf->gen; }
 }
 
 int fd_timerfd_create(int flags)
@@ -680,6 +721,197 @@ int fd_timerfd_gettime(int descriptor, uint64_t out[2])
 }
 
 /* fstat: regular files go through the filesystem; other kinds are synthesized (type 3 fifo, 4 socket, 5 tty, 6 anonymous) */
+/* ---- signalfd ---- */
+#define SIGKILL_BIT (1U << 9)
+#define SIGSTOP_BIT (1U << 19)
+int fd_signalfd(int descriptor, uint32_t mask, int flags)
+{
+    mask &= ~(SIGKILL_BIT | SIGSTOP_BIT | 1U);
+    if (descriptor >= 0)
+    {
+        OpenFile* f = file_of(descriptor);
+        if (!f) return -9;
+        if (f->kind != FD_KIND_SIGNAL || f->aux < 0 || f->aux >= SF_MAX || !sigfds[f->aux].used) return -22;
+        sigfds[f->aux].mask = mask;
+        return descriptor;
+    }
+    int idx = -1;
+    for (int i = 0; i < SF_MAX; ++i) if (!sigfds[i].used) { idx = i; break; }
+    if (idx < 0) return -24;
+    sigfds[idx].used = 1; sigfds[idx].mask = mask;
+    int d = new_object_fd(FD_KIND_SIGNAL, FD_O_RDONLY | ((flags & SOCK_NONBLOCK_FLAG) ? FD_O_NONBLOCK : 0), idx, -1, (flags & SOCK_CLOEXEC_FLAG) != 0);
+    if (d < 0) sigfds[idx].used = 0;
+    return d;
+}
+
+/* one 128-byte struct signalfd_siginfo per pending signal of the mask; -EAGAIN when none (the syscall layer blocks) */
+static int64_t signalfd_read(OpenFile* entry, void* buffer, uint64_t length)
+{
+    if (entry->aux < 0 || entry->aux >= SF_MAX || !sigfds[entry->aux].used) return -9;
+    if (length < 128) return -22;
+    FdTable* t = current_table();
+    if (!t) return -9;
+    int pid = t->owner_pid;
+    uint8_t* out = (uint8_t*)buffer; uint64_t done = 0;
+    while (done + 128 <= length)
+    {
+        int sig = process_sig_take_set(pid, sigfds[entry->aux].mask);
+        if (sig <= 0) break;
+        int sender = 0, code = 0; uint64_t value = 0;
+        (void)process_sig_info_get(pid, sig, &sender, &code, &value);
+        uint8_t* r = out + done; for (int i = 0; i < 128; ++i) r[i] = 0;
+        *(uint32_t*)(r + 0) = (uint32_t)sig;                 /* ssi_signo */
+        *(int32_t*)(r + 8) = code;                           /* ssi_code */
+        *(uint32_t*)(r + 12) = (uint32_t)sender;             /* ssi_pid */
+        *(uint32_t*)(r + 16) = process_uid(sender > 0 ? sender : pid);   /* ssi_uid */
+        *(uint64_t*)(r + 48) = value;                        /* ssi_ptr (sigqueue value) */
+        done += 128;
+    }
+    return done ? (int64_t)done : -11;
+}
+
+/* ---- inotify ---- */
+#define IN_MODIFY_B 0x2U
+#define IN_DELETE_SELF_B 0x400U
+#define IN_MOVE_SELF_B 0x800U
+#define IN_Q_OVERFLOW_B 0x4000U
+#define IN_IGNORED_B 0x8000U
+#define IN_ISDIR_B 0x40000000U
+#define IN_ONESHOT_B 0x80000000U
+#define IN_MASK_ADD_B 0x20000000U
+#define IN_ONLYDIR_B 0x01000000U
+#define IN_DONT_FOLLOW_B 0x02000000U
+#define IN_ALL_EVENTS_B 0x00000FFFU
+
+static void ino_queue(Ino* in, int wd, uint32_t mask, uint32_t cookie, const char* name)
+{
+    int len = 0; if (name) while (name[len] && len < IN_NAME_MAX - 1) ++len;
+    if (in->qn > 0)
+    {   /* identical to the newest queued event: coalesce (as Linux does) */
+        InoEv* last = &in->q[(in->qh + in->qn - 1) % IN_QUEUE_MAX];
+        if (last->wd == wd && last->mask == mask && last->cookie == cookie && last->len == len)
+        {
+            int same = 1; for (int i = 0; i < len; ++i) if (last->name[i] != name[i]) { same = 0; break; }
+            if (same) return;
+        }
+    }
+    if (in->qn >= IN_QUEUE_MAX - 1)
+    {
+        if (!in->overflow) { in->overflow = 1; InoEv* e = &in->q[(in->qh + in->qn) % IN_QUEUE_MAX]; e->wd = -1; e->mask = IN_Q_OVERFLOW_B; e->cookie = 0; e->len = 0; e->name[0] = 0; ++in->qn; ++in->gen; }
+        return;
+    }
+    InoEv* e = &in->q[(in->qh + in->qn) % IN_QUEUE_MAX];
+    e->wd = wd; e->mask = mask; e->cookie = cookie; e->len = len;
+    for (int i = 0; i < len; ++i) e->name[i] = name[i];
+    e->name[len] = 0;
+    ++in->qn; ++in->gen;
+}
+
+/* called for every change: dir = directory whose entry changed, node = the node, name = entry name */
+static void ino_dispatch(int dir, int node, const char* name, uint32_t mask, uint32_t cookie)
+{
+    uint32_t ev = mask & ~IN_ISDIR_B;
+    int self_only = (ev & (IN_DELETE_SELF_B | IN_MOVE_SELF_B)) != 0;
+    int child_only = (ev & (0x100U | 0x200U | 0x40U | 0x80U)) != 0;       /* CREATE DELETE MOVED_FROM MOVED_TO */
+    for (int k = 0; k < IN_INST_MAX; ++k)
+    {
+        Ino* in = &inos[k]; if (!in->used) continue;
+        for (int i = 0; i < IN_WATCH_MAX; ++i)
+        {
+            InoWatch* w = &in->w[i]; if (!w->wd || !(w->mask & ev)) continue;
+            if (!child_only && w->node == node) ino_queue(in, w->wd, mask, cookie, "");          /* the watched object itself */
+            else if (!self_only && dir >= 0 && w->node == dir) ino_queue(in, w->wd, mask, cookie, name);                      /* an entry of the watched directory */
+            else continue;
+            if (ev & IN_DELETE_SELF_B) { ino_queue(in, w->wd, IN_IGNORED_B, 0, ""); w->wd = 0; continue; }
+            if (w->mask & IN_ONESHOT_B) { ino_queue(in, w->wd, IN_IGNORED_B, 0, ""); w->wd = 0; }
+        }
+    }
+}
+static void ino_hook(int dir, int node, const char* name, uint32_t mask, uint32_t cookie) { ino_dispatch(dir, node, name, mask, cookie); }
+
+/* OPEN / ACCESS / CLOSE_* come from the descriptor layer */
+static void ino_file_event(const char* path, int cwd, uint32_t mask)
+{
+    if (!ino_active) return;
+    int id = fs_resolve(path, cwd);
+    if (id < 0) return;
+    ino_dispatch(fs_get_parent(id), id, fs_get_name(id), mask, 0);
+}
+
+int fd_inotify_init(int flags)
+{
+    int idx = -1;
+    for (int i = 0; i < IN_INST_MAX; ++i) if (!inos[i].used) { idx = i; break; }
+    if (idx < 0) return -24;
+    Ino* in = &inos[idx];
+    in->used = 1; in->next_wd = 1; in->qh = in->qn = 0; in->overflow = 0; in->gen = 0;
+    for (int i = 0; i < IN_WATCH_MAX; ++i) in->w[i].wd = 0;
+    int d = new_object_fd(FD_KIND_INOTIFY, FD_O_RDONLY | ((flags & SOCK_NONBLOCK_FLAG) ? FD_O_NONBLOCK : 0), idx, -1, (flags & SOCK_CLOEXEC_FLAG) != 0);
+    if (d < 0) { in->used = 0; return d; }
+    ++ino_active; fs_event_hook = ino_hook;
+    return d;
+}
+
+static Ino* ino_of(int descriptor)
+{
+    OpenFile* f = file_of(descriptor);
+    if (!f || f->kind != FD_KIND_INOTIFY || f->aux < 0 || f->aux >= IN_INST_MAX || !inos[f->aux].used) return 0;
+    return &inos[f->aux];
+}
+
+int fd_inotify_add_watch(int descriptor, const char* path, uint32_t mask, int cwd)
+{
+    Ino* in = ino_of(descriptor);
+    if (!in) return file_of(descriptor) ? -22 : -9;
+    if (!path || !path[0]) return -2;
+    if ((mask & IN_ALL_EVENTS_B) == 0) return -22;
+    int id = (mask & IN_DONT_FOLLOW_B) ? fs_resolve_nofollow(path, cwd) : fs_resolve(path, cwd);
+    if (id < 0) return -2;
+    if ((mask & IN_ONLYDIR_B) && fs_get_type(id) != FS_DIR) return -20;
+    if (fs_check_access(id, FS_ACCESS_READ) != 0) return -13;
+    mask &= ~(IN_DONT_FOLLOW_B | IN_ONLYDIR_B);
+    for (int i = 0; i < IN_WATCH_MAX; ++i)
+        if (in->w[i].wd && in->w[i].node == id)
+        {
+            in->w[i].mask = (mask & IN_MASK_ADD_B) ? (in->w[i].mask | (mask & ~IN_MASK_ADD_B)) : (mask & ~IN_MASK_ADD_B);
+            return in->w[i].wd;
+        }
+    for (int i = 0; i < IN_WATCH_MAX; ++i)
+        if (!in->w[i].wd) { in->w[i].wd = in->next_wd++; in->w[i].node = id; in->w[i].mask = mask & ~IN_MASK_ADD_B; return in->w[i].wd; }
+    return -28;                                   /* ENOSPC: too many watches */
+}
+
+int fd_inotify_rm_watch(int descriptor, int wd)
+{
+    Ino* in = ino_of(descriptor);
+    if (!in) return file_of(descriptor) ? -22 : -9;
+    for (int i = 0; i < IN_WATCH_MAX; ++i)
+        if (in->w[i].wd == wd && wd > 0) { in->w[i].wd = 0; ino_queue(in, wd, IN_IGNORED_B, 0, ""); return 0; }
+    return -22;
+}
+
+static int64_t inotify_read(OpenFile* entry, void* buffer, uint64_t length)
+{
+    Ino* in = (entry->aux >= 0 && entry->aux < IN_INST_MAX && inos[entry->aux].used) ? &inos[entry->aux] : 0;
+    if (!in) return -9;
+    if (in->qn == 0) return -11;
+    uint8_t* out = (uint8_t*)buffer; uint64_t done = 0;
+    while (in->qn > 0)
+    {
+        InoEv* e = &in->q[in->qh];
+        uint32_t nl = e->len ? (uint32_t)((e->len + 1 + 3) & ~3) : 0;
+        uint64_t need = 16U + nl;
+        if (done + need > length) { if (done == 0) return -22; break; }
+        uint8_t* r = out + done;
+        *(int32_t*)(r + 0) = e->wd; *(uint32_t*)(r + 4) = e->mask; *(uint32_t*)(r + 8) = e->cookie; *(uint32_t*)(r + 12) = nl;
+        for (uint32_t i = 0; i < nl; ++i) r[16 + i] = (int)i < e->len ? (uint8_t)e->name[i] : 0;
+        done += need;
+        in->qh = (in->qh + 1) % IN_QUEUE_MAX; --in->qn;
+        if (e->mask == IN_Q_OVERFLOW_B) in->overflow = 0;
+    }
+    return (int64_t)done;
+}
+
 int fd_fstat(int descriptor, FsStat* out)
 {
     OpenFile* f = file_of(descriptor);
@@ -791,7 +1023,8 @@ int fd_is_blocking(int descriptor)
     OpenFile* f = file_of(descriptor);
     if (!f || (f->flags & FD_O_NONBLOCK)) return 0;
     return f->kind == FD_KIND_STDIN || f->kind == FD_KIND_PIPE_READ || f->kind == FD_KIND_PIPE_WRITE || f->kind == FD_KIND_SOCK_TCP ||
-           f->kind == FD_KIND_SOCK_UDP || f->kind == FD_KIND_EVENT || f->kind == FD_KIND_UNIX || f->kind == FD_KIND_TIMER;
+           f->kind == FD_KIND_SOCK_UDP || f->kind == FD_KIND_EVENT || f->kind == FD_KIND_UNIX || f->kind == FD_KIND_TIMER ||
+           f->kind == FD_KIND_SIGNAL || f->kind == FD_KIND_INOTIFY;
 }
 
 int fd_is_socket(int descriptor)
@@ -810,7 +1043,7 @@ static int ux_of(OpenFile* f)
 static void ring_put(UnixSock* u, const uint8_t* d, uint32_t n)
 {
     for (uint32_t i = 0; i < n; ++i) { u->ring[u->wr] = d[i]; u->wr = (u->wr + 1U) % UX_RING; }
-    u->size += n; u->tot_w += n;
+    u->size += n; u->tot_w += n; ++u->gen;
 }
 static void ring_get(UnixSock* u, uint8_t* d, uint32_t n)
 {
@@ -895,7 +1128,7 @@ int fd_unix_connect(int descriptor, const char* path)
     if (srv < 0) return -24;
     usocks[srv].state = 2; usocks[srv].peer = me; usocks[srv].attached = 0;
     usocks[me].state = 2; usocks[me].peer = srv;
-    usocks[l].backlog[usocks[l].nback++] = srv;
+    usocks[l].backlog[usocks[l].nback++] = srv; ++usocks[l].gen;
     return 0;
 }
 
@@ -1179,7 +1412,7 @@ int fd_sock_shutdown(int descriptor, int how)   /* 0 RD, 1 WR, 2 RDWR */
         int me = ux_of(f);
         if (me < 0) return -9;
         if (usocks[me].state != 2) return -107;
-        if (how >= 1) usocks[me].wr_shut = 1;
+        if (how >= 1) { usocks[me].wr_shut = 1; if (usocks[me].peer >= 0) ++usocks[usocks[me].peer].gen; }
         return 0;
     }
     if (f->kind == FD_KIND_SOCK_TCP)
@@ -1267,6 +1500,13 @@ int fd_poll_mask(int descriptor)
             return (e->counter ? POLL_IN : 0) | (e->counter < 0xFFFFFFFFFFFFFFFEULL ? POLL_OUT : 0);
         }
         case FD_KIND_TIMER: { TimerFd* tf = &timerfds[f->aux]; tf_update(tf); return tf->expirations ? POLL_IN : 0; }
+        case FD_KIND_SIGNAL:
+        {
+            if (f->aux < 0 || f->aux >= SF_MAX || !sigfds[f->aux].used) return POLL_ERR;
+            FdTable* t = current_table();
+            return t && (process_sig_pending_raw(t->owner_pid) & sigfds[f->aux].mask) ? POLL_IN : 0;
+        }
+        case FD_KIND_INOTIFY: return f->aux >= 0 && f->aux < IN_INST_MAX && inos[f->aux].used && inos[f->aux].qn ? POLL_IN : 0;
         case FD_KIND_UNIX:
         {
             int me = ux_of(f);
@@ -1289,6 +1529,27 @@ int fd_poll_mask(int descriptor)
     }
 }
 
+
+/* Arrival counter for edge-triggered epoll: changes whenever new data, EOF, an error or a new connection shows up on the
+   descriptor.  Returns (1<<32)|counter, or 0 for kinds that have no counter (files, tty): the caller then falls back to
+   comparing readiness masks. */
+int64_t fd_poll_gen(int descriptor)
+{
+    OpenFile* f = file_of(descriptor);
+    if (!f) return -9;
+    switch (f->kind)
+    {
+        case FD_KIND_PIPE_READ: if (f->pipe_id < 0 || !pipes[f->pipe_id].used) return 0; return (1LL << 32) | pipes[f->pipe_id].gen;
+        case FD_KIND_EVENT: return (1LL << 32) | events[f->aux].gen;
+        case FD_KIND_TIMER: { TimerFd* tf = &timerfds[f->aux]; tf_update(tf); return (1LL << 32) | tf->gen; }
+        case FD_KIND_UNIX: { int me = ux_of(f); if (me < 0) return 0; return (1LL << 32) | usocks[me].gen; }
+        case FD_KIND_SIGNAL: { FdTable* t = current_table(); return t ? ((1LL << 32) | process_sig_serial(t->owner_pid)) : 0; }
+        case FD_KIND_INOTIFY: return f->aux >= 0 && f->aux < IN_INST_MAX ? ((1LL << 32) | inos[f->aux].gen) : 0;
+        case FD_KIND_SOCK_TCP: { (void)net_poll_once(); uint32_t g = net_tcp_gen(f->owner, f->aux); return (1LL << 32) | g; }
+        case FD_KIND_SOCK_UDP: { (void)net_poll_once(); uint32_t g = net_udp_gen(f->owner, f->aux); return (1LL << 32) | g; }
+        default: return 0;
+    }
+}
 
 int64_t fd_read(int descriptor, void* buffer, uint64_t length)
 {
@@ -1334,6 +1595,8 @@ int64_t fd_read(int descriptor, void* buffer, uint64_t length)
         tf->expirations = 0;
         return 8;
     }
+    if (entry->kind == FD_KIND_SIGNAL) return signalfd_read(entry, buffer, length);
+    if (entry->kind == FD_KIND_INOTIFY) return inotify_read(entry, buffer, length);
     if (entry->kind == FD_KIND_EVENT)
     {
         if (length < 8) return -22;
@@ -1358,6 +1621,7 @@ int64_t fd_read(int descriptor, void* buffer, uint64_t length)
     for (uint64_t i = 0; i < count; ++i)
         out[i] = file_buffer[entry->offset + i];
     entry->offset += count;
+    if (ino_active && count) ino_file_event(entry->path, entry->cwd, 0x1U);      /* IN_ACCESS */
     return (int64_t)count;
 }
 
@@ -1393,7 +1657,7 @@ int64_t fd_write(int descriptor, const void* buffer, uint64_t length)
             pipe->data[pipe->write_pos] = input[i];
             pipe->write_pos = (pipe->write_pos + 1U) % FD_PIPE_CAPACITY;
         }
-        pipe->size += (uint32_t)count;
+        pipe->size += (uint32_t)count; ++pipe->gen;
         return (int64_t)count;
     }
     if (entry->kind == FD_KIND_SOCK_TCP || entry->kind == FD_KIND_SOCK_UDP)
@@ -1406,7 +1670,7 @@ int64_t fd_write(int descriptor, const void* buffer, uint64_t length)
         EventState* ev = &events[entry->aux];
         if (v == 0xFFFFFFFFFFFFFFFFULL) return -22;
         if (ev->counter > 0xFFFFFFFFFFFFFFFEULL - v) return -11;
-        ev->counter += v;
+        ev->counter += v; ++ev->gen;
         return 8;
     }
     if (entry->kind != FD_KIND_FILE) return -9;
@@ -1419,6 +1683,14 @@ int64_t fd_write(int descriptor, const void* buffer, uint64_t length)
     if (entry->flags & FD_O_APPEND) entry->offset = old_size;
     if (entry->offset > FD_FILE_MAX || length > FD_FILE_MAX - entry->offset)
         return -27;
+    {   /* RLIMIT_FSIZE: nothing may be written at or past the limit (SIGXFSZ + EFBIG); a write crossing it is shortened */
+        uint64_t fl = process_rlimit_cur(table->owner_pid, PROC_RLIMIT_FSIZE);
+        if (fl != PROC_RLIM_INF && entry->offset + length > fl)
+        {
+            if (entry->offset >= fl) { (void)process_sig_raise(table->owner_pid, 25); return -27; }
+            length = fl - entry->offset;
+        }
+    }
 
     uint64_t end = entry->offset + length;
     if (entry->offset > old_size)
@@ -1487,6 +1759,8 @@ void fd_list()
             case FD_KIND_EVENT: uart_puts("eventfd    "); break;
             case FD_KIND_UNIX: uart_puts("unix-socket"); break;
             case FD_KIND_TIMER: uart_puts("timerfd    "); break;
+            case FD_KIND_SIGNAL: uart_puts("signalfd   "); break;
+            case FD_KIND_INOTIFY: uart_puts("inotify    "); break;
             default: uart_puts("unknown    "); break;
         }
         if (entry->kind == FD_KIND_FILE)

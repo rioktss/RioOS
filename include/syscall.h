@@ -136,6 +136,12 @@ enum SyscallNumber
     SYS_UMASK      = 109, /* umask(mask | ~0 queries) -> old mask */
     SYS_SYSINFO    = 110, /* sysinfo(uint64_t out[4]: total_pages, free_pages, online_cpus, uptime_ms) */
     SYS_ED25519    = 112, /* ed25519(op, uint64_t a[4]): op 0 pubkey(seed,-,-,pub) 1 sign(seed,msg,len,sig) 2 verify(pub,msg,len,sig) 3 rng-ready */
+    SYS_FDGEN      = 113, /* fdgen(fd): EPOLLET arrival counter, (1<<32)|gen or 0 */
+    SYS_RLIMIT     = 114, /* rlimit(op 0 get / 1 set, resource, cur, max, out*): per-process, inherited, enforced */
+    SYS_AFFINITY   = 115, /* affinity(op 0 get / 1 set, pid (0 = self), mask) -> mask / -errno */
+    SYS_SIGNALFD   = 116, /* signalfd(fd or -1, sigmask, flags 0x800 NONBLOCK | 0x1000 CLOEXEC) */
+    SYS_INOTIFY    = 117, /* inotify(op 0 init flags / 1 add_watch fd,path,mask / 2 rm_watch fd,wd) */
+    SYS_RUSAGE     = 118, /* rusage(who 0 self / 1 children, uint64_t out[4]: user_ms, sys_ms, maxrss_kb, ctx switches) */
     SYS_FDATTR     = 111, /* fdattr(fd, op 0 fchmod(mode) / 1 fchown(uid,gid) / 2 futimens(mtime_seconds)) on regular files */
     SYS_TTY        = 97,  /* tty(op 0 tcgetattr / 1 tcsetattr(action in x2) / 2 winsize, ptr) */
     SYS_HTTP_GET   = 78,  /* http_get(url, buf, cap, flags | cacert<<8?) see syscall.cpp: flags bit0 = insecure; x4 = cacert path or 0 -> body length or -errno */

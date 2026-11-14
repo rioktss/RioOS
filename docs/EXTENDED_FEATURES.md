@@ -106,3 +106,6 @@ See `docs/SECURITY_FS.md`: metadata journal + COW + derived bitmap, atomic `rena
 
 ## Not implemented
 Parallel kernel execution (SMP uses a Big Kernel Lock; only user code runs in parallel), mounts persisted in an fstab, IPv6 global addressing / routers / DNS / DHCPv6, TLS certificate validation and TLS 1.2, HTTPS server, sshd, ext2, atime/ctime and disk encryption, USB hubs/storage/tablet devices, Wi-Fi and other NICs, audio/GPU, booting on real hardware (Raspberry Pi), native machine-code compilation, kernel floating-point (userspace floats are soft-float), job-control signals beyond what `jobs/fg/bg/kill` already do.
+
+## Round 10: POSIX limits removed
+See `docs/IPC_POSIX.md` (Round 10): epoll EPOLLET with kernel arrival counters, enforced setrlimit, real getrusage, sched_setaffinity, signalfd, inotify, iconv. Remaining honest limits: BKL (kernel code is serialized) and host-dependent `-smp` speed.

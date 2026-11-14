@@ -674,6 +674,17 @@ int mmu_user_brk(int pid, uint64_t new_brk, uint64_t* out)
     return 0;
 }
 
+/* heap + mmap area currently reserved (what RLIMIT_AS / RLIMIT_DATA limit) */
+uint64_t mmu_user_vsize(int pid)
+{
+    int slot = user_space_find(pid);
+    if (slot < 0) return 0;
+    UserAddressSpace* sp = &user_spaces[slot];
+    uint64_t heap = sp->brk_start && sp->brk_cur > sp->brk_start ? sp->brk_cur - sp->brk_start : 0;
+    uint64_t map = sp->mmap_cur < MMU_USER_LIMIT ? MMU_USER_LIMIT - sp->mmap_cur : 0;
+    return heap + map;
+}
+
 int mmu_user_mmap(int pid, uint64_t length, uint32_t prot, uint64_t* out)
 {
     int slot = user_space_find(pid);
