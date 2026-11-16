@@ -322,7 +322,7 @@ void vfs_ls(const char* spec)
     }
 
     int id = operand[0] ? fs_resolve(operand, current_directory) : current_directory;
-    if (id < 0) { uart_puts("ls: not found or permission denied\r\n"); return; }
+    if (id < 0 || fs_get_type(id) < 0) { uart_puts("ls: not found or permission denied\r\n"); return; }   /* (also: cwd removed behind our back) */
 
     if (fs_get_type(id) == FS_DIR &&
         fs_check_access(id, FS_ACCESS_READ | FS_ACCESS_EXEC) != 0)

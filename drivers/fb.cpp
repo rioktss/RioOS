@@ -25,6 +25,7 @@
 #include "fb.h"
 #ifndef HOST_TEST
 #include "uart.h"
+#include "virtio_gpu.h"
 #endif
 
 #define FB_DEFAULT_WIDTH  1024
@@ -48,6 +49,7 @@ static int fb_w = FB_DEFAULT_WIDTH;
 static int fb_h = FB_DEFAULT_HEIGHT;
 static int fb_ready = 0;
 static int fb_display_ready = 0;
+static int fb_backend = 0;      /* 0 none, 1 QEMU ramfb, 2 virtio-gpu */
 
 #ifndef HOST_TEST
 struct FwCfgDma
@@ -272,13 +274,18 @@ void fb_init()
     fb_h = FB_DEFAULT_HEIGHT;
     fb_ready = 0;
     fb_display_ready = 0;
-    if (fwcfg_init_ramfb() == 0)
+    fb_backend = 0;
+    /* virtio-gpu wins when the machine has one (-device virtio-gpu-device); otherwise fall back to ramfb */
+    if (virtio_gpu_init(ramfb_pixels, FB_DEFAULT_WIDTH, FB_DEFAULT_HEIGHT)) fb_backend = 2;
+    else if (fwcfg_init_ramfb() == 0) fb_backend = 1;
+    if (fb_backend != 0)
     {
         fb_ready = 1;
         fb_clear(FB_BACKGROUND);
         fb_display_ready = 1;
         fb_present();
-        uart_puts("Framebuffer: QEMU ramfb is ready (1024x768 XRGB8888).\r\n");
+        if (fb_backend == 2) uart_puts("Framebuffer: virtio-gpu is ready (1024x768 XRGB8888).\r\n");
+        else uart_puts("Framebuffer: QEMU ramfb is ready (1024x768 XRGB8888).\r\n");
     }
     else
     {
@@ -305,6 +312,7 @@ void fb_present_rows(int y0, int y1)
     if (y1 <= y0) return;
     cache_clean(fb_base + (uint64_t)y0 * (uint64_t)fb_w,
                 (uint64_t)(y1 - y0) * (uint64_t)fb_w * sizeof(uint32_t));
+    if (fb_backend == 2) virtio_gpu_flush_rows(y0, y1);
 #else
     (void)y0; (void)y1;
 #endif
@@ -321,6 +329,10 @@ int fb_get_width() { return fb_w; }
 int fb_get_height() { return fb_h; }
 int fb_is_ready() { return fb_ready && fb_base != 0; }
 int fb_has_display() { return fb_display_ready; }
+const char* fb_backend_name()
+{
+    return fb_backend == 2 ? "virtio-gpu" : fb_backend == 1 ? "ramfb" : "none";
+}
 
 #ifdef HOST_TEST
 int fb_test_attach(uint32_t* pixels, int width, int height)

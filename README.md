@@ -145,7 +145,7 @@ RioOS/
 
 ## Known scope and limitations
 
-RioOS is an experimental learning project, not a replacement for Linux/BSD or a ready-to-use general-purpose OS. QEMU display backends and input devices vary by host package. Secondary CPUs are released via PSCI but only run offloaded jobs (the scheduler stays on CPU0); HTTPS/TLS and USB/HID are not implemented; and a QEMU visual/input session should be tested locally when changing the renderer or runners. Read the feature-specific guides for exact implementation status and tests.
+RioOS is an experimental learning project, not a replacement for Linux/BSD or a ready-to-use general-purpose OS. QEMU display backends and input devices vary by host package. Secondary CPUs are released via PSCI but only run offloaded jobs (the scheduler stays on CPU0); USB/HID, virtio-gpu, virtio-sound and virtio-9p are QEMU-tested only (see `docs/DEVICES.md` for the limits; no real hardware was tested); and a QEMU visual/input session should be tested locally when changing the renderer or runners. Read the feature-specific guides for exact implementation status and tests.
 
 ## Documentation
 
@@ -159,6 +159,7 @@ RioOS is an experimental learning project, not a replacement for Linux/BSD or a 
 - [`docs/ROADMAP.md`](./docs/ROADMAP.md) — planned work.
 - [`docs/P5_PROCESS_ISOLATION.md`](./docs/P5_PROCESS_ISOLATION.md) — P5 address spaces, page ownership, context frames, and limitations.
 - [`docs/EXTENDED_FEATURES.md`](./docs/EXTENDED_FEATURES.md) — preemptive multitasking, processes, memory, libc/dl, journal/symlinks, accounts, scripting, PCI/NVMe/AHCI, DHCP/TCP server/IPv6, SMP.
+- [`docs/DEVICES.md`](./docs/DEVICES.md) — USB HID (hubs, hot-plug, mouse/tablet), virtio-gpu, virtio-sound, virtio-9p: usage, run-script switches, limits.
 - [`docs/FAQ.md`](./docs/FAQ.md) — common questions.
 - [`tests/TEST_MATRIX.md`](./tests/TEST_MATRIX.md) — general test matrix.
 - [`docs/TEST_MATRIX_P5.md`](./docs/TEST_MATRIX_P5.md) — P5-specific verification matrix.

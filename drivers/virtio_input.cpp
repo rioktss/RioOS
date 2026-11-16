@@ -26,6 +26,7 @@
 #include "virtio_mmio.h"
 #include "uart.h"
 #include "console.h"
+#include "usb.h"
 
 #define V_DEVICE_ID          0x008U
 #define V_DEVICE_FEATURES    0x010U
@@ -388,7 +389,7 @@ int virtio_input_pointer_ready()
     return 0;
 }
 
-int virtio_input_poll(struct RioInputEvent* event)
+static int virtio_input_poll_virtio(struct RioInputEvent* event)
 {
     if (!event) return 0;
     event->kind = RIO_INPUT_NONE;
@@ -507,6 +508,14 @@ int virtio_input_poll(struct RioInputEvent* event)
         }
     }
     return 0;
+}
+
+/* virtio-input first, then USB HID pointing devices (same event format, coordinates 0..32767) */
+int virtio_input_poll(struct RioInputEvent* event)
+{
+    if (!event) return 0;
+    if (virtio_input_poll_virtio(event)) return 1;
+    return usb_poll_event(event);
 }
 
 int virtio_input_try_get_key(char* key)

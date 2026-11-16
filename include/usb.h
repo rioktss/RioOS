@@ -27,13 +27,19 @@
 
 #include "types.h"
 
-/* xHCI (USB 3) host controller driver, polling, HID boot-protocol keyboard and mouse. */
-void usb_init();                    /* find xHCI on PCI, reset, enumerate root-hub ports */
+/* xHCI (USB 3) host controller driver, polling: keyboards, pointing devices (mice, tablets, any HID report layout),
+   hubs (multi-tier), hot-plug / hot-unplug, error recovery. */
+struct RioInputEvent;
+void usb_init();                    /* find xHCI on PCI, reset, enumerate root-hub ports (and whatever hangs off hubs) */
 int usb_present();                  /* controller initialised */
 int usb_keyboard_count();
-int usb_mouse_count();
-void usb_poll();                    /* process events; cheap, called from the keyboard idle path */
-int usb_try_get_key(char* out);     /* next key typed on a USB keyboard (ASCII), 1 if any */
+int usb_mouse_count();              /* relative pointers */
+int usb_tablet_count();             /* absolute pointers (tablets, touch screens) */
+int usb_hub_count();
+void usb_poll();                    /* process events, hot-plug, hub status, key repeat; cheap, called from the keyboard idle path */
+void usb_rescan();                  /* force a look at every root port and hub port */
+int usb_try_get_key(char* out);     /* next key typed on a USB keyboard (1 if any); arrows/PgUp/PgDn use the virtio-input codes 0x80..0x85 */
+int usb_poll_event(struct RioInputEvent* event);   /* next pointer/scroll event of a USB pointing device (coordinates 0..32767) */
 void usb_status();
 int usb_selftest();                 /* control-transfer sanity test: 0 = pass */
 

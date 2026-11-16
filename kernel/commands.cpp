@@ -32,6 +32,9 @@
 #include "fat32.h"
 #include "pci.h"
 #include "usb.h"
+#include "virtio_gpu.h"
+#include "virtio_snd.h"
+#include "ninep.h"
 #include "tls.h"
 #include "x509.h"
 #include "ssh.h"
@@ -415,7 +418,7 @@ static int dev_by_name(const char* n)
 }
 static const char* dev_name(int d)
 {
-    return d == 0 ? "root" : d == 1 ? "ram0" : d == 5 ? "ram1" : d == 3 ? "nvme0n1" : d == 4 ? "sda" : "?";
+    return d == 0 ? "root" : d == 1 ? "ram0" : d == 5 ? "ram1" : d == 3 ? "nvme0n1" : d == 4 ? "sda" : (d == 6 || d == 7) ? "9p-cache" : "?";
 }
 static void mount_err(const char* who, int rc)
 {
@@ -430,6 +433,33 @@ static void mount_err(const char* who, int rc)
     uart_puts("\r\n");
 }
 
+/* mount a virtio-9p share (by mount tag) on a directory */
+static void do_mount_9p(const char* tag, const char* dir, int ro)
+{
+    int share = ninep_share_find(tag);
+    if (share < 0) { uart_puts("mount: no virtio-9p share with tag '"); uart_puts(tag); uart_puts("' (see '9p')\r\n"); return; }
+    int rc = fs_mount_9p(ninep_ops(), share, dir, vfs_cwd(), ro == 1);
+    if (rc == 0) { uart_puts(tag); uart_puts(" (9p) mounted on "); uart_puts(dir); uart_puts(ro == 1 ? " (ro)\r\n" : "\r\n"); return; }
+    if (rc == -2 || rc == -20 || rc == -16 || rc == -24 || rc == -22) { mount_err("mount", rc); return; }
+    uart_puts("mount: cannot read the 9p share (error "); print_u64((uint64_t)(-rc)); uart_puts(")\r\n");
+}
+
+static void command_mount9p(const char* argument)
+{
+    if (!security_is_root()) { uart_puts("mount9p: permission denied (root required)\r\n"); return; }
+    char buf[128]; str_copy(buf, argument ? argument : "", sizeof(buf));
+    char* w[6]; int n = split_words(buf, w, 6);
+    int ro = 0; char* pos[3]; int np = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        if (str_equal(w[i], "-r") || str_equal(w[i], "ro")) ro = 1;
+        else if (str_equal(w[i], "-w") || str_equal(w[i], "rw")) ro = 0;
+        else if (np < 3) pos[np++] = w[i];
+    }
+    if (np != 2) { uart_puts("usage: mount9p [-r] <tag> <dir>   (tags: see '9p')\r\n"); return; }
+    do_mount_9p(pos[0], pos[1], ro);
+}
+
 static void command_mount(const char* argument)
 {
     if (argument && argument[0])
@@ -437,12 +467,12 @@ static void command_mount(const char* argument)
         if (!security_is_root()) { uart_puts("mount: permission denied (root required)\r\n"); return; }
         char buf[128]; str_copy(buf, argument, sizeof(buf));
         char* w[8]; int n = split_words(buf, w, 8);
-        int ro = -1, tmpfs = 0; char* pos[3]; int np = 0;
+        int ro = -1, tmpfs = 0, p9 = 0; char* pos[3]; int np = 0;
         for (int i = 0; i < n; ++i)
         {
             if (str_equal(w[i], "-r")) ro = 1;
             else if (str_equal(w[i], "-w")) ro = 0;
-            else if (str_equal(w[i], "-t") && i + 1 < n) { ++i; if (str_equal(w[i], "tmpfs")) tmpfs = 1; else if (!str_equal(w[i], "myfs")) { uart_puts("mount: unknown filesystem type (myfs, tmpfs)\r\n"); return; } }
+            else if (str_equal(w[i], "-t") && i + 1 < n) { ++i; if (str_equal(w[i], "tmpfs")) tmpfs = 1; else if (str_equal(w[i], "9p")) p9 = 1; else if (!str_equal(w[i], "myfs")) { uart_puts("mount: unknown filesystem type (myfs, tmpfs, 9p)\r\n"); return; } }
             else if (str_equal(w[i], "-o") && i + 1 < n)
             {
                 ++i;
@@ -452,6 +482,12 @@ static void command_mount(const char* argument)
             else if (np < 3) pos[np++] = w[i];
         }
         int cwd = vfs_cwd();
+        if (p9)
+        {
+            if (np != 2) { uart_puts("usage: mount -t 9p [-r] <tag> <dir>\r\n"); return; }
+            do_mount_9p(pos[0], pos[1], ro);
+            return;
+        }
         if (tmpfs)
         {
             if (np != 2) { uart_puts("usage: mount -t tmpfs none <dir>\r\n"); return; }
@@ -501,9 +537,13 @@ static void command_mount(const char* argument)
     {
         FsMountInfo mi;
         if (fs_mount_info(i, &mi) != 0) continue;
-        uart_puts(dev_name(mi.dev)); uart_puts(" on "); uart_puts(mi.dir);
-        uart_puts((mi.dev == 1 || mi.dev == 5) ? " type tmpfs (" : " type myfs (");
-        uart_puts(mi.readonly ? "ro" : "rw"); uart_puts(")\r\n");
+        if (mi.p9share >= 0) { const char* t = ninep_share_tag(mi.p9share); uart_puts(t ? t : "9p"); }
+        else uart_puts(dev_name(mi.dev));
+        uart_puts(" on "); uart_puts(mi.dir);
+        uart_puts(mi.p9share >= 0 ? " type 9p (" : (mi.dev == 1 || mi.dev == 5) ? " type tmpfs (" : " type myfs (");
+        uart_puts(mi.readonly ? "ro" : "rw");
+        if (mi.p9share >= 0 && mi.p9hidden > 0) { uart_puts(", at least "); print_u64((uint64_t)mi.p9hidden); uart_puts(" entries hidden (cache full / name too long)"); }
+        uart_puts(")\r\n");
     }
 }
 
@@ -617,10 +657,117 @@ static void command_fat(const char* argument)
     uart_puts("fat: unknown subcommand or wrong arguments (run 'fat' for usage)\r\n");
 }
 
+static int p9_ls_cb(void* ctx, const char* name, uint32_t mt)
+{
+    (void)ctx;
+    uart_puts(mt == NINEP_S_IFDIR ? "  d " : mt == NINEP_S_IFLNK ? "  l " : mt == NINEP_S_IFREG ? "  - " : "  ? ");
+    uart_puts(name); uart_puts("\r\n");
+    return 0;
+}
+
+static void p9_err(const char* what, int rc)
+{
+    uart_puts("9p: "); uart_puts(what); uart_puts(" failed (errno "); print_u64((uint64_t)(rc < 0 ? -rc : rc)); uart_puts(")\r\n");
+}
+
+static void command_9p(const char* argument)
+{
+    char buf[200]; str_copy(buf, argument ? argument : "", sizeof(buf));
+    char* w[6]; int n = cw_tokens(buf, w, 6);
+    if (n == 0 || str_equal(w[0], "info"))
+    {
+        int cnt = ninep_share_count();
+        int usable = 0;
+        for (int i = 0; i < cnt; ++i) if (ninep_share_tag(i)) ++usable;
+        if (usable == 0) { uart_puts("9p: no virtio-9p share (QEMU: -fsdev local,id=f,path=DIR,security_model=none -device virtio-9p-device,fsdev=f,mount_tag=TAG)\r\n"); return; }
+        uart_puts("virtio-9p shares (9P2000.L):\r\n");
+        for (int i = 0; i < cnt; ++i)
+        {
+            const char* t = ninep_share_tag(i);
+            if (!t) continue;
+            uart_puts("  "); print_u64((uint64_t)i); uart_puts(": tag '"); uart_puts(t); uart_puts("', msize "); print_u64(ninep_share_msize(i));
+            uart_puts(ninep_share_alive(i) ? ", ok\r\n" : ", dead\r\n");
+        }
+        uart_puts("  requests so far: "); print_u64(ninep_request_count()); uart_puts("\r\n");
+        return;
+    }
+    if (!security_is_root()) { uart_puts("9p: permission denied (root required: raw share access; use mount9p for normal access)\r\n"); return; }
+    if (str_equal(w[0], "ls") && n >= 2)
+    {
+        int sh = ninep_share_find(w[1]);
+        if (sh < 0) { uart_puts("9p: unknown share tag\r\n"); return; }
+        int rc = ninep_ops()->readdir(sh, n > 2 ? w[2] : "", p9_ls_cb, 0);
+        if (rc != 0) p9_err("ls", rc);
+        return;
+    }
+    if (str_equal(w[0], "cat") && n == 3)
+    {
+        int sh = ninep_share_find(w[1]);
+        if (sh < 0) { uart_puts("9p: unknown share tag\r\n"); return; }
+        uint8_t* b = (uint8_t*)kmalloc(1048576 + 16);
+        if (!b) { uart_puts("9p: out of memory\r\n"); return; }
+        uint64_t size = 0;
+        int rc = ninep_ops()->read_file(sh, w[2], b, 1048576, &size);
+        if (rc != 0) p9_err("cat", rc);
+        else { for (uint64_t i = 0; i < size; ++i) uart_putc((char)b[i]); if (size && b[size - 1] != '\n') uart_puts("\r\n"); }
+        kfree(b);
+        return;
+    }
+    uart_puts("usage: 9p [info] | 9p ls <tag> [path] | 9p cat <tag> <path>\r\n");
+}
+
+static int parse_u64_arg(const char* s, uint64_t* out);
+static void command_sound(const char* argument)
+{
+    char buf[200]; str_copy(buf, argument ? argument : "", sizeof(buf));
+    char* w[6]; int n = cw_tokens(buf, w, 6);
+    if (n == 0 || str_equal(w[0], "info"))
+    {
+        if (!snd_present()) { uart_puts("sound: "); uart_puts(snd_error_text(SND_E_NODEV)); uart_puts("\r\n"); return; }
+        const SndInfo* si = snd_get_info();
+        static const uint32_t hz[14] = { 5512, 8000, 11025, 16000, 22050, 32000, 44100, 48000, 64000, 88200, 96000, 176400, 192000, 384000 };
+        uart_puts("virtio-sound: jacks "); print_u64(si->jacks); uart_puts(", streams "); print_u64(si->streams);
+        uart_puts(", chmaps "); print_u64(si->chmaps); uart_puts("\r\n  output stream "); print_u64((uint64_t)si->out_stream);
+        uart_puts(": channels "); print_u64(si->channels_min); uart_putc('-'); print_u64(si->channels_max);
+        uart_puts(", PCM S16, rates:");
+        for (int i = 0; i < 14; ++i) if (si->rates & (1U << i)) { uart_putc(' '); print_u64(hz[i]); }
+        uart_puts("\r\n  played "); print_u64(snd_bytes_played()); uart_puts(" bytes, errors "); print_u64(snd_error_count()); uart_puts("\r\n");
+        return;
+    }
+    if (str_equal(w[0], "beep"))
+    {
+        uint64_t freq = 880, ms = 250, vol = 50;
+        if ((n > 1 && !parse_u64_arg(w[1], &freq)) || (n > 2 && !parse_u64_arg(w[2], &ms)) || (n > 3 && !parse_u64_arg(w[3], &vol)) || n > 4)
+        { uart_puts("usage: sound beep [freq_hz=880] [ms=250] [volume_pct=50]\r\n"); return; }
+        if (freq > 20000ULL || ms > 60000ULL || vol > 100ULL) { uart_puts("sound: freq 20-20000 Hz, duration 1-60000 ms, volume 1-100\r\n"); return; }
+        int rc = snd_play_tone((uint32_t)freq, (uint32_t)ms, (uint32_t)vol, 44100U, 2U);
+        if (rc != SND_OK) { uart_puts("sound: "); uart_puts(snd_error_text(rc)); uart_puts("\r\n"); return; }
+        uart_puts("sound: played "); print_u64(freq); uart_puts(" Hz for "); print_u64(ms); uart_puts(" ms\r\n");
+        return;
+    }
+    if (str_equal(w[0], "play") && n == 2)
+    {
+        if (!snd_present()) { uart_puts("sound: "); uart_puts(snd_error_text(SND_E_NODEV)); uart_puts("\r\n"); return; }
+        uint8_t* b = (uint8_t*)kmalloc(1048576 + 16);
+        if (!b) { uart_puts("sound: out of memory\r\n"); return; }
+        uint64_t size = 0;
+        if (fs_read_file(w[1], vfs_cwd(), b, 1048576, &size) != 0) { uart_puts("sound: cannot read file (missing, no permission or over 1 MiB)\r\n"); kfree(b); return; }
+        uint32_t frames = 0, rate = 0, ch = 0;
+        int rc = snd_play_wav(b, (uint32_t)size, &frames, &rate, &ch);
+        kfree(b);
+        if (rc != SND_OK) { uart_puts("sound: "); uart_puts(snd_error_text(rc)); uart_puts("\r\n"); return; }
+        uart_puts("sound: played "); print_u64(frames); uart_puts(" frames ("); print_u64(rate); uart_puts(" Hz, "); print_u64(ch); uart_puts(" ch)\r\n");
+        return;
+    }
+    uart_puts("usage: sound [info] | sound beep [freq_hz] [ms] [volume_pct] | sound play <file.wav>\r\n");
+}
+
 static void command_lspci() { pci_list(); }
 static void command_usb(const char* argument)
 {
     if (argument && str_equal(argument, "selftest")) { if (!usb_present()) { uart_puts("usb: no xHCI controller (try QEMU: -device qemu-xhci -device usb-kbd)\r\n"); return; } int rc = usb_selftest(); uart_puts(rc == 0 ? "usb selftest: PASS\r\n" : "usb selftest: FAIL\r\n"); return; }
+    if (argument && str_equal(argument, "scan")) { if (!usb_present()) { uart_puts("usb: no xHCI controller (try QEMU: -device qemu-xhci -device usb-kbd)\r\n"); return; } usb_rescan(); usb_status(); return; }
+    if (argument && argument[0]) { uart_puts("usage: usb [scan | selftest]\r\n"); return; }
     usb_status();
 }
 
@@ -1087,7 +1234,10 @@ static const ManualEntry manual_entries[] =
     {"ping6", "ICMPv6 echo to a link-local address", "ping6 <ipv6>", "uses NDP neighbor discovery"},
     {"httpd", "HTTP file server (GET/HEAD, ranges, keep-alive, directory listings)", "httpd <port> [requests] [-d docroot] [-q]", "serves files below the document root (default /; with / and no index.html the path / is a greeting); index.html, directory listings, 301/403/404/405/416, Content-Type by extension, Range requests, HTTP/1.1 keep-alive; requests 0 = until Ctrl-C, default 1; one connection at a time; no HTTPS"},
     {"ftpd", "FTP server (passive/active, login with local accounts)", "ftpd [-p port] [-d root] [-n sessions] [-a] [-P lo-hi]", "login with a RioOS account (permissions of that user apply); USER PASS PWD CWD CDUP TYPE PASV EPSV PORT LIST NLST RETR STOR APPE DELE MKD RMD RNFR RNTO SIZE MDTM REST FEAT QUIT; -a adds a read-only anonymous login; -P lo-hi fixes the passive data ports (default 30000-31999) so QEMU hostfwd can forward them, e.g. RIOOS_FWD=\"tcp::2121-:21,tcp::30000-:30000\" with ftpd -P 30000; files up to 4 MiB; one session at a time; plain FTP (no TLS)"},
-    {"usb", "xHCI USB controller / HID devices", "usb [selftest]", "lists devices on the xHCI root hub; keyboards type into the shell, mice are tracked (start QEMU with -device qemu-xhci -device usb-kbd)"},
+    {"sound", "virtio-sound audio output", "sound [info] | beep [freq_hz] [ms] [volume_pct] | play <file.wav>", "plays a sine tone or a 16-bit PCM WAV (mono/stereo, up to 1 MiB) on the first virtio-sound output stream (QEMU: -audiodev none,id=a -device virtio-sound-device,audiodev=a)"},
+    {"mount9p", "mount a virtio-9p share", "mount9p [-r] <tag> <dir>", "mirrors the host directory of a virtio-9p share into the file tree (also: mount -t 9p <tag> <dir>); umount <dir> detaches it; writes go straight to the host"},
+    {"9p", "virtio-9p shares (raw access)", "9p [info] | 9p ls <tag> [path] | 9p cat <tag> <path>", "lists virtio-9p shares and gives root raw access to a share (ls/cat); mount9p mounts a share into the file tree"},
+    {"usb", "xHCI USB controller / HID devices", "usb [scan|selftest]", "lists xHCI devices (hubs, HID keyboards, mice, tablets); scan re-checks all ports (hot-plug is also automatic); keyboards type into the shell (start QEMU with -device qemu-xhci -device usb-kbd)"},
     {"lspci", "list PCIe devices", "lspci", "bus 0 via ECAM; shows class and assigned BARs"},
     {"nvme", "NVMe disk status", "nvme [selftest]", "selftest is read-only on the root disk, read/write on others"},
     {"sata", "AHCI/SATA disk status", "sata [selftest]", "selftest is read-only on the root disk, read/write on others"},
@@ -2077,7 +2227,15 @@ static void command_fbinfo()
 {
     uart_puts("Framebuffer diagnostics\r\n------------------------\r\nBackend : ");
     uart_puts(fb_has_display() ? "display attached (QEMU window)\r\n" : "none (serial console only)\r\n");
-    uart_puts("Surface : ");
+    uart_puts("Driver  : "); uart_puts(fb_backend_name());
+    if (virtio_gpu_ready())
+    {
+        uint32_t hw = 0, hh = 0; int en = 0;
+        virtio_gpu_display(&hw, &hh, &en);
+        uart_puts(" (host scanout "); print_u64(hw); uart_putc('x'); print_u64(hh);
+        uart_puts(en ? ", enabled" : ", disabled"); uart_puts(", flushes "); print_u64(virtio_gpu_flush_count()); uart_putc(')');
+    }
+    uart_puts("\r\nSurface : ");
     uart_puts(fb_is_ready() ? "initialized\r\n" : "not initialized\r\n");
     uart_puts("Geometry: "); print_u64((uint64_t)fb_get_width());
     uart_putc('x'); print_u64((uint64_t)fb_get_height());
@@ -2186,7 +2344,7 @@ static const HelpSection help_sections[] = {
  "  df [-h]  du  fsck [-r] [mnt]               usage and consistency check (-r repairs)\r\n"
  "  ln <a> <b>                                 hard link (shared data, link count in stat)\r\n"
  "  fat <dev> mkfs|info|ls|cat|get|put|mkdir|rm ...   FAT32 volumes with long names (man fat)\r\n"
- "  usb [selftest]                             xHCI USB, HID keyboard and mouse\r\n"},
+ "  usb [scan|selftest]                        xHCI USB: hubs, HID keyboard/mouse/tablet, hot-plug\r\n"},
 {"network", "NETWORK",
  "  net  ifconfig  dhcp [status|renew|release]  dnsserver <ip>  nslookup <host>\r\n"
  "  ping <ip>  ping6 <ipv6>                    ICMP echo over IPv4 / IPv6\r\n"
@@ -4815,6 +4973,9 @@ static void execute_command_inner(
     if (str_equal(command, "ftpd")) { command_ftpd(argument); return; }
     if (str_equal(command, "lspci")) { command_lspci(); return; }
     if (str_equal(command, "usb")) { command_usb(argument); return; }
+    if (str_equal(command, "sound")) { command_sound(argument); return; }
+    if (str_equal(command, "9p")) { command_9p(argument); return; }
+    if (str_equal(command, "mount9p")) { command_mount9p(argument); return; }
     if (str_equal(command, "nvme")) { command_nvme(argument); return; }
     if (str_equal(command, "sata")) { command_sata(argument); return; }
     if (str_equal(command, "umount")) { command_umount(argument); return; }

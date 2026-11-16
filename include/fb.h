@@ -36,6 +36,8 @@ int fb_get_width();
 int fb_get_height();
 int fb_is_ready();
 int fb_has_display();
+/* "virtio-gpu", "ramfb" or "none" */
+const char* fb_backend_name();
 uint32_t* fb_buffer();
 int fb_stride_pixels();
 void fb_draw_pixel(int x, int y, uint32_t color);

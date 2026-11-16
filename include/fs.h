@@ -127,11 +127,15 @@ int fs_fsck(const char* path, int cwd, int repair, FsckInfo* out);   /* path = a
 int fs_quota_set(uint32_t uid, uint64_t bytes);                         /* 0 removes the limit; persisted in /etc/quota */
 int fs_quota_get(uint32_t uid, uint64_t* limit, uint64_t* used);
 
-struct FsMountInfo { int dev; int readonly; int journal; int version; uint64_t total_sectors; uint64_t used_sectors; char dir[96]; };
+struct FsMountInfo { int dev; int readonly; int journal; int version; uint64_t total_sectors; uint64_t used_sectors; char dir[96]; int p9share; int p9hidden; };   /* p9share: virtio-9p share index (-1: ordinary mount); p9hidden: entries the 9p cache could not hold */
 int fs_mount_count();
 int fs_mount_info(int index, FsMountInfo* out);                    /* index 0 = root filesystem */
 int fs_mount_device(int dev, const char* path, int cwd, int readonly, int format_fresh);   /* 0 ok, -errno */
 int fs_mkfs_device(int dev);                                       /* format a device (must not be mounted) */
+/* Mount virtio-9p share `share` (see ninep.h) on an existing directory. The mount mirrors the share through a RAM cache
+   (storage devices 6/7); returns 0 or -errno (-16 already mounted / busy, -24 no cache device left). */
+struct NinepOps;
+int fs_mount_9p(const struct NinepOps* ops, int share, const char* path, int cwd, int readonly);
 int fs_umount_path(const char* path, int cwd, int busy_gid);       /* busy_gid: node id the shell is in, or -1 */
 
 #endif

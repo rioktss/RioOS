@@ -106,3 +106,9 @@ Round 8: host tests `crypto_host_test` (86 vectors from python `cryptography`), 
 
 
 Round 9: `fs_crash_test` (6185 simulated power-loss points on write-through and volatile-cache disks, plus corruption repair), `sshkey_host_test`, Ed25519 signing vectors in `crypto_host_test`; `qemu_net_tests.py` pkg session extended (signed index, untrusted key, rollback, tampered package, detached signatures, policy) and ssh session extended (ssh-keygen, public-key login without password, fallback to password, `-i`, key permission check); regression session 16 (`rng`, seed file persisting across boots, `fsck: clean` after create/rename/rm -r, `ssh-keygen`).
+
+Round 11: host test `fs9p_host_test` (9p mirror layer against an in-memory 9P server; run by build.sh, an ASan/UBSan run was done by hand); `tests/qemu_devices.py` (also run from `qemu_regression.py`; sessions skip when QEMU lacks the device):
+- usb: xHCI with a 2-tier hub tree + keyboard + mouse + tablet (QMP `input-send-event` for absolute/relative/wheel), hot-plug/unplug on hub and root ports, hub removal, key layer (Shift, Caps Lock, keypad, history, key repeat), no transfer errors
+- gpu: virtio-gpu scanout checked with `screendump` (1024x768, text pixels present), flush counter, no-display fallback
+- sound: virtio-sound with the `wav` audio backend: beep, WAV files (44.1/22.05/48 kHz, 8-bit/odd-rate/4-channel/garbage/empty/missing rejected), the captured host WAV has the right duration and is not silent
+- 9p: virtfs share: read, write, mkdir, rename, symlink, chmod, 1.2 MiB round trip byte-exact, `rm -r`, host-side changes visible in the guest, read-only mount, bad tag / bad mount point, host verification of everything the guest wrote

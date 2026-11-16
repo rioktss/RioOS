@@ -5,6 +5,7 @@ usage: [QEMU_BIOS=<pc-bios dir>] python3 tests/qemu_regression.py [path-to-qemu-
 Runs real boots on a throw-away copy of storage/disk.img and checks the console output.
 Sessions: core/ELF/job-control/scripting/security/FS, storage backends (NVMe, AHCI, root-on-NVMe),
 SMP (-smp 4), network (DHCP, TCP server, IPv6, ping) against tests/qemu_fake_peer.py, shell extras, USB xHCI,
+device tests (tests/qemu_devices.py: USB hubs/hot-plug/tablet, virtio-gpu, virtio-sound, virtio-9p),
 network extras + HTTPS against tests/qemu_fake_peer2.py.
 """
 import os, re, pty, select, shutil, subprocess, sys, tempfile, time, tty
@@ -341,6 +342,18 @@ log = run(C("su", "123", "rng", "rng seed", "mkdir /tmp/cr", "echo a > /tmp/cr/a
 check("rng-fs-boot1", log, "SHA-256 hash DRBG", "(ready)", "virtio-rng       : yes", "none yet", "seed file refreshed", "fsck: clean")
 log = run(C("su", "123", "rng", "ssh-keygen -f /tmp/k -C t@x", "ls -l /tmp/k", "ssh-keygen -l -f /tmp/k", "ssh-keygen -f /tmp/k", "fsck"), wait=2, extra=["-device", "virtio-rng-device"])
 check("rng-seed-persists-and-keygen", log, "loaded from /var/lib/random.seed", "Generated Ed25519 key pair", "rw-------", "256 SHA256:", "already exists", "fsck: clean")
+
+# device tests: USB hubs/hot-plug/tablet, virtio-gpu, virtio-sound, virtio-9p (each session SKIPs when this QEMU build lacks the device)
+if os.environ.get("RIOOS_SKIP_DEVTESTS") != "1":
+    print("== device tests (tests/qemu_devices.py): usb, gpu, sound, 9p")
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "tests", "qemu_devices.py"), QEMU], capture_output=True, text=True)
+    out = r.stdout
+    m = re.search(r"devices: (\d+) checks, (\d+) failed", out)
+    if m:
+        total += int(m.group(1)); fails += int(m.group(2))
+        print("\n".join(l for l in out.splitlines() if l.startswith("SKIP") or "FAIL" in l))
+        print("  device tests: %s checks, %s failed" % (m.group(1), m.group(2)))
+    else: fails += 1; total += 1; print("  FAIL  device tests did not finish\n" + (out + r.stderr)[-600:])
 
 # real-network tests (TLS verification, ssh/scp, httpd, ftpd, pkg over HTTP(S)); skipped when root / TAP / python-cryptography are missing
 if os.environ.get("RIOOS_SKIP_NETTESTS") != "1":

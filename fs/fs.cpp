@@ -27,6 +27,7 @@
 #include "uart.h"
 #include "string.h"
 #include "rtc.h"
+#include "ninep.h"
 
 /* Every public fs_* entry point below is the single-mount implementation (*_impl, local ids); the real API at the end of
    this file routes calls to the right mounted filesystem and encodes ids as (mount << 12) | local id. */
@@ -200,6 +201,15 @@ struct FsNode
 
 /* ---- per-mount context: every mounted filesystem has its own inode table, bitmap, journal and device ---- */
 #define FS_MAX_CTX 8
+/* bookkeeping for a mount that mirrors a virtio-9p share (see fs9p.inc); all zero for ordinary mounts */
+struct P9Node
+{
+    uint64_t ts;                         /* directory: when the listing was read; */
+    uint64_t ver, srv_mtime, srv_mtime_ns;   /* what the server reported when the cached data / link target was read */
+    uint8_t listed;                      /* directory listing has been read at least once */
+    uint8_t data_ok;                     /* file data (or link target) in the cache matches ver/srv_mtime */
+    uint8_t pending;                     /* created locally, not yet created on the server */
+};
 struct FsCtx
 {
     FsNode nodes[FS_NODE_CAP];
@@ -215,6 +225,9 @@ struct FsCtx
     int inuse, dev, quiet, no_journal;
     uint64_t fmt_sectors;
     int mp_ctx, mp_local;
+    int p9share1;                        /* > 0: mirrors 9p share (p9share1 - 1) */
+    int p9lost;                          /* directory entries that did not fit into the cache */
+    P9Node p9n[FS_NODE_CAP];
 };
 static FsCtx ctxs[FS_MAX_CTX];
 static FsCtx* cur = &ctxs[0];
@@ -889,6 +902,8 @@ static int create_node(int type, const char* name, int parent)
     if (id < 0)
         return -3;
     clear_bytes(&nodes[id], sizeof(nodes[id]));
+    clear_bytes(&cur->p9n[id], sizeof(cur->p9n[id]));
+    cur->p9n[id].pending = cur->p9share1 ? 1 : 0;      /* 9p mounts: pushed to the server by the wrapper layer */
     nodes[id].used = 1;
     nodes[id].type = type;
     nodes[id].parent = parent;
@@ -2238,6 +2253,8 @@ static void quota_load()
    Path functions first walk the path to the mount that holds it (crossing mount points and '..'
    back out of them), then call the single-mount implementation on that mount.
    ============================================================================================ */
+#include "fs9p.inc"
+
 #undef fs_check_access_as
 #undef fs_check_access
 #undef fs_init
@@ -2323,6 +2340,7 @@ static int route_step(const char* path, int cwd_gid, Route* r, int cross_last, i
     act(c);
     r->ctx = c; r->cwd = loc;
     if (loc < 0) return 0;
+    if (path[0] != '/' && (loc >= cur->node_count || !cur->nodes[loc].used)) return -1;   /* cwd no longer exists */
     if (str_len(path) >= (int)sizeof(r->buf)) return 0;                 /* too long: leave it to the implementation */
     char* b = r->buf;
     str_copy(b, path, sizeof(r->buf));
@@ -2363,6 +2381,7 @@ static int route_step(const char* path, int cwd_gid, Route* r, int cross_last, i
             if (fs_check_access_impl(loc, FS_ACCESS_EXEC) != 0) stop = 1;
             else
             {
+                if (cur->p9share1) (void)p9_refresh_dir(loc, 0);     /* 9p: bring this directory up to date first */
                 int ch = find_child(loc, comp);
                 if (ch < 0) stop = 1;
                 else if (cur->nodes[ch].type == FS_SYMLINK && (more || follow))
@@ -2464,7 +2483,7 @@ int fs_check_access(int id, uint32_t requested) { return fs_check_access_as(id, 
 int fs_get_root() { return 0; }
 int fs_resolve(const char* path, int cwd) { Route r; route(path, cwd, &r, 1, 1); int v = fs_resolve_impl(r.rest, r.cwd); return enc(r.ctx, v); }
 int fs_resolve_nofollow(const char* path, int cwd) { Route r; route(path, cwd, &r, 1); int v = fs_resolve_nofollow_impl(r.rest, r.cwd); return enc(r.ctx, v); }
-int fs_symlink(const char* target, const char* linkpath, int cwd) { Route r; route(linkpath, cwd, &r, 0); int v = fs_symlink_impl(target, r.rest, r.cwd); int g = enc(r.ctx, v); if (g >= 0) ev_created(linkpath, cwd); return g; }
+int fs_symlink(const char* target, const char* linkpath, int cwd) { Route r; route(linkpath, cwd, &r, 0); int v = fs_symlink_impl(target, r.rest, r.cwd); v = p9_post_create(v); int g = enc(r.ctx, v); if (g >= 0) ev_created(linkpath, cwd); return g; }
 int fs_readlink(const char* path, int cwd, char* out, int cap) { Route r; route(path, cwd, &r, 1); return fs_readlink_impl(r.rest, r.cwd, out, cap); }
 int fs_link_target_of(int id, char* out, int cap) { if (!gid_ok(id)) return -1; act(id >> 12); return fs_link_target_of_impl(id & 0xFFF, out, cap); }
 void fs_set_readonly(int ro) { act(0); fs_set_readonly_impl(ro); }
@@ -2478,43 +2497,65 @@ int fs_sync()
 }
 void fs_journal_status(FsJournalInfo* out) { act(0); fs_journal_status_impl(out); }
 int fs_journal_crash_test(const char* path, int cwd) { Route r; route(path, cwd, &r, 0); return fs_journal_crash_test_impl(r.rest, r.cwd); }
-int fs_mkdir(const char* path, int cwd) { Route r; route(path, cwd, &r, 0); int v = fs_mkdir_impl(r.rest, r.cwd); int g = enc(r.ctx, v); if (g >= 0) ev_created(path, cwd); return g; }
+int fs_mkdir(const char* path, int cwd) { Route r; route(path, cwd, &r, 0); int v = fs_mkdir_impl(r.rest, r.cwd); v = p9_post_create(v); int g = enc(r.ctx, v); if (g >= 0) ev_created(path, cwd); return g; }
 int fs_touch(const char* path, int cwd)
 {
     int existed = fs_event_hook ? fs_resolve_nofollow(path, cwd) >= 0 : 0;
-    Route r; route(path, cwd, &r, 0); int v = fs_touch_impl(r.rest, r.cwd); int g = enc(r.ctx, v);
+    Route r; route(path, cwd, &r, 0);
+    int p9existed = p9_pre_exists(r.rest, r.cwd);
+    int v = fs_touch_impl(r.rest, r.cwd);
+    v = p9_post_touch(p9existed, v, r.rest, r.cwd);
+    int g = enc(r.ctx, v);
     if (g >= 0) { if (existed) ev_changed(path, cwd, 4U); else ev_created(path, cwd); }
     return g;
 }
 int fs_mkdir_p(const char* path, int cwd)
 {
     int existed = fs_event_hook ? fs_resolve_nofollow(path, cwd) >= 0 : 1;
-    Route r; route(path, cwd, &r, 0); int v = fs_mkdir_p_impl(r.rest, r.cwd); int g = enc(r.ctx, v);
+    Route r; route(path, cwd, &r, 0); int v = fs_mkdir_p_impl(r.rest, r.cwd); v = p9_post_create(v); int g = enc(r.ctx, v);
     if (g >= 0 && !existed) ev_created(path, cwd);
     return g;
 }
 int fs_write_data(const char* path, int cwd, const uint8_t* data, uint64_t size)
 {
     int existed = fs_event_hook ? fs_resolve(path, cwd) >= 0 : 1;
-    Route r; route(path, cwd, &r, 0, 1); int rc = fs_write_data_impl(r.rest, r.cwd, data, size);
+    Route r; route(path, cwd, &r, 0, 1);
+    p9_pre_write(size);
+    int rc = fs_write_data_impl(r.rest, r.cwd, data, size);
+    if (rc == -3 && p9_on()) { p9_evict(-1); rc = fs_write_data_impl(r.rest, r.cwd, data, size); }
+    rc = p9_post_write(rc, r.rest, r.cwd, data, size);
     if (rc == 0 && fs_event_hook) { if (!existed) ev_created(path, cwd); if (existed || size) ev_changed(path, cwd, 2U); }
     return rc;
 }
 int fs_write(const char* path, int cwd, const char* content)
 {
     int existed = fs_event_hook ? fs_resolve(path, cwd) >= 0 : 1;
-    Route r; route(path, cwd, &r, 0, 1); int rc = fs_write_impl(r.rest, r.cwd, content);
+    Route r; route(path, cwd, &r, 0, 1);
+    if (p9_on())
+    {
+        const uint8_t* d = (const uint8_t*)(content ? content : ""); uint64_t n = (uint64_t)str_len(content ? content : "");
+        p9_pre_write(n);
+        int rc9 = fs_write_data_impl(r.rest, r.cwd, d, n);
+        if (rc9 == -3) { p9_evict(-1); rc9 = fs_write_data_impl(r.rest, r.cwd, d, n); }
+        rc9 = p9_post_write(rc9, r.rest, r.cwd, d, n);
+        if (rc9 == 0 && fs_event_hook) { if (!existed) ev_created(path, cwd); if (existed || (content && content[0])) ev_changed(path, cwd, 2U); }
+        return rc9;
+    }
+    int rc = fs_write_impl(r.rest, r.cwd, content);
     if (rc == 0 && fs_event_hook) { if (!existed) ev_created(path, cwd); if (existed || (content && content[0])) ev_changed(path, cwd, 2U); }
     return rc;
 }
-int fs_read_file(const char* path, int cwd, uint8_t* buffer, uint64_t capacity, uint64_t* out_size) { Route r; route(path, cwd, &r, 1, 1); return fs_read_file_impl(r.rest, r.cwd, buffer, capacity, out_size); }
-int fs_read_file_for_update(const char* path, int cwd, uint8_t* buffer, uint64_t capacity, uint64_t* out_size) { Route r; route(path, cwd, &r, 1, 1); return fs_read_file_for_update_impl(r.rest, r.cwd, buffer, capacity, out_size); }
-int fs_cat(const char* path, int cwd) { Route r; route(path, cwd, &r, 1, 1); return fs_cat_impl(r.rest, r.cwd); }
-int fs_cat_numbered(const char* path, int cwd) { Route r; route(path, cwd, &r, 1, 1); return fs_cat_numbered_impl(r.rest, r.cwd); }
+int fs_read_file(const char* path, int cwd, uint8_t* buffer, uint64_t capacity, uint64_t* out_size) { Route r; route(path, cwd, &r, 1, 1); { int pr = p9_pre_read(r.rest, r.cwd); if (pr) return pr; } return fs_read_file_impl(r.rest, r.cwd, buffer, capacity, out_size); }
+int fs_read_file_for_update(const char* path, int cwd, uint8_t* buffer, uint64_t capacity, uint64_t* out_size) { Route r; route(path, cwd, &r, 1, 1); { int pr = p9_pre_read(r.rest, r.cwd); if (pr) return pr; } return fs_read_file_for_update_impl(r.rest, r.cwd, buffer, capacity, out_size); }
+int fs_cat(const char* path, int cwd) { Route r; route(path, cwd, &r, 1, 1); { int pr = p9_pre_read(r.rest, r.cwd); if (pr) return pr; } return fs_cat_impl(r.rest, r.cwd); }
+int fs_cat_numbered(const char* path, int cwd) { Route r; route(path, cwd, &r, 1, 1); { int pr = p9_pre_read(r.rest, r.cwd); if (pr) return pr; } return fs_cat_numbered_impl(r.rest, r.cwd); }
 int fs_rm(const char* path, int cwd)
 {
     EvSnap s; s.id = -1; if (fs_event_hook) ev_snap(path, cwd, 0, &s);
-    Route r; route(path, cwd, &r, 1); int rc = fs_rm_impl(r.rest, r.cwd);
+    Route r; route(path, cwd, &r, 1);
+    P9Rm pm; p9_pre_rm(r.rest, r.cwd, &pm, 1);
+    int rc = fs_rm_impl(r.rest, r.cwd);
+    rc = p9_post_rm(rc, &pm, 0);
     if (rc == 0 && s.id >= 0) { if (!ev_alive(&s)) ev_removed(&s); }
     return rc;
 }
@@ -2529,7 +2570,10 @@ int fs_rm_recursive(const char* path, int cwd)
 {
     static EvSnap tree[EV_TREE_MAX]; int nt = 0;
     if (fs_event_hook) { int id = fs_resolve_nofollow(path, cwd); if (id >= 0) ev_collect(id, tree, &nt, 0); }
-    Route r; route(path, cwd, &r, 1); int rc = fs_rm_recursive_impl(r.rest, r.cwd);
+    Route r; route(path, cwd, &r, 1);
+    P9Rm pm; p9_pre_rm(r.rest, r.cwd, &pm, 0);
+    int rc = fs_rm_recursive_impl(r.rest, r.cwd);
+    rc = p9_post_rm(rc, &pm, 1);
     for (int i = 0; i < nt; ++i) if (tree[i].id >= 0 && !ev_alive(&tree[i])) ev_removed(&tree[i]);
     return rc;
 }
@@ -2552,7 +2596,9 @@ static int fs_rename_core(const char* from, const char* to, int cwd)
     for (const char* q = b.rest; *q && p < 198; ++q) fb[p++] = *q;
     fb[p] = 0;
     act(a.ctx);
-    return fs_rename_impl(fa, fb, 0);
+    P9Mv pv; p9_pre_rename(fa, &pv);
+    int rc = fs_rename_impl(fa, fb, 0);
+    return p9_post_rename(rc, &pv);
 }
 int fs_rename(const char* from, const char* to, int cwd)
 {
@@ -2593,23 +2639,59 @@ int fs_get_parent(int id)
     if ((id & 0xFFF) == 0 && c > 0) { act(ctxs[c].mp_ctx); int pp = fs_get_parent_impl(ctxs[c].mp_local); act(c); return enc(ctxs[c].mp_ctx, pp); }
     act(c); return enc(c, fs_get_parent_impl(id & 0xFFF));
 }
-int fs_get_child_count(int id) { if (!gid_ok(id)) return 0; act(id >> 12); return fs_get_child_count_impl(id & 0xFFF); }
-int fs_get_child(int id, int index) { if (!gid_ok(id)) return -1; act(id >> 12); return enc(id >> 12, fs_get_child_impl(id & 0xFFF, index)); }
+int fs_get_child_count(int id) { if (!gid_ok(id)) return 0; act(id >> 12); (void)p9_refresh_dir(id & 0xFFF, 0); return fs_get_child_count_impl(id & 0xFFF); }
+int fs_get_child(int id, int index) { if (!gid_ok(id)) return -1; act(id >> 12); (void)p9_refresh_dir(id & 0xFFF, 0); return enc(id >> 12, fs_get_child_impl(id & 0xFFF, index)); }
 uint32_t fs_get_mode(int id) { if (!gid_ok(id)) return 0; act(id >> 12); return fs_get_mode_impl(id & 0xFFF); }
 uint64_t fs_get_mtime(int id) { if (!gid_ok(id)) return 0; act(id >> 12); return fs_get_mtime_impl(id & 0xFFF); }
 uint32_t fs_get_uid(int id) { if (!gid_ok(id)) return 0; act(id >> 12); return fs_get_uid_impl(id & 0xFFF); }
 uint32_t fs_get_gid(int id) { if (!gid_ok(id)) return 0; act(id >> 12); return fs_get_gid_impl(id & 0xFFF); }
 static void ev_attrib_id(int id) { if (!fs_event_hook) return; EvSnap s; ev_snap_id(id, &s); ev_emit(&s, 4U, 0); }
-int fs_set_mode(int id, uint32_t mode) { if (!gid_ok(id)) return -1; act(id >> 12); int rc = fs_set_mode_impl(id & 0xFFF, mode); if (rc == 0) ev_attrib_id(id); return rc; }
-int fs_set_owner(int id, uint32_t uid, uint32_t gid) { if (!gid_ok(id)) return -1; act(id >> 12); int rc = fs_set_owner_impl(id & 0xFFF, uid, gid); if (rc == 0) ev_attrib_id(id); return rc; }
-int fs_set_owner_path(const char* path, int cwd, uint32_t uid, uint32_t gid) { Route r; route(path, cwd, &r, 1, 1); int rc = fs_set_owner_path_impl(r.rest, r.cwd, uid, gid); if (rc == 0) ev_changed(path, cwd, 4U); return rc; }
+int fs_set_mode(int id, uint32_t mode) { if (!gid_ok(id)) return -1; act(id >> 12); int rc = fs_set_mode_impl(id & 0xFFF, mode); if (rc == 0) rc = p9_post_attr(id & 0xFFF, NINEP_SET_MODE); if (rc == 0) ev_attrib_id(id); return rc; }
+int fs_set_owner(int id, uint32_t uid, uint32_t gid) { if (!gid_ok(id)) return -1; act(id >> 12); int rc = fs_set_owner_impl(id & 0xFFF, uid, gid); if (rc == 0) rc = p9_post_attr(id & 0xFFF, NINEP_SET_UID | NINEP_SET_GID); if (rc == 0) ev_attrib_id(id); return rc; }
+int fs_set_owner_path(const char* path, int cwd, uint32_t uid, uint32_t gid)
+{
+    Route r; route(path, cwd, &r, 1, 1);
+    int rc = fs_set_owner_path_impl(r.rest, r.cwd, uid, gid);
+    if (rc == 0 && p9_on()) { int id = fs_resolve_impl(r.rest, r.cwd); if (id >= 0) rc = p9_post_attr(id, NINEP_SET_UID | NINEP_SET_GID); }
+    if (rc == 0) ev_changed(path, cwd, 4U);
+    return rc;
+}
 int fs_stat_path(const char* path, int cwd, FsStat* out) { Route r; route(path, cwd, &r, 1, 1); return fs_stat_path_impl(r.rest, r.cwd, out); }
 int fs_lstat_path(const char* path, int cwd, FsStat* out) { Route r; route(path, cwd, &r, 1); return fs_lstat_path_impl(r.rest, r.cwd, out); }
-int fs_truncate(const char* path, int cwd, uint64_t size) { Route r; route(path, cwd, &r, 0, 1); int rc = fs_truncate_impl(r.rest, r.cwd, size); if (rc == 0) ev_changed(path, cwd, 2U); return rc; }
+int fs_truncate(const char* path, int cwd, uint64_t size)
+{
+    Route r; route(path, cwd, &r, 0, 1);
+    if (p9_on() && size <= FS_MAX_FILE_SIZE)
+    {
+        int pr = p9_pre_read(r.rest, r.cwd);                          /* the implementation copies the current content */
+        if (pr) return pr;
+        int tid = fs_resolve_impl(r.rest, r.cwd);
+        uint64_t cur_size = (tid >= 0 && ctxs[r.ctx].nodes[tid].type == FS_FILE) ? ctxs[r.ctx].nodes[tid].size : 0;
+        p9_make_room((size > cur_size ? size : cur_size) + size, tid);
+    }
+    int rc = fs_truncate_impl(r.rest, r.cwd, size);
+    if (rc == 0 && p9_on()) rc = p9_post_truncate(rc, r.rest, r.cwd, size);
+    if (rc == 0) ev_changed(path, cwd, 2U);
+    return rc;
+}
 uint64_t fs_total_sectors() { act(0); return fs_total_sectors_impl(); }
 uint64_t fs_used_sectors() { act(0); return fs_used_sectors_impl(); }
-int fs_set_mode_path(const char* path, int cwd, uint32_t mode) { Route r; route(path, cwd, &r, 1, 1); int rc = fs_set_mode_path_impl(r.rest, r.cwd, mode); if (rc == 0) ev_changed(path, cwd, 4U); return rc; }
-int fs_set_mtime_path(const char* path, int cwd, uint64_t mtime) { Route r; route(path, cwd, &r, 1, 1); int rc = fs_set_mtime_path_impl(r.rest, r.cwd, mtime); if (rc == 0) ev_changed(path, cwd, 4U); return rc; }
+int fs_set_mode_path(const char* path, int cwd, uint32_t mode)
+{
+    Route r; route(path, cwd, &r, 1, 1);
+    int rc = fs_set_mode_path_impl(r.rest, r.cwd, mode);
+    if (rc == 0 && p9_on()) { int id = fs_resolve_impl(r.rest, r.cwd); if (id >= 0) rc = p9_post_attr(id, NINEP_SET_MODE); }
+    if (rc == 0) ev_changed(path, cwd, 4U);
+    return rc;
+}
+int fs_set_mtime_path(const char* path, int cwd, uint64_t mtime)
+{
+    Route r; route(path, cwd, &r, 1, 1);
+    int rc = fs_set_mtime_path_impl(r.rest, r.cwd, mtime);
+    if (rc == 0 && p9_on()) { int id = fs_resolve_impl(r.rest, r.cwd); if (id >= 0) rc = p9_post_attr(id, NINEP_SET_MTIME); }
+    if (rc == 0) ev_changed(path, cwd, 4U);
+    return rc;
+}
 int fs_persistent() { return ctxs[0].mounted; }
 void fs_init() { fs_init_impl(); act(0); }
 
@@ -2618,6 +2700,7 @@ int fs_link_hard(const char* target, const char* linkpath, int cwd)
     Route a, b; route(target, cwd, &a, 1); route(linkpath, cwd, &b, 0);
     if (a.ctx != b.ctx) return -18;
     if (!a.rest || !b.rest) return -22;
+    if (ctxs[a.ctx].p9share1) return -95;                                     /* no hard links on a 9p mount (needs Tlink) */
     char fa[200], fb[200], da[200], db[200];
     ctx_rel_path(a.ctx, a.cwd, da, sizeof(da)); ctx_rel_path(b.ctx, b.cwd, db, sizeof(db));
     int p = 0; for (const char* q = da; *q && p < 150; ++q) fa[p++] = *q;
@@ -2638,6 +2721,7 @@ int fs_fsck(const char* path, int cwd, int repair, FsckInfo* out)
 {
     int c = 0;
     if (path && path[0]) { Route r; route(path, cwd, &r, 1); if (r.cwd != 0 || (r.rest && r.rest[0])) { act(0); return -22; } c = r.ctx; }
+    if (ctxs[c].p9share1) { act(0); return -95; }                             /* the server owns the data: nothing to check here */
     act(c); int rc = fs_fsck_impl(repair, out); act(0); return rc;
 }
 int fs_quota_set(uint32_t uid, uint64_t bytes) { act(0); return fs_quota_set_impl(uid, bytes); }
@@ -2667,7 +2751,15 @@ int fs_mount_info(int index, FsMountInfo* out)
         if (n++ != index) continue;
         out->dev = ctxs[c].dev; out->readonly = ctxs[c].fs_ro; out->journal = ctxs[c].jnl_enabled; out->version = (int)ctxs[c].g_version;
         out->total_sectors = ctxs[c].disk_sectors;
-        act(c); out->used_sectors = fs_used_sectors_impl(); act(0);
+        act(c); out->used_sectors = fs_used_sectors_impl();
+        out->p9share = ctxs[c].p9share1 - 1;
+        out->p9hidden = ctxs[c].p9lost;
+        if (ctxs[c].p9share1 && p9ops)                                        /* report the share's own capacity (df) */
+        {
+            uint64_t tb = 0, fb = 0;
+            if (p9ops->statfs(ctxs[c].p9share1 - 1, &tb, &fb) == 0 && tb >= fb) { out->total_sectors = tb / 512ULL; out->used_sectors = (tb - fb) / 512ULL; }
+        }
+        act(0);
         if (c == 0) { out->dir[0] = '/'; out->dir[1] = 0; }
         else gid_path(enc(ctxs[c].mp_ctx, ctxs[c].mp_local), out->dir, sizeof(out->dir));
         return 0;
@@ -2675,7 +2767,7 @@ int fs_mount_info(int index, FsMountInfo* out)
     return -1;
 }
 
-int fs_mount_device(int dev, const char* path, int cwd, int readonly, int format_fresh)
+static int mount_common(int dev, const char* path, int cwd, int readonly, int format_fresh, int p9share1)
 {
     if (dev < 0 || !path) return -22;
     if (dev_in_use(dev)) return -16;
@@ -2696,8 +2788,9 @@ int fs_mount_device(int dev, const char* path, int cwd, int readonly, int format
     clear_bytes(&ctxs[slot], sizeof(ctxs[slot]));
     ctxs[slot].inuse = 1; ctxs[slot].dev = dev; ctxs[slot].fs_ro = readonly ? 1 : 0;
     ctxs[slot].mp_ctx = pc; ctxs[slot].mp_local = node;
-    ctxs[slot].quiet = (dev == 1 || dev == 5);
-    ctxs[slot].no_journal = (dev == 1 || dev == 5);
+    ctxs[slot].quiet = (dev == 1 || dev == 5 || p9share1);
+    ctxs[slot].no_journal = (dev == 1 || dev == 5 || p9share1);
+    ctxs[slot].p9share1 = p9share1;
     ctxs[slot].fmt_sectors = cap > FS_DEFAULT_DISK_SECTORS ? FS_DEFAULT_DISK_SECTORS : cap;
     act(slot);
     set_layout(FS_VERSION);
@@ -2707,6 +2800,13 @@ int fs_mount_device(int dev, const char* path, int cwd, int readonly, int format
         int saved_ro = cur->fs_ro; cur->fs_ro = 0;
         rc = format_fs();
         if (rc == 0 && ctxs[slot].quiet) { cur->nodes[0].mode = 0777U; (void)save_inode(0); }
+        if (rc == 0 && p9share1)
+        {
+            NinepAttr ra;
+            rc = p9ops->lookup(p9share1 - 1, "", &ra);                       /* the share must be reachable and a directory */
+            if (rc == 0 && (ra.mode & NINEP_S_IFMT) != NINEP_S_IFDIR) rc = -20;
+            if (rc == 0) p9_set_attr(0, &ra, 0);
+        }
         cur->fs_ro = saved_ro;
     }
     else rc = mount_current(0);
@@ -2722,8 +2822,27 @@ int fs_mount_device(int dev, const char* path, int cwd, int readonly, int format
     return 0;
 }
 
+int fs_mount_device(int dev, const char* path, int cwd, int readonly, int format_fresh)
+{
+    if (dev == 6 || dev == 7) return -22;                                      /* internal 9p cache devices */
+    return mount_common(dev, path, cwd, readonly, format_fresh, 0);
+}
+
+/* mount virtio-9p share `share` (index from ninep_share_find) on directory `path`; ops = the 9P client (or a test double) */
+int fs_mount_9p(const NinepOps* ops, int share, const char* path, int cwd, int readonly)
+{
+    if (!ops || share < 0 || !path) return -22;
+    for (int c = 1; c < FS_MAX_CTX; ++c) if (ctxs[c].inuse && ctxs[c].p9share1 == share + 1) return -16;   /* already mounted */
+    int dev = -1;
+    for (int d = 6; d <= 7; ++d) if (!dev_in_use(d)) { dev = d; break; }
+    if (dev < 0) return -24;                                                   /* both cache devices are in use */
+    p9ops = ops;
+    return mount_common(dev, path, cwd, readonly, 1, share + 1);
+}
+
 int fs_mkfs_device(int dev)
 {
+    if (dev == 6 || dev == 7) return -22;
     if (dev <= 0 || !storage_dev_sectors) return -22;
     if (dev_in_use(dev)) return -16;
     uint64_t cap = storage_dev_sectors(dev);

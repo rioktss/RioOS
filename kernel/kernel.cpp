@@ -45,6 +45,8 @@
 #include "version.h"
 #include "fb.h"
 #include "console.h"
+#include "virtio_snd.h"
+#include "ninep.h"
 
 extern "C" void kernel_main()
 {
@@ -149,6 +151,11 @@ extern "C" void kernel_main()
 
     uart_puts("[11] Initializing keyboard...\r\n");
     keyboard_init();
+    if (snd_init()) uart_puts("Sound: virtio-sound output stream ready (see 'sound').\r\n");
+    {
+        int shares = ninep_init();
+        if (shares > 0) { uart_puts("9p: "); uart_puts(shares == 1 ? "1 virtio-9p share" : "virtio-9p shares"); uart_puts(" ready (see '9p', 'mount9p').\r\n"); }
+    }
 
     uart_puts("[12] Initializing scheduler...\r\n");
     scheduler_init();

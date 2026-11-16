@@ -72,8 +72,10 @@ if ! backend_ok "$DISPLAY_BACKEND"; then
     DISPLAY_BACKEND="$picked"
 fi
 
+FBDEV=ramfb
+if [ "${RIOOS_GPU:-}" = "virtio" ]; then FBDEV=virtio-gpu-device; fi
 DEVICE_HELP="$("$QEMU" -device help 2>&1 || true)"
-for required_device in ramfb virtio-keyboard-device virtio-tablet-device; do
+for required_device in "$FBDEV" virtio-keyboard-device virtio-tablet-device; do
     if ! grep -Fq "name \"${required_device}\"" <<<"$DEVICE_HELP"; then
         echo "ERROR: this QEMU build lacks '${required_device}'." >&2
         echo "  Install a QEMU system-aarch64 build that includes ramfb and VirtIO input devices." >&2
@@ -82,6 +84,36 @@ for required_device in ramfb virtio-keyboard-device virtio-tablet-device; do
 done
 
 echo "RioOS terminal window: QEMU ($DISPLAY_BACKEND). Type in the window; scroll with the mouse wheel." >&2
+
+# ---- optional extra devices (everything below is off by default) --------------------------------------------------
+#   RIOOS_USB=1             xHCI controller + USB keyboard + USB tablet (hubs / hot-plug: use the QEMU monitor, see docs/DEVICES.md)
+#   RIOOS_SOUND=<driver>    virtio-sound with a host audio driver (e.g. coreaudio, alsa, sdl, wav); 1 = coreaudio; wav writes ${RIOOS_WAV:-rioos-audio.wav}
+#   RIOOS_9P=<dir>[,<dir2>] share host directories over virtio-9p (in the guest, as root: mkdir -p /mnt/p9; mount9p share0 /mnt/p9)
+#   RIOOS_GPU=virtio        virtio-gpu (2D) instead of ramfb
+need_dev() {
+    "$QEMU" -device help 2>&1 | grep -Fq "name \"$1\"" || { echo "ERROR: this QEMU build lacks '$1'." >&2; exit 1; }
+}
+EXTRA=()
+if [ -n "${RIOOS_USB:-}" ] && [ "${RIOOS_USB}" != "0" ]; then
+    need_dev qemu-xhci; need_dev usb-kbd; need_dev usb-tablet
+    EXTRA+=(-device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0)
+fi
+if [ -n "${RIOOS_SOUND:-}" ] && [ "${RIOOS_SOUND}" != "0" ]; then
+    need_dev virtio-sound-device
+    _snd="${RIOOS_SOUND}"; [ "$_snd" = "1" ] && _snd="coreaudio"
+    if [ "$_snd" = "wav" ]; then EXTRA+=(-audiodev "wav,id=snd0,path=${RIOOS_WAV:-rioos-audio.wav}"); else EXTRA+=(-audiodev "${_snd},id=snd0"); fi
+    EXTRA+=(-device virtio-sound-device,audiodev=snd0)
+fi
+if [ -n "${RIOOS_9P:-}" ]; then
+    need_dev virtio-9p-device
+    IFS=',' read -ra _dirs <<< "$RIOOS_9P"
+    _i=0
+    for _d in "${_dirs[@]}"; do
+        [ -d "$_d" ] || { echo "ERROR: RIOOS_9P directory '$_d' not found." >&2; exit 1; }
+        EXTRA+=(-fsdev "local,id=fs${_i},path=${_d},security_model=none" -device "virtio-9p-device,fsdev=fs${_i},mount_tag=share${_i}")
+        _i=$((_i + 1))
+    done
+fi
 
 exec "$QEMU" \
     -M virt,gic-version=2,virtualization=on \
@@ -92,11 +124,12 @@ exec "$QEMU" \
     -serial stdio \
     -monitor none \
     -kernel "$KERNEL" \
-    -device ramfb \
+    -device "$FBDEV" \
     -drive "if=none,format=raw,file=$DISK,id=vd0" \
     -device virtio-blk-device,drive=vd0 \
     -device virtio-rng-device \
     -netdev "user,id=n1,ipv4=on,ipv6=off${NETFWD}" \
     -device virtio-net-device,netdev=n1 \
     -device virtio-keyboard-device \
-    -device virtio-tablet-device
+    -device virtio-tablet-device \
+    ${EXTRA[@]+"${EXTRA[@]}"}

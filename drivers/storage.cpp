@@ -107,9 +107,15 @@ void storage_status()
 static uint8_t ramdisk[2][RAMDISK_SECTORS * 512] __attribute__((aligned(16)));
 static int ram_index(int dev) { return dev == 1 ? 0 : dev == 5 ? 1 : -1; }
 
+/* 6 and 7: 8 MiB RAM caches that back the node/data cache of a mounted virtio-9p share (see fs/fs9p.inc) */
+#define P9CACHE_SECTORS 17408
+static uint8_t p9cache[2][P9CACHE_SECTORS * 512] __attribute__((aligned(16)));
+static int p9c_index(int dev) { return dev == 6 ? 0 : dev == 7 ? 1 : -1; }
+
 uint64_t storage_dev_sectors(int dev)
 {
     if (ram_index(dev) >= 0) return RAMDISK_SECTORS;
+    if (p9c_index(dev) >= 0) return P9CACHE_SECTORS;
     if (dev == 3) return (backend != BK_NVME && nvme_ready()) ? nvme_capacity() : 0;
     if (dev == 4) return (backend != BK_AHCI && ahci_ready()) ? ahci_capacity() : 0;
     return 0;
@@ -122,6 +128,14 @@ int storage_dev_read(int dev, uint64_t sector, void* buffer)
     {
         if (sector >= RAMDISK_SECTORS) return -1;
         const uint8_t* src = &ramdisk[r][sector * 512]; uint8_t* d = (uint8_t*)buffer;
+        for (int i = 0; i < 512; ++i) d[i] = src[i];
+        return 0;
+    }
+    int pc = p9c_index(dev);
+    if (pc >= 0)
+    {
+        if (sector >= P9CACHE_SECTORS) return -1;
+        const uint8_t* src = &p9cache[pc][sector * 512]; uint8_t* d = (uint8_t*)buffer;
         for (int i = 0; i < 512; ++i) d[i] = src[i];
         return 0;
     }
@@ -139,13 +153,21 @@ int storage_dev_write(int dev, uint64_t sector, const void* buffer)
         for (int i = 0; i < 512; ++i) dst[i] = s[i];
         return 0;
     }
+    int pc = p9c_index(dev);
+    if (pc >= 0)
+    {
+        if (sector >= P9CACHE_SECTORS) return -1;
+        uint8_t* dst = &p9cache[pc][sector * 512]; const uint8_t* s = (const uint8_t*)buffer;
+        for (int i = 0; i < 512; ++i) dst[i] = s[i];
+        return 0;
+    }
     if (!storage_dev_sectors(dev)) return -1;
     return dev == 3 ? nvme_write(sector, buffer) : ahci_write(sector, buffer);
 }
 
 int storage_dev_flush(int dev)
 {
-    if (ram_index(dev) >= 0) return 0;
+    if (ram_index(dev) >= 0 || p9c_index(dev) >= 0) return 0;
     if (!storage_dev_sectors(dev)) return -1;
     return dev == 3 ? nvme_flush() : ahci_flush();
 }
