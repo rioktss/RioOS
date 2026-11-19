@@ -26,10 +26,34 @@
 #include "uart.h"
 #include "process.h"
 
-#define SCHED_MAX 48
-
-static int queue[SCHED_MAX];
+/* The run queue of processes grows on demand: the only limit is memory. */
+#ifdef HOST_TEST
+#include <stdlib.h>
+static void* queue_alloc(uint64_t n) { return malloc((size_t)n); }
+static void queue_free(void* p) { free(p); }
+#else
+#include "memory.h"
+static void* queue_alloc(uint64_t n) { return kmalloc(n); }
+static void queue_free(void* p) { kfree(p); }
+#endif
+static int* queue = 0;
+static int qcap = 0;
 static int count = 0;
+
+/* room for `need` entries; 0 on success. Called with IRQs masked. */
+static int queue_reserve(int need)
+{
+    if (need <= qcap) return 0;
+    int ncap = qcap ? qcap * 2 : 64;
+    while (ncap < need) ncap *= 2;
+    int* nq = (int*)queue_alloc((uint64_t)ncap * sizeof(int));
+    if (!nq) return -1;
+    for (int i = 0; i < count; ++i) nq[i] = queue[i];
+    if (queue) queue_free(queue);
+    queue = nq;
+    qcap = ncap;
+    return 0;
+}
 static int current = -1;
 static int cursor = 0;
 static uint64_t ticks = 0;
@@ -206,9 +230,7 @@ void scheduler_init()
     ticks = 0;
     preempt_pending = 0;
 
-    for (int slot = 0;
-         slot < SCHED_MAX && count < SCHED_MAX;
-         ++slot)
+    for (int slot = 0; slot < process_slot_count(); ++slot)
     {
         int pid = process_pid_at(slot);
 
@@ -217,6 +239,9 @@ void scheduler_init()
 
         if (!runnable(pid))
             continue;
+
+        if (queue_reserve(count + 1) != 0)
+            break;
 
         queue[count++] = pid;
     }
@@ -263,7 +288,7 @@ int scheduler_add(int pid)
         }
     }
 
-    if (count >= SCHED_MAX)
+    if (queue_reserve(count + 1) != 0)
     {
         irq_restore(flags);
         return -1;

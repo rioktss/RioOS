@@ -114,7 +114,7 @@ ASMFLAGS=(
 
 MODULES=(
     uart memory string fs vfs process sched_policy scheduler timer interrupt keyboard
-    commands version shell history env rtc exceptions syscall user mmu virtio_mmio virtio_input virtio_blk storage thread fd tty task mapping jobs sha256 script pci nvme ahci filters textutils shellext usb tls crypto x509 trust ssh netserv fat32 random virtio_rng sshkey virtio_dev virtio_gpu virtio_snd ninep
+    commands version shell history env rtc exceptions syscall user mmu virtio_mmio virtio_input virtio_blk storage thread fd tty task futex mapping jobs sha256 script pci nvme ahci filters textutils shellext usb tls crypto x509 trust ssh netserv fat32 random virtio_rng sshkey virtio_dev virtio_gpu virtio_snd ninep
     fb console console_font
     elf virtio_net netstack page_alloc fault diag security smp
     kernel
@@ -204,7 +204,7 @@ for src in userspace/bin/*.cpp; do
     [[ -f "$src" ]] || continue
     name="$(basename "$src" .cpp)"
     "$CXX" "${UCXXFLAGS[@]}" -c "$src" -o "build/bin/$name.o"
-    "$LD" -T userspace/user_init.ld -nostdlib -z max-page-size=0x1000 \
+    "$LD" -T userspace/user_prog.ld -nostdlib -z max-page-size=0x1000 \
         build/bin/crt0.o build/bin/"$name".o build/bin/ulibc.o build/bin/ulibc2.o build/bin/ulibc3.o build/bin/ulibc4.o build/bin/ulibc5.o build/bin/ulibc6.o build/bin/ulibc7.o build/bin/ulibc8.o build/bin/ulibm.o build/bin/softfloat.o build/bin/deflate.o build/bin/dl.o -o "build/bin/$name.elf"
     EXTRA_ELFS+=("build/bin/$name.elf")
     vlog " -> build/bin/$name.elf ready"
@@ -265,7 +265,7 @@ step "6/9" "Linking"
     build/commands.o build/version.o build/shell.o build/history.o build/env.o build/rtc.o build/exceptions.o build/syscall.o build/user.o build/mmu.o \
     build/virtio_mmio.o build/virtio_input.o build/virtio_blk.o build/storage.o build/elf.o build/virtio_net.o \
     build/netstack.o build/page_alloc.o build/fault.o build/diag.o build/security.o \
-    build/fb.o build/console.o build/console_font.o build/thread.o build/fd.o build/tty.o build/smp.o build/task.o build/mapping.o build/jobs.o build/sha256.o build/script.o build/pci.o build/nvme.o build/ahci.o build/filters.o build/textutils.o build/shellext.o build/usb.o build/tls.o build/crypto.o build/x509.o build/trust.o build/ssh.o build/netserv.o build/fat32.o build/random.o build/virtio_rng.o build/sshkey.o build/virtio_dev.o build/virtio_gpu.o build/virtio_snd.o build/ninep.o \
+    build/fb.o build/console.o build/console_font.o build/thread.o build/fd.o build/tty.o build/smp.o build/task.o build/futex.o build/mapping.o build/jobs.o build/sha256.o build/script.o build/pci.o build/nvme.o build/ahci.o build/filters.o build/textutils.o build/shellext.o build/usb.o build/tls.o build/crypto.o build/x509.o build/trust.o build/ssh.o build/netserv.o build/fat32.o build/random.o build/virtio_rng.o build/sshkey.o build/virtio_dev.o build/virtio_gpu.o build/virtio_snd.o build/ninep.o \
     -o build/kernel.elf
 
 step "7/9" "Verifying ELF"

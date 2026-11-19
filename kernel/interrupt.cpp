@@ -163,6 +163,13 @@ extern "C" void interrupt_kick_others()
     *(volatile uint32_t*)(GICD_BASE + 0xF00) = (1U << 24) | 0U;
 }
 
+/* Wake the CPUs in `mask` (bit n = CPU n) out of wfi: SGI 0 with an explicit target list. */
+extern "C" void interrupt_kick_cpus(uint32_t mask)
+{
+    asm volatile("dsb sy" ::: "memory");
+    *(volatile uint32_t*)(GICD_BASE + 0xF00) = ((mask & 0xFFU) << 16) | 0U;
+}
+
 void interrupt_enable()
 {
     /* Enable the timer PPI before unmasking CPU IRQs. */

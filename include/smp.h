@@ -48,7 +48,8 @@ void bkl_lock();
 void bkl_unlock();
 int bkl_held();
 void smp_idle_wait();               /* boot-CPU thread with nothing to do: sleep until the next interrupt without the lock */
-void smp_kick_others();             /* wake idle CPUs (a process exited, a thread became runnable) */
+void smp_kick_others();             /* wake every other CPU (exit_group, boot-CPU shell notices an exit) */
+void smp_kick_cpus(uint32_t mask);  /* wake the CPUs in the mask (bit n = CPU n): a thread became runnable there / must reschedule */
 void smp_window();                 /* brief hand-over window for a CPU that busy-waits in the kernel (IRQs must be masked) */
 void smp_enable_scheduling();      /* boot CPU: let every online CPU run scheduled threads */
 #ifndef HOST_TEST

@@ -31,7 +31,7 @@
 
 RioOS is an educational **bare-metal ARM64/AArch64 operating-system project**. It boots the custom MyKernel kernel directly in QEMU rather than running as a Linux application. The host operating system supplies the compiler, linker, tests, and QEMU; the guest kernel is freestanding C++17 plus assembly.
 
-**Current source baseline: v1.13.0 — live 100 Hz timer IRQ and a shell-only QEMU window terminal (scrollable with the mouse wheel).** RioOS is under active development. Host-side tests and release checks cover many subsystems, but a successful build is not a substitute for testing the QEMU window on the target machine.
+**Current source baseline: v1.14.0 — preemptive multitasking: several ELF programs run concurrently on up to 8 CPUs (real-time + fair scheduler, priorities, CPU affinity, 1:1 threads with per-task kernel stacks, futex/pthread synchronisation). See [docs/MULTITASKING.md](docs/MULTITASKING.md).** RioOS is under active development. Host-side tests and release checks cover many subsystems, but a successful build is not a substitute for testing the QEMU window on the target machine.
 
 ## Quick start
 

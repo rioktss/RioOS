@@ -23,7 +23,7 @@
  */
 
 #include "../libc/ulibc.h"
-/* thrtest: POSIX threads (user-level M:1 threads) */
+/* thrtest: POSIX threads (1:1 kernel threads, run in parallel and are preempted) */
 static int fails = 0;
 static void chk(const char* name, int ok) { printf("%s %s\n", ok ? "PASS" : "FAIL", name); if (!ok) ++fails; }
 
@@ -37,7 +37,7 @@ static int queue_items = 0, consumed = 0, done_flag = 0;
 static void* consumer(void* a) { (void)a; pthread_mutex_lock(&mtx); for (;;) { while (queue_items == 0 && !done_flag) pthread_cond_wait(&cv, &mtx); if (queue_items == 0 && done_flag) break; --queue_items; ++consumed; } pthread_mutex_unlock(&mtx); return 0; }
 
 static sem_t sem; static int sem_order = 0;
-static void* sem_waiter(void* a) { sem_wait(&sem); return (void*)(long)(++sem_order + (long)a * 0); }
+static void* sem_waiter(void* a) { sem_wait(&sem); return (void*)(long)(__atomic_add_fetch(&sem_order, 1, __ATOMIC_SEQ_CST) + (long)a * 0); }
 
 static pthread_rwlock_t rw = PTHREAD_RWLOCK_INITIALIZER; static int rw_val = 0, rw_bad = 0;
 static void* rw_reader(void* a) { (void)a; for (int i = 0; i < 20; ++i) { pthread_rwlock_rdlock(&rw); int v = rw_val; pthread_yield(); if (v != rw_val) rw_bad = 1; pthread_rwlock_unlock(&rw); } return 0; }
@@ -51,7 +51,7 @@ static void once_fn(void) { ++once_count; }
 static void* once_worker(void* a) { (void)a; pthread_once(&once, once_fn); return 0; }
 
 static pthread_key_t key; static int dtor_calls = 0;
-static void key_dtor(void* v) { if (v) ++dtor_calls; }
+static void key_dtor(void* v) { if (v) __atomic_add_fetch(&dtor_calls, 1, __ATOMIC_SEQ_CST); }
 static void* key_worker(void* a) { pthread_setspecific(key, a); pthread_yield(); return (void*)(pthread_getspecific(key) == a ? 1L : 0L); }
 
 static volatile int detached_ran = 0;
@@ -61,16 +61,16 @@ static volatile int cancel_started = 0;
 static void* cancel_fn(void* a) { (void)a; cancel_started = 1; for (;;) { sleep_ms(5); pthread_testcancel(); } return 0; }
 
 static void* sleeper(void* a) { sleep_ms(40); return a; }
-static volatile int order_log[8]; static volatile int order_n = 0;
-static void* ord_a(void* a) { (void)a; order_log[order_n++] = 1; sleep_ms(30); order_log[order_n++] = 3; return 0; }
-static void* ord_b(void* a) { (void)a; sleep_ms(10); order_log[order_n++] = 2; return 0; }
+static volatile int order_log[8]; static int order_n = 0;
+static void ord_add(int v) { int i = __atomic_fetch_add(&order_n, 1, __ATOMIC_SEQ_CST); order_log[i] = v; }
+static void* ord_a(void* a) { (void)a; ord_add(1); sleep_ms(60); ord_add(3); return 0; }
+static void* ord_b(void* a) { (void)a; sleep_ms(20); ord_add(2); return 0; }
 
 static volatile int ksig = 0;
 static void on_usr1(int s) { ksig = s; }
 static void* sig_target(void* a) { (void)a; while (!ksig) sleep_ms(5); return (void*)1L; }
 
 static void* many(void* a) { return a; }
-static void* lock_twice(void* a) { (void)a; pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER; pthread_mutex_lock(&m); pthread_mutex_lock(&m); return 0; }
 static void* recursive_fn(void* a) { pthread_mutex_t* m = (pthread_mutex_t*)a; pthread_mutex_lock(m); pthread_mutex_lock(m); pthread_mutex_unlock(m); pthread_mutex_unlock(m); return (void*)1L; }
 static void* exit_fn(void* a) { (void)a; pthread_exit((void*)77); return 0; }
 static void* self_fn(void* a) { *(pthread_t*)a = pthread_self(); return 0; }
@@ -164,14 +164,11 @@ int main(int argc, char** argv)
       for (long i = 0; i < 16; ++i) if (pthread_create(&m[i], 0, many, (void*)(i + 1)) != 0) ok = 0;
       for (int i = 0; i < 16; ++i) { pthread_join(m[i], &r); sum += (long)r; }
       chk("sixteen-threads", ok && sum == 136); }
-    { pthread_t m[40]; int created = 0; for (int i = 0; i < 40; ++i) if (pthread_create(&m[i], 0, many, 0) == 0) ++created; else break;
-      for (int i = 0; i < created; ++i) pthread_join(m[i], 0);
-      chk("thread-limit-eagain", created < 40 && created >= 16); }
+    { enum { N = 150 }; static pthread_t m[N]; int created = 0; long sum = 0;
+      for (long i = 0; i < N; ++i) if (pthread_create(&m[i], 0, many, (void*)(i + 1)) == 0) ++created; else break;
+      for (int i = 0; i < created; ++i) { pthread_join(m[i], &r); sum += (long)r; }
+      chk("150-threads-no-limit", created == N && sum == (long)N * (N + 1) / 2); }
 
-    { pid_t p = fork();
-      if (p == 0) { pthread_t x; pthread_create(&x, 0, lock_twice, 0); pthread_join(x, 0); _exit(0); }
-      int st = 0; waitpid(p, &st, 0);
-      chk("deadlock-detected", WIFEXITED(st) && WEXITSTATUS(st) == 134); }
     { pid_t p = fork();
       if (p == 0) { pthread_t x; pthread_create(&x, 0, ret_arg, (void*)1); _exit(pthread_join(x, 0) == 0 ? 5 : 6); }
       int st = 0; waitpid(p, &st, 0);

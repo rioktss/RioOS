@@ -108,7 +108,7 @@ int main(int argc, char** argv)
     int pf[2]; pipe(pf);
     p = fork();
     if (p == 0) { dup2(pf[1], 1); close(pf[0]); close(pf[1]); char* av[] = { (char*)"proctest", (char*)"env", 0 }; execv("/bin/proctest.elf", av); _exit(111); }
-    close(pf[1]); { int n = (int)read(pf[0], buf, sizeof(buf) - 1); buf[n > 0 ? n : 0] = 0; } close(pf[0]);
+    close(pf[1]); { int n = 0; ssize_t r; while (n < (int)sizeof(buf) - 1 && (r = read(pf[0], buf + n, sizeof(buf) - 1 - (size_t)n)) > 0) n += (int)r; buf[n] = 0; } close(pf[0]);
     waitpid(p, &st, 0);
     chk("env-inherited", strstr(buf, "FOO=inherited") != 0);
 
@@ -178,7 +178,7 @@ int main(int argc, char** argv)
       pf[0] = pf[1] = -1; pipe(pf);
       p = fork();
       if (p == 0) { dup2(pf[1], 1); close(pf[0]); close(pf[1]); char* av[] = { (char*)"proctest", (char*)"sigdfl", 0 }; execv("/bin/proctest.elf", av); _exit(111); }
-      close(pf[1]); { int n = (int)read(pf[0], buf, sizeof(buf) - 1); buf[n > 0 ? n : 0] = 0; } close(pf[0]);
+      close(pf[1]); { int n = 0; ssize_t r; while (n < (int)sizeof(buf) - 1 && (r = read(pf[0], buf + n, sizeof(buf) - 1 - (size_t)n)) > 0) n += (int)r; buf[n] = 0; } close(pf[0]);
       waitpid(p, &st, 0);
       chk("exec-resets-handlers", strstr(buf, "USR1=dfl") != 0);
       chk("exec-keeps-ignored", strstr(buf, "USR2=ign") != 0); }
@@ -193,7 +193,7 @@ int main(int argc, char** argv)
       char sa_[16], sb_[16]; sprintf(sa_, "%d", a); sprintf(sb_, "%d", b);
       p = fork();
       if (p == 0) { dup2(pf[1], 1); close(pf[0]); close(pf[1]); char* av[] = { (char*)"proctest", (char*)"cloexec", sa_, sb_, 0 }; execv("/bin/proctest.elf", av); _exit(111); }
-      close(pf[1]); { int n = (int)read(pf[0], buf, sizeof(buf) - 1); buf[n > 0 ? n : 0] = 0; } close(pf[0]);
+      close(pf[1]); { int n = 0; ssize_t r; while (n < (int)sizeof(buf) - 1 && (r = read(pf[0], buf + n, sizeof(buf) - 1 - (size_t)n)) > 0) n += (int)r; buf[n] = 0; } close(pf[0]);
       waitpid(p, &st, 0);
       chk("cloexec-closed-on-exec", strstr(buf, "keep=open") && strstr(buf, "closed=closed"));
       close(a); close(b); close(c); close(d); }

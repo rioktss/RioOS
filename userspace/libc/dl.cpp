@@ -57,7 +57,7 @@ static const HostSym host_libc[] = {
     H(printf), H(puts), H(putchar), H(snprintf), H(sprintf), H(dprintf), H(malloc), H(free), H(calloc), H(realloc),
     H(memcpy), H(memset), H(memmove), H(memcmp), H(strlen), H(strcmp), H(strncmp), H(strcpy), H(strncpy),
     H(strcat), H(strchr), H(strrchr), H(strstr), H(strdup), H(atoi), H(strtol), H(abs), H(qsort), H(rand),
-    H(getpid), H(write), H(read), H(open), H(close), H(sleep_ms), H(clock_ms), H(exit), { "errno", (void*)&errno }
+    H(getpid), H(write), H(read), H(open), H(close), H(sleep_ms), H(clock_ms), H(exit), H(__errno_location)
 };
 
 int dl_register(const char* name, void* addr)

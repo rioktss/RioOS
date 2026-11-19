@@ -29,7 +29,7 @@
    the allocator. */
 
 static uint8_t bitmap[PAGE_ALLOC_MAX_PAGES / 8U];
-static uint8_t refcnt[PAGE_ALLOC_MAX_PAGES];
+static uint16_t refcnt[PAGE_ALLOC_MAX_PAGES];
 static uint64_t pool_base = 0;
 static uint64_t pool_pages = 0;
 static uint64_t hint = 0;
@@ -187,7 +187,7 @@ int page_ref(void* page)
         address >= pool_base + pool_pages * PAGE_SIZE_BYTES)
         return -1;
     uint64_t index = (address - pool_base) / PAGE_SIZE_BYTES;
-    if (!bit_get(index) || refcnt[index] >= 250U) return -1;
+    if (!bit_get(index) || refcnt[index] >= 65000U) return -1;
     ++refcnt[index];
     return 0;
 }

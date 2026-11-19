@@ -26,6 +26,8 @@ def run(cmds, extra=(), disk=True, boot=8, wait=2, env=None, base_disk=None, mon
                  "-device", "virtio-blk-device,drive=vd0"]
     args += list(extra)
     if os.environ.get("RIO_SMP") and "-smp" not in args: args += ["-smp", os.environ["RIO_SMP"]]
+    if "-smp" in args and "-accel" not in args and "-accel" not in os.environ.get("RIO_QEMU_EXTRA", ""):
+        args += ["-accel", "tcg,thread=single"]               # multi-threaded TCG with several vCPUs on a 2-core host is erratic (broadcast TLBI / big kernel lock spinning)
     args += os.environ.get("RIO_QEMU_EXTRA", "").split()      # e.g. "-accel tcg,thread=single" on a host with few cores
     pid, fd = pty.fork()
     if pid == 0:
@@ -88,7 +90,7 @@ log = run(C("ktest", "dltest", "id", "echo hello > /home/user/a.txt", "ln -s a.t
 check("core", log, "ktest: 28/28 passed", "dltest ALL PASS", "uid=1000(user)")
 check("fs", log, "[LINK] l1 -> a.txt", "hello", "a.txt", "remounted read-only", "remounted read-write", "journal        : on")
 check("script", log, "n=3", "it1", "it2")
-check("shell", log, "fb-ok", "st=127", "/bin/hello.elf", "\n28\r")
+check("shell", log, "fb-ok", "st=127", "/bin/hello.elf", "\n29\r")
 check("security", log, "Switched to root", "bob  uid=1001", "$rio$3000$", "User created")
 print("== session 1b: reboot recovers the journal")
 log = run(C("cat /jt.txt", "mount"))
@@ -316,7 +318,7 @@ log = run(C("su", "123", "ipctest"), wait=90, extra=["-netdev", "dgram,id=n0,loc
 check("ipc-poll-sockets", log, "ipctest done fails=0", "PASS scm-write-via-passed-fd", "PASS unix-accept", "PASS poll-eintr", "PASS eventfd-sum", "PASS write-20000-through-pipe", "PASS so-rcvtimeo")
 if "FAIL " in log:
     fails += 1; total += 1; print("  FAIL  ipc-poll-sockets: a FAIL line was printed")
-log = run(C("su", "123", "smptest 5"), extra=["-smp", "4"], wait=600)
+log = run([("su", 3), ("123", 3), ("smptest 5", 600)], extra=["-smp", "4"])
 check("smp-scheduler", log, "smptest done fails=0", "PASS work-spreads-across-cpus", "PASS futex-mutex-counter-exact", "PASS atomic-counter-exact", "PASS fork-storm", "PASS cow-isolation-parallel", "PASS signal-to-spinning-process", "PASS soak")
 if "FAIL " in log:
     fails += 1; total += 1; print("  FAIL  smp-scheduler: a FAIL line was printed")
@@ -334,6 +336,78 @@ if "FAIL " in log:
 log = run(C("su", "123", "echo 'f(){ return 3; }' > /tmp/s1.sh", "echo 'f a; echo rc=$?' >> /tmp/s1.sh", "echo 'false; echo rc2=$?' >> /tmp/s1.sh", "source /tmp/s1.sh",
             "echo hello | read W", "echo W=$W", "usb selftest"), wait=2)
 check("shell-fixes", log, "rc=3", "rc2=1", "W=hello", "usb: no xHCI controller")
+
+print("== session 15b: preemptive multitasking + 1:1 kernel threads (mttest), many ELF processes at once")
+shutil.copy(os.path.join(ROOT, "storage", "disk.img"), os.path.join(TMP, "disk.img"))
+MT_NAMES = ["preempt-hogs-do-not-starve-main",
+         "preempt-equal-hogs-share-cpu",
+         "affinity-pinned-threads-stay-on-cpu",
+         "affinity-change-migrates-running-thread",
+         "affinity-empty-mask-rejected",
+         "tls-and-errno-are-per-thread",
+         "tls-blocks-distinct",
+         "robust-mutex-owner-death",
+         "robust-pi-mutex-owner-death",
+         "robust-errorcheck-owner-death",
+         "cancel-async-spinning-thread",
+         "cancel-interrupts-blocked-read",
+         "cancel-cond-wait-runs-cleanup",
+         "cancel-disabled-defers-until-enabled",
+         "signal-mask-inherited-by-new-thread",
+         "process-signal-goes-to-unblocked-thread",
+         "tgkill-reaches-only-the-target-thread",
+         "sigwait-in-thread-consumes-process-signal",
+         "pthread_kill-self-delivers-synchronously",
+         "fork-from-thread-with-busy-allocators",
+         "exit-from-thread-ends-process",
+         "exit-with-spinning-sibling",
+         "main-pthread_exit-then-thread-exit-code",
+         "last-thread-return-exits-zero",
+         "exec-from-thread-replaces-whole-process",
+         "sigkill-kills-all-threads",
+         "sigterm-kills-threaded-process",
+         "no-zombie-children-left",
+         "thread-stack-overflow-hits-guard-sigsegv",
+         "thread-sigaltstack-handles-overflow",
+         "malloc-free-realloc-8-threads",
+         "stdio-lines-intact-6-threads",
+         "futex-wake-counts",
+         "futex-wake-no-waiters-zero",
+         "futex-wait-eagain-and-timeout",
+         "futex-cmp-requeue",
+         "futex-bitset-selective-wake",
+         "mutex-timedlock-times-out",
+         "timedjoin-timeout-then-success",
+         "sem-timedwait-times-out",
+         "cond-timedwait-signalled-early",
+         "pshared-mutex-and-semaphore-two-processes",
+         "pshared-robust-mutex-owner-process-death",
+         "process-storm-with-threads",
+         "4-elf-processes-run-concurrently",
+         "8-elf-processes-run-concurrently",
+         "thread-attr-policy-priority-affinity-applied",
+         "pthread_setschedparam-roundtrip-and-range-check",
+         "new-thread-inherits-creator-policy",
+         "nice-weights-cpu-share",
+         "pi-inversion-resolved",
+         "pi-chain-transitive",
+         "fifo-strict-priority-order",
+         "rr-time-slices-rotate"]
+log = run([("su", 2), ("123", 2), ("mttest", 150)])
+check("mttest", log, "mttest done fails=0", *["PASS " + n for n in MT_NAMES])
+if "FAIL " in log.replace("FAIL cmd", ""):
+    fails += 1; total += 1; print("  FAIL  mttest: a FAIL line was printed")
+log = run([("su", 3), ("123", 3), ("mttest", 240)], extra=["-smp", "4"])
+check("mttest-smp4", log, "mttest done fails=0", "PASS parallel-threads-use-several-cpus", *["PASS " + n for n in MT_NAMES])
+if "FAIL " in log.replace("FAIL cmd", ""):
+    fails += 1; total += 1; print("  FAIL  mttest-smp4: a FAIL line was printed")
+# three CPU-bound shell jobs at once: progress lines of all of them appear before the first one finishes
+log = run([("su", None), ("123", None), ("spin 1200 &", 0.3), ("spin 1200 &", 0.3), ("spin 1200 &", 0.3), ("wait", 6)])
+first_done = log.find("done (")
+spin_pids = set(re.findall(r"\[spin (\d+)\] \d+ ms", log[:first_done if first_done > 0 else len(log)]))
+total += 1
+if len(spin_pids) >= 3 and log.count("done (") >= 3: print("  PASS  concurrent-jobs: 3 spin processes progress together")
+else: fails += 1; print("  FAIL  concurrent-jobs: pids with progress before the first finish = %d, finished = %d" % (len(spin_pids), log.count("done (")))
 
 print("== session 16: crash-safe fs, RNG, ssh keys")
 shutil.copy(os.path.join(ROOT, "storage", "disk.img"), os.path.join(TMP, "disk.img"))

@@ -28,8 +28,6 @@
 #define RAM_START       0x40000000ULL
 #define RAM_SIZE        (128ULL * 1024ULL * 1024ULL)
 #define RAM_END         (RAM_START + RAM_SIZE)
-#define USER_REGION_BASE 0x47000000ULL
-#define FRAMEBUFFER_BASE 0x46800000ULL
 #define HEAP_GUARD_SIZE  0x00100000ULL
 
 extern "C" char __heap_start[];
@@ -56,12 +54,9 @@ void memory_init()
     heap_head = 0;
     heap_live = 0;
 
-    /* Keep a permanent guard before the reserved EL0 program window. */
-    heap_end = FRAMEBUFFER_BASE;
-    if (heap_end > USER_REGION_BASE - HEAP_GUARD_SIZE)
-        heap_end = USER_REGION_BASE - HEAP_GUARD_SIZE;
-    if (heap_end <= heap_start)
-        heap_end = RAM_END - HEAP_GUARD_SIZE;
+    /* User programs no longer own a fixed physical window: their pages come from the page pool, which is carved out of
+       this heap, so the heap spans all of RAM up to a permanent guard at the top. */
+    heap_end = RAM_END - HEAP_GUARD_SIZE;
 
     uart_puts("Memory manager initialized.\r\n");
 }

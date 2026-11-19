@@ -27,7 +27,8 @@
 
 #include "types.h"
 
-#define FD_MAX_DESCRIPTORS 24
+#define FD_MAX_DESCRIPTORS 65536     /* hard ceiling of RLIMIT_NOFILE; a table's array grows on demand */
+#define FD_DEFAULT_LIMIT 1024        /* default soft and hard RLIMIT_NOFILE of a new process */
 #define FD_IO_MAX 4096ULL
 #define FD_FILE_MAX (1024ULL * 1024ULL)
 #define FD_PIPE_CAPACITY 4096

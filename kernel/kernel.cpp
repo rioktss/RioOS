@@ -82,11 +82,11 @@ extern "C" void kernel_main()
     memory_init();
     uart_puts("[2] Memory initialized.\r\n");
 
-    /* Physical page pool (32 MiB + alignment slack) carved from the heap. */
+    /* Physical page pool (48 MiB + alignment slack) carved from the heap: user pages and page tables. */
     {
-        void* pool = kmalloc(32ULL * 1024ULL * 1024ULL + PAGE_SIZE_BYTES);
+        void* pool = kmalloc(48ULL * 1024ULL * 1024ULL + PAGE_SIZE_BYTES);
 
-        if (pool == 0 || page_alloc_init(pool, 32ULL * 1024ULL * 1024ULL + PAGE_SIZE_BYTES) != 0)
+        if (pool == 0 || page_alloc_init(pool, 48ULL * 1024ULL * 1024ULL + PAGE_SIZE_BYTES) != 0)
             uart_puts("Page allocator unavailable.\r\n");
         else
             uart_puts("Page allocator ready.\r\n");
@@ -160,7 +160,7 @@ extern "C" void kernel_main()
     uart_puts("[12] Initializing scheduler...\r\n");
     scheduler_init();
     thread_init();
-    uart_puts("Cooperative thread subsystem initialized (no preemption; timer tick only).\r\n");
+    uart_puts("Preemptive thread subsystem initialized (1:1 kernel threads, per-task kernel stacks).\r\n");
 
     uart_puts("[13] Initializing interrupt controller...\r\n");
     interrupt_init();

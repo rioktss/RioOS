@@ -76,6 +76,7 @@ int process_save_context(int pid, const ProcessCpuContext* context);
 int process_load_context(int pid, ProcessCpuContext* context);
 int process_context_valid(int pid);
 int process_pid_at(int slot);
+int process_slot_count();                      /* slots to scan with process_pid_at (the table grows on demand) */
 
 
 /* ---- multitasking metadata (fork/exec/wait, signals, job control) ---- */
@@ -99,27 +100,33 @@ int process_set_stopped(int pid, int v);
 int process_is_stopped(int pid);
 int process_sig_raise(int pid, int sig);
 int process_sig_raise_info(int pid, int sig, int sender, int code, uint64_t value);   /* siginfo: sender pid, si_code, si_value */
+int process_sig_note(int pid, int sig, int sender, int code, uint64_t value);   /* siginfo of a thread-directed signal */
 int process_sig_info_get(int pid, int sig, int* sender, int* code, uint64_t* value);
 int process_sig_take_set(int pid, uint32_t set);   /* sigwait: lowest pending signal in `set`, blocked or not */
 int process_altstack_set(int pid, uint64_t sp, uint64_t size);
 int process_altstack_get(int pid, uint64_t* sp, uint64_t* size);
 uint64_t process_itimer_get(int pid, uint64_t now, uint64_t* interval_ms);
 uint64_t process_itimer_set(int pid, uint64_t value_ms, uint64_t interval_ms, uint64_t now);   /* returns previous remaining ms */
-int process_sig_take(int pid);               /* lowest pending, unblocked signal (KILL/STOP are never blocked) */
-uint32_t process_sig_pending(int pid);       /* pending and deliverable (not blocked) */
+int process_sig_take_mask(int pid, uint32_t mask);          /* lowest process-directed signal not blocked by `mask` (KILL/STOP never are); cleared */
+uint32_t process_sig_pending_mask(int pid, uint32_t mask);  /* process-directed signals deliverable under `mask` */
+/* threads: masks and thread-directed signals live with each thread (see task_sig_*); the process keeps the live count and the exit_group state */
+int process_thread_adjust(int pid, int delta);              /* returns the new count */
+int process_thread_count(int pid);
+int process_begin_exit(int pid, int code, int sig);         /* 1 for the first caller, 0 when an exit is already under way */
+int process_is_exiting(int pid);
+int process_exit_pending(int pid, int* code, int* sig);
 uint32_t process_sig_pending_raw(int pid);   /* pending, including blocked */
 /* user signal handlers: handler 0 = default, 1 = ignore, else a user address */
 int process_sig_set_action(int pid, int sig, uint64_t handler, uint32_t amask, uint32_t flags, uint64_t restorer, uint64_t* old);
 uint64_t process_sig_handler(int pid, int sig, uint32_t* amask, uint32_t* flags);
 uint64_t process_sig_restorer(int pid);
-uint32_t process_sig_mask(int pid);
-int process_sig_set_mask(int pid, uint32_t mask);
-int process_sig_inherit(int parent, int child);   /* fork: handlers, mask */
+int process_sig_inherit(int parent, int child);   /* fork: handlers */
 int process_sig_reset_on_exec(int pid);           /* exec: caught handlers -> default (ignored stay ignored) */
 int process_sig_clear_all(int pid);
 /* alarm(): returns the previous remaining milliseconds; ms == 0 cancels */
 uint64_t process_alarm_set(int pid, uint64_t ms, uint64_t now);
 void process_alarm_check(int pid, uint64_t now);
+uint64_t process_alarm_deadline(int pid);   /* absolute ms of the next alarm/itimer expiry, 0 = none */
 /* resource limits (setrlimit): resource numbers are the Linux ones; values are bytes / seconds / counts, ~0 = unlimited */
 #define PROC_RLIMIT_CPU 0
 #define PROC_RLIMIT_FSIZE 1

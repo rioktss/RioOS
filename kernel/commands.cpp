@@ -71,6 +71,7 @@
 #include "history.h"
 #include "env.h"
 #include "thread.h"
+#include "task.h"
 #include "rtc.h"
 #include "fd.h"
 #include "smp.h"
@@ -1340,7 +1341,14 @@ static const ManualEntry manual_entries[] =
     {"jtest", "journal crash-recovery test", "jtest [path]", "root only; commits to journal then skips apply; reset to see replay"},
     {"ps", "show processes", "ps", "No options"},
     {"history", "show command history", "history [10|-c|-w|-r]", "-c clear; N last N entries; -w save to /home/user/.history (loaded at boot); -r reload; Arrow Up/Down recall"},
-    {"threads", "list cooperative kernel threads", "threads", "Shows state, priority, run counts, and context switches"},
+    {"threads", "list kernel threads and their scheduling state", "threads", "Shows state, policy, priority, nice, CPU, affinity, run counts and ticks"},
+    {"nice", "run a command with an adjusted niceness", "nice [-n N] <command...>", "default +10; only root may use negative values"},
+    {"renice", "change the niceness of a running task", "renice [-n] <N> [-p] <tid>", "tid is the process id"},
+    {"chrt", "set or show the scheduling policy", "chrt [-f|-r|-o|-b|-i] <prio> <cmd...> | chrt -p [<policy> <prio>] <tid> | chrt -m", "FIFO/RR priorities 1-99 need root"},
+    {"taskset", "set or show CPU affinity", "taskset [-c] <mask|list> <cmd...> | taskset -p [-c] [<mask|list>] <tid>", "mask is hexadecimal, list like 0,2-3"},
+    {"top", "CPU share per task over an interval", "top [seconds]", "snapshot of the busiest tasks, default 1 second"},
+    {"schedstat", "scheduler counters", "schedstat", "switches, active threads, real-time throttling"},
+    {"maps", "show the memory map of a process", "maps <pid>", "regions, permissions, resident pages and fault counters"},
     {"smp", "show CPU topology / run jobs on secondary CPUs", "smp [test]", "lists online CPUs; test offloads a computation to every secondary CPU and verifies it"},
     {"fbinfo", "show framebuffer backend status", "fbinfo", "Reports the framebuffer terminal state (QEMU window runner)"},
     {"thread-demo", "exercise voluntary context switching", "thread-demo", "Uses yield only; no preemption (tick keeps running)"},
@@ -2182,6 +2190,284 @@ static void thread_demo_worker(void* argument)
         uart_puts("\r\n");
         thread_yield();
     }
+}
+
+/* ---- scheduling: nice / renice / chrt / taskset / top / schedstat / maps ---------------------------------------------------- */
+static void print_hex_min(uint64_t v)
+{
+    static const char hx[] = "0123456789abcdef";
+    int started = 0;
+    for (int sh = 60; sh >= 0; sh -= 4) { int d = (int)((v >> sh) & 15); if (d || started || sh == 0) { started = 1; uart_putc(hx[d]); } }
+}
+static void print_i64(int64_t v) { if (v < 0) { uart_putc('-'); v = -v; } print_u64((uint64_t)v); }
+static int sched_parse_int(const char* s, int* out)
+{
+    int neg = 0, any = 0; long v = 0;
+    if (*s == '-') { neg = 1; ++s; } else if (*s == '+') ++s;
+    while (*s >= '0' && *s <= '9') { v = v * 10 + (*s - '0'); any = 1; if (v > 100000000L) break; ++s; }
+    if (!any || *s) return -1;
+    *out = neg ? -(int)v : (int)v;
+    return 0;
+}
+static int sched_parse_mask(const char* s, int as_list, uint64_t* out)
+{
+    uint64_t m = 0;
+    if (as_list)
+    {
+        while (*s)
+        {
+            int a = 0, b = 0, i = 0;
+            if (*s < '0' || *s > '9') return -1;
+            while (*s >= '0' && *s <= '9') { a = a * 10 + (*s - '0'); ++s; if (++i > 3) return -1; }
+            b = a;
+            if (*s == '-') { ++s; b = 0; i = 0; if (*s < '0' || *s > '9') return -1; while (*s >= '0' && *s <= '9') { b = b * 10 + (*s - '0'); ++s; if (++i > 3) return -1; } }
+            if (a > b || b > 63) return -1;
+            for (int c = a; c <= b; ++c) m |= 1ULL << c;
+            if (*s == ',') ++s; else if (*s) return -1;
+        }
+    }
+    else
+    {
+        if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+        if (!*s) return -1;
+        for (; *s; ++s)
+        {
+            int d;
+            if (*s >= '0' && *s <= '9') d = *s - '0'; else if (*s >= 'a' && *s <= 'f') d = *s - 'a' + 10; else if (*s >= 'A' && *s <= 'F') d = *s - 'A' + 10; else return -1;
+            if (m >> 60) return -1;
+            m = (m << 4) | (uint64_t)d;
+        }
+    }
+    *out = m;
+    return m ? 0 : -1;
+}
+static void print_mask_list(uint64_t m)
+{
+    int first = 1;
+    for (int c = 0; c < 64; ++c)
+    {
+        if (!((m >> c) & 1ULL)) continue;
+        int e = c; while (e + 1 < 64 && ((m >> (e + 1)) & 1ULL)) ++e;
+        if (!first) uart_putc(',');
+        first = 0;
+        print_u64((uint64_t)c); if (e > c) { uart_putc('-'); print_u64((uint64_t)e); }
+        c = e;
+    }
+}
+static const char* sched_policy_label(int p)
+{
+    switch (p) { case SCHED_FIFO: return "SCHED_FIFO"; case SCHED_RR: return "SCHED_RR"; case SCHED_BATCH: return "SCHED_BATCH"; case SCHED_IDLE: return "SCHED_IDLE"; default: return "SCHED_OTHER"; }
+}
+/* Take the next blank-separated word without touching the text (the remainder is later executed as a command line).
+   The result lives in a small ring of buffers, so a few words can be held at once. */
+static char* sched_next_word(char** p)
+{
+    static char ring[4][96]; static int slot = 0;
+    char* s = *p; while (*s == ' ') ++s;
+    if (!*s) { *p = s; return 0; }
+    char* out = ring[slot]; slot = (slot + 1) & 3;
+    int n = 0;
+    while (*s && *s != ' ') { if (n < 95) out[n++] = *s; ++s; }
+    out[n] = 0;
+    *p = s;
+    return out;
+}
+static void sched_run_with(const ThreadParams* tp, char* rest)
+{
+    while (*rest == ' ') ++rest;
+    if (!*rest) return;
+    task_set_spawn_params(tp);
+    execute_command(rest);
+    task_set_spawn_params(0);
+}
+
+static void command_nice(const char* argument)
+{
+    char buf[512]; str_copy(buf, argument ? argument : "", sizeof(buf));
+    char* p = buf; char* save = p; char* w = sched_next_word(&p);
+    int adj = 10;
+    if (!w) { uart_puts("0\r\n"); return; }
+    if (w[0] == '-' && w[1] == 'n' && w[2]) { if (sched_parse_int(w + 2, &adj) != 0) { uart_puts("nice: invalid adjustment\r\n"); return; } }
+    else if (str_equal(w, "-n")) { char* v = sched_next_word(&p); if (!v || sched_parse_int(v, &adj) != 0) { uart_puts("nice: invalid adjustment\r\n"); return; } }
+    else if (w[0] == '-' && (w[1] >= '0' && w[1] <= '9')) { if (sched_parse_int(w + 1, &adj) != 0) { uart_puts("nice: invalid adjustment\r\n"); return; } adj = -adj; }
+    else if (w[0] == '-' && w[1] == '-' && w[2] == '-') { if (sched_parse_int(w + 3, &adj) != 0) { uart_puts("nice: invalid adjustment\r\n"); return; } }
+    else { p = save; adj = 10; }
+    if (adj < SCHED_NICE_MIN) adj = SCHED_NICE_MIN;
+    if (adj > SCHED_NICE_MAX) adj = SCHED_NICE_MAX;
+    if (adj < 0 && security_uid() != 0) { uart_puts("nice: cannot set niceness: Permission denied\r\n"); return; }
+    ThreadParams tp; thread_params_default(&tp);
+    tp.nice = adj;
+    sched_run_with(&tp, p);
+}
+
+static void command_renice(const char* argument)
+{
+    char buf[256]; str_copy(buf, argument ? argument : "", sizeof(buf));
+    char* p = buf; int nice = 0, have = 0, tid = -1;
+    for (char* w; (w = sched_next_word(&p)) != 0; )
+    {
+        if (str_equal(w, "-n") || str_equal(w, "-p")) continue;
+        int v;
+        if (sched_parse_int(w, &v) != 0) { uart_puts("renice: usage: renice [-n] <nice> [-p] <tid>\r\n"); return; }
+        if (!have) { nice = v; have = 1; } else tid = v;
+    }
+    if (!have || tid <= 0) { uart_puts("renice: usage: renice [-n] <nice> [-p] <tid>\r\n"); return; }
+    int th = thread_find_tid((uint32_t)tid);
+    int pol = 0, pr = 0, ni = 0;
+    if (th < 0 || thread_pid(th) < 0 || thread_get_sched(th, &pol, &pr, &ni) != 0) { uart_puts("renice: no such task\r\n"); return; }
+    if (nice < SCHED_NICE_MIN) nice = SCHED_NICE_MIN;
+    if (nice > SCHED_NICE_MAX) nice = SCHED_NICE_MAX;
+    if (nice < ni && security_uid() != 0) { uart_puts("renice: Permission denied\r\n"); return; }
+    if (sched_policy_is_rt(pol)) { uart_puts("renice: task is real-time; the nice value applies once it is time-shared\r\n"); return; }
+    if (thread_set_sched(th, pol, 0, nice) != 0) { uart_puts("renice: failed\r\n"); return; }
+    print_u64((uint64_t)tid); uart_puts(": old nice "); print_i64(ni); uart_puts(", new nice "); print_i64(nice); uart_puts("\r\n");
+}
+
+static void chrt_show(int tid)
+{
+    int th = thread_find_tid((uint32_t)tid);
+    int pol = 0, pr = 0, ni = 0;
+    if (th < 0 || thread_pid(th) < 0 || thread_get_sched(th, &pol, &pr, &ni) != 0) { uart_puts("chrt: no such task\r\n"); return; }
+    uart_puts("pid "); print_u64((uint64_t)tid); uart_puts("'s current scheduling policy: "); uart_puts(sched_policy_label(pol));
+    uart_puts("\r\npid "); print_u64((uint64_t)tid); uart_puts("'s current scheduling priority: "); print_u64((uint64_t)pr); uart_puts("\r\n");
+}
+
+static void command_chrt(const char* argument)
+{
+    char buf[512]; str_copy(buf, argument ? argument : "", sizeof(buf));
+    char* p = buf; int pol = -1, per_task = 0;
+    char* save;
+    char* w;
+    for (;;)
+    {
+        save = p; w = sched_next_word(&p);
+        if (!w) break;
+        if (str_equal(w, "-m"))
+        {
+            static const int pols[] = {SCHED_OTHER, SCHED_FIFO, SCHED_RR, SCHED_BATCH, SCHED_IDLE};
+            for (int i = 0; i < 5; ++i) { uart_puts(sched_policy_label(pols[i])); uart_puts(" min/max priority\t: "); print_u64(sched_policy_is_rt(pols[i]) ? SCHED_RT_MIN : 0); uart_putc('/'); print_u64(sched_policy_is_rt(pols[i]) ? SCHED_RT_MAX : 0); uart_puts("\r\n"); }
+            return;
+        }
+        if (str_equal(w, "-p")) { per_task = 1; continue; }
+        if (str_equal(w, "-f")) { pol = SCHED_FIFO; continue; }
+        if (str_equal(w, "-r")) { pol = SCHED_RR; continue; }
+        if (str_equal(w, "-o")) { pol = SCHED_OTHER; continue; }
+        if (str_equal(w, "-b")) { pol = SCHED_BATCH; continue; }
+        if (str_equal(w, "-i")) { pol = SCHED_IDLE; continue; }
+        break;
+    }
+    if (!w) { uart_puts("chrt: usage: chrt [-f|-r|-o|-b|-i] <prio> <cmd...> | chrt -p [-f|-r|-o|-b|-i <prio>] <tid> | chrt -m\r\n"); return; }
+    if (per_task && pol < 0)
+    {
+        int tid; if (sched_parse_int(w, &tid) != 0 || tid <= 0) { uart_puts("chrt: bad task id\r\n"); return; }
+        chrt_show(tid); return;
+    }
+    if (pol < 0) pol = SCHED_RR;
+    int prio = 0;
+    if (sched_policy_is_rt(pol) || per_task)
+    {
+        if (sched_parse_int(w, &prio) != 0) { uart_puts("chrt: bad priority\r\n"); return; }
+        save = p;
+        w = sched_next_word(&p);                       /* the task id, or the first word of the command */
+        if (!w) { uart_puts("chrt: missing command or task id\r\n"); return; }
+        while (*save == ' ') ++save;
+    }
+    if (!sched_policy_is_rt(pol)) prio = 0;
+    if (sched_policy_is_rt(pol) && (prio < SCHED_RT_MIN || prio > SCHED_RT_MAX)) { uart_puts("chrt: priority must be 1-99\r\n"); return; }
+    if (sched_policy_is_rt(pol) && security_uid() != 0) { uart_puts("chrt: failed to set policy: Operation not permitted\r\n"); return; }
+    if (per_task)
+    {
+        int tid; if (sched_parse_int(w, &tid) != 0 || tid <= 0) { uart_puts("chrt: bad task id\r\n"); return; }
+        int th = thread_find_tid((uint32_t)tid); int op = 0, opr = 0, on = 0;
+        if (th < 0 || thread_pid(th) < 0 || thread_get_sched(th, &op, &opr, &on) != 0) { uart_puts("chrt: no such task\r\n"); return; }
+        if (thread_set_sched(th, pol, prio, on) != 0) { uart_puts("chrt: failed to set policy\r\n"); return; }
+        chrt_show(tid); return;
+    }
+    ThreadParams tp; thread_params_default(&tp);
+    tp.policy = pol; tp.rt_prio = prio;
+    sched_run_with(&tp, save);
+}
+
+static void command_taskset(const char* argument)
+{
+    char buf[512]; str_copy(buf, argument ? argument : "", sizeof(buf));
+    char* p = buf; int per_task = 0, as_list = 0; uint64_t mask = 0; int have_mask = 0;
+    char* w;
+    for (;;)
+    {
+        w = sched_next_word(&p);
+        if (!w) break;
+        if (str_equal(w, "-p")) { per_task = 1; continue; }
+        if (str_equal(w, "-c")) { as_list = 1; continue; }
+        if (str_equal(w, "-pc") || str_equal(w, "-cp")) { per_task = 1; as_list = 1; continue; }
+        break;
+    }
+    if (!w) { uart_puts("taskset: usage: taskset [-c] <mask|list> <cmd...> | taskset -p [-c] [<mask|list>] <tid>\r\n"); return; }
+    if (per_task)
+    {
+        char* second = 0; char* here = p; second = sched_next_word(&here);
+        int tid;
+        if (second) { if (sched_parse_mask(w, as_list, &mask) != 0) { uart_puts("taskset: bad CPU mask\r\n"); return; } have_mask = 1; if (sched_parse_int(second, &tid) != 0) { uart_puts("taskset: bad task id\r\n"); return; } }
+        else if (sched_parse_int(w, &tid) != 0) { uart_puts("taskset: bad task id\r\n"); return; }
+        int th = tid > 0 ? thread_find_tid((uint32_t)tid) : -1;
+        if (th < 0 || thread_pid(th) < 0) { uart_puts("taskset: no such task\r\n"); return; }
+        uint64_t all = thread_online_mask();
+        if (have_mask)
+        {
+            if ((mask & all) == 0) { uart_puts("taskset: no online CPU in the mask\r\n"); return; }
+            for (int t2 = thread_group_next(thread_pid(th), -1); t2 >= 0; t2 = thread_group_next(thread_pid(th), t2)) (void)thread_set_affinity(t2, mask & all);
+        }
+        uint64_t cur = thread_get_affinity(th); if (!cur) cur = all;
+        uart_puts("pid "); print_u64((uint64_t)tid); uart_puts(have_mask ? "'s new affinity " : "'s current affinity ");
+        if (as_list) { uart_puts("list: "); print_mask_list(cur); } else { uart_puts("mask: "); print_hex_min(cur); }
+        uart_puts("\r\n");
+        return;
+    }
+    if (sched_parse_mask(w, as_list, &mask) != 0) { uart_puts("taskset: bad CPU mask\r\n"); return; }
+    uint64_t all = thread_online_mask();
+    if ((mask & all) == 0) { uart_puts("taskset: no online CPU in the mask\r\n"); return; }
+    ThreadParams tp; thread_params_default(&tp);
+    tp.affinity = mask & all;
+    sched_run_with(&tp, p);
+}
+
+static void command_top(const char* argument)
+{
+    int secs = argument && argument[0] ? parse_uint(argument, 1) : 1;
+    if (secs < 1) secs = 1;
+    if (secs > 60) secs = 60;
+    thread_top((uint64_t)secs * 1000ULL);
+}
+
+static void command_schedstat()
+{
+    uart_puts("Scheduler: preemptive, tick 10 ms, SCHED_OTHER/BATCH/IDLE (weighted fair, nice -20..19), SCHED_FIFO/RR (priority 1-99)\r\n");
+    uart_puts("Online CPUs        : "); print_u64(smp_online_cpu_count()); uart_puts("\r\n");
+    uart_puts("Context switches   : "); print_u64(thread_switch_count()); uart_puts("\r\n");
+    uart_puts("Active threads     : "); print_u64((uint64_t)thread_active_count()); uart_puts("\r\n");
+    uart_puts("User processes     : "); print_u64((uint64_t)thread_user_tasks()); uart_puts("\r\n");
+    uart_puts("RT throttled ticks : "); print_u64(thread_rt_throttled_ticks()); uart_puts("  (real-time class capped at 95% per CPU)\r\n");
+}
+
+static void command_maps(const char* argument)
+{
+    int pid = parse_uint(argument, -1);
+    if (pid < 0) { uart_puts("maps: usage: maps <pid>\r\n"); return; }
+    if (!mmu_user_space_exists(pid)) { uart_puts("maps: no such process\r\n"); return; }
+    for (int i = 0; ; ++i)
+    {
+        uint64_t s, e; uint32_t prot, kind;
+        if (mmu_user_space_vma(pid, i, &s, &e, &prot, &kind) != 0) break;
+        uart_puts("0x"); print_hex_min(s); uart_putc('-'); uart_puts("0x"); print_hex_min(e); uart_putc(' ');
+        uart_putc((prot & 1U) ? 'r' : '-'); uart_putc((prot & 2U) ? 'w' : '-'); uart_putc((prot & 4U) ? 'x' : '-'); uart_putc((kind & 2U) ? 's' : 'p'); uart_putc(' ');
+        uart_puts((kind & 4U) ? "[stack]" : (kind & 8U) ? "[heap]" : (kind & 16U) ? "[image]" : (kind & 2U) ? "[shared]" : "[anon]");
+        uart_puts("\r\n");
+    }
+    uint64_t bs = 0, bc = 0, mt = 0, sl = 0, st = 0, tp = 0, res = 0, shr = 0, cow = 0, dem = 0;
+    (void)mmu_user_space_layout(pid, &bs, &bc, &mt, &sl, &st, &tp);
+    (void)mmu_user_space_stats(pid, &res, &shr, &cow, &dem);
+    uart_puts("resident "); print_u64(res * 4); uart_puts(" KiB (shared "); print_u64(shr * 4); uart_puts(" KiB), page tables "); print_u64(tp * 4);
+    uart_puts(" KiB, demand faults "); print_u64(dem); uart_puts(", copy-on-write faults "); print_u64(cow); uart_puts("\r\n");
 }
 
 static void command_threads()
@@ -4579,7 +4865,7 @@ static void command_selftest()
     ++total; uint64_t sp=syscall_invoke(SYS_PING); if(sp==0x4D594B56ULL){uart_puts("[PASS] SVC/syscall\r\n");++pass;}else uart_puts("[FAIL] SVC/syscall\r\n");
     ++total; if (pages_selftest()) {uart_puts("[PASS] page allocator\r\n");++pass;} else uart_puts("[FAIL] page allocator\r\n");
     ++total; int pid=process_create("selftest"); if(pid>=0){process_set_state(pid,PROCESS_READY);scheduler_add(pid);scheduler_remove(pid);process_destroy(pid);uart_puts("[PASS] process lifecycle\r\n");++pass;}else uart_puts("[FAIL] process lifecycle\r\n");
-    ++total; uint64_t entry=0; if(elf_load("/bin/init.elf",&entry)==0 && entry!=0){uart_puts("[PASS] ELF loader\r\n");++pass;}else uart_puts("[FAIL] ELF loader\r\n"); mmu_user_prepare();
+    ++total; uint64_t entry=0; if(elf_load("/bin/init.elf",&entry)==0 && entry!=0){uart_puts("[PASS] ELF loader\r\n");++pass;}else uart_puts("[FAIL] ELF loader\r\n");
     ++total; if(virtio_net_present()){uart_puts("[PASS] VirtIO-Net detected\r\n");++pass;}else uart_puts("[SKIP] VirtIO-Net unavailable\r\n");
     uart_puts("Summary: ");print_u64(pass);uart_putc('/');print_u64(total);uart_puts(" checks passed.\r\n");
 }
@@ -4942,6 +5228,13 @@ static void execute_command_inner(
     if (str_equal(command, "pages")) { command_pages(); return; }
     if (str_equal(command, "tasks")) { command_tasks(); return; }
     if (str_equal(command, "threads")) { command_threads(); return; }
+    if (str_equal(command, "nice")) { command_nice(argument); return; }
+    if (str_equal(command, "renice")) { command_renice(argument); return; }
+    if (str_equal(command, "chrt")) { command_chrt(argument); return; }
+    if (str_equal(command, "taskset")) { command_taskset(argument); return; }
+    if (str_equal(command, "top")) { command_top(argument); return; }
+    if (str_equal(command, "schedstat")) { command_schedstat(); return; }
+    if (str_equal(command, "maps")) { command_maps(argument); return; }
     if (str_equal(command, "smp")) { command_smp_status(argument); return; }
     if (str_equal(command, "fbinfo")) { command_fbinfo(); return; }
     if (str_equal(command, "fds")) { fd_list(); return; }

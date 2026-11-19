@@ -29,6 +29,8 @@
 #include "tty.h"
 #include "timer.h"
 #include "process.h"
+#include "memory.h"
+#include "task.h"
 
 #define FD_KIND_NONE 0
 #define FD_KIND_STDIN 1
@@ -56,9 +58,6 @@
 #define FD_SEEK_CUR 1
 #define FD_SEEK_END 2
 
-#define FD_PROCESS_TABLES 48
-#define FD_OPEN_FILES 128
-#define FD_PIPE_MAX 32
 #define FD_PIPE_CAPACITY 4096
 
 struct FdEntry
@@ -72,7 +71,8 @@ struct FdTable
 {
     int used;
     int owner_pid;
-    FdEntry entries[FD_MAX_DESCRIPTORS];
+    int cap;                 /* allocated entries: the array grows on demand up to FD_MAX_DESCRIPTORS */
+    FdEntry* entries;
 };
 
 struct OpenFile
@@ -106,40 +106,88 @@ struct PipeState
 };
 
 
+#ifdef HOST_TEST
+#include <stdlib.h>
+static void* fd_alloc(uint64_t n) { return malloc((size_t)n); }
+static void fd_free(void* p) { free(p); }
+#else
+static void* fd_alloc(uint64_t n) { return kmalloc(n); }
+static void fd_free(void* p) { kfree(p); }
+#endif
+
+/* Process descriptor tables, open file objects and pipes live in growable pools: records are allocated in chunks that never move,
+   so a pointer to one stays valid while the pool grows. There is no fixed count; the only limit is memory. */
+template <typename T, int CHUNK>
+struct Pool
+{
+    T** dir;
+    int dir_cap;
+    int n;                                   /* records allocated (a multiple of CHUNK) */
+    T& operator[](int i) { return dir[i / CHUNK][i % CHUNK]; }
+    int size() const { return n; }
+    int index_of(const T* p) const
+    {
+        for (int c = 0; c < n / CHUNK; ++c)
+            if (p >= dir[c] && p < dir[c] + CHUNK) return c * CHUNK + (int)(p - dir[c]);
+        return -1;
+    }
+    int grow()                               /* adds CHUNK zeroed records; returns the index of the first, -1 if out of memory */
+    {
+        if (n / CHUNK == dir_cap)
+        {
+            int nc = dir_cap ? dir_cap * 2 : 16;
+            T** nd = (T**)fd_alloc((uint64_t)nc * sizeof(T*));
+            if (!nd) return -1;
+            for (int i = 0; i < dir_cap; ++i) nd[i] = dir[i];
+            if (dir) fd_free(dir);
+            dir = nd;
+            dir_cap = nc;
+        }
+        uint8_t* c = (uint8_t*)fd_alloc((uint64_t)sizeof(T) * (uint64_t)CHUNK);
+        if (!c) return -1;
+        for (uint64_t i = 0; i < (uint64_t)sizeof(T) * (uint64_t)CHUNK; ++i) c[i] = 0;
+        dir[n / CHUNK] = (T*)c;
+        int first = n;
+        n += CHUNK;
+        return first;
+    }
+};
+
+/* a record with a `used` flag that is free, growing the pool when every one is taken; -1 when out of memory */
+template <typename P> static int pool_free_slot(P& pool)
+{
+    for (int i = 0; i < pool.size(); ++i) if (!pool[i].used) return i;
+    return pool.grow();
+}
+
 /* ---- timerfd ---- */
-#define TF_MAX 16
 struct TimerFd { int used; uint64_t interval_ms; uint64_t next_ms; uint64_t expirations; uint32_t gen; };
-static TimerFd timerfds[TF_MAX];
+static Pool<TimerFd, 16> timerfds;
 
 /* ---- signalfd: signals of a mask are read as 128-byte signalfd_siginfo records instead of being delivered ---- */
-#define SF_MAX 8
 struct SigFd { int used; uint32_t mask; };
-static SigFd sigfds[SF_MAX];
+static Pool<SigFd, 16> sigfds;
 
 /* ---- inotify: change events for watched files and directories (fed by fs_event_hook and by the descriptor layer) ---- */
-#define IN_INST_MAX 4
 #define IN_WATCH_MAX 16
 #define IN_QUEUE_MAX 64
 #define IN_NAME_MAX 64
 struct InoWatch { int wd; int node; uint32_t mask; };            /* wd 0 = free slot */
 struct InoEv { int wd; uint32_t mask; uint32_t cookie; int len; char name[IN_NAME_MAX]; };
 struct Ino { int used; int next_wd; InoWatch w[IN_WATCH_MAX]; InoEv q[IN_QUEUE_MAX]; int qh, qn; int overflow; uint32_t gen; };
-static Ino inos[IN_INST_MAX];
+static Pool<Ino, 2> inos;
 static int ino_active;
 static void ino_file_event(const char* path, int cwd, uint32_t mask);
 
 /* ---- flock (advisory, per open file description) ---- */
-#define FL_MAX 64
 struct FLock { int used; int node; int ex; int obj; };
-static FLock flocks[FL_MAX];
+static Pool<FLock, 32> flocks;
 
 /* ---- eventfd ---- */
-#define EV_MAX 32
 struct EventState { int used; int semaphore; uint64_t counter; uint32_t gen; };
-static EventState events[EV_MAX];
+static Pool<EventState, 16> events;
 
 /* ---- AF_UNIX sockets (stream + datagram), socketpair, named listeners, SCM_RIGHTS ---- */
-#define UX_MAX 32
 #define UX_RING 8192
 #define UX_BACKLOG 8
 #define UX_FDQ 8
@@ -161,12 +209,47 @@ struct UnixSock
     int fdq_obj[UX_FDQ]; uint64_t fdq_end[UX_FDQ]; int nfdq;
     uint8_t ring[UX_RING];
 };
-static UnixSock usocks[UX_MAX];
-static FdTable tables[FD_PROCESS_TABLES];
-static OpenFile open_files[FD_OPEN_FILES];
-static PipeState pipes[FD_PIPE_MAX];
+static Pool<UnixSock, 2> usocks;
+static Pool<FdTable, 16> tables;
+static Pool<OpenFile, 64> open_files;
+static Pool<PipeState, 4> pipes;
+#define FD_PROCESS_TABLES (tables.size())
+#define FD_OPEN_FILES (open_files.size())
+#define FD_PIPE_MAX (pipes.size())
+#define TF_MAX (timerfds.size())
+#define SF_MAX (sigfds.size())
+#define IN_INST_MAX (inos.size())
+#define FL_MAX (flocks.size())
+#define EV_MAX (events.size())
+#define UX_MAX (usocks.size())
 static int active_table = -1;
 static uint8_t file_buffer[FD_FILE_MAX];
+
+/* Descriptor entries of a table: ent() is for writing (grows the array), entr() for reading (never allocates). */
+static FdEntry fd_scratch_entry;
+static FdEntry& ent(FdTable* t, int d)
+{
+    if (!t || d < 0 || d >= FD_MAX_DESCRIPTORS) { fd_scratch_entry.used = 0; fd_scratch_entry.object = -1; fd_scratch_entry.cloexec = 0; return fd_scratch_entry; }
+    if (d >= t->cap)
+    {
+        int ncap = t->cap ? t->cap : 32;
+        while (ncap <= d) ncap *= 2;
+        if (ncap > FD_MAX_DESCRIPTORS) ncap = FD_MAX_DESCRIPTORS;
+        FdEntry* ne = (FdEntry*)fd_alloc((uint64_t)ncap * sizeof(FdEntry));
+        if (!ne) { fd_scratch_entry.used = 0; fd_scratch_entry.object = -1; fd_scratch_entry.cloexec = 0; return fd_scratch_entry; }
+        for (int i = 0; i < t->cap; ++i) ne[i] = t->entries[i];
+        for (int i = t->cap; i < ncap; ++i) { ne[i].used = 0; ne[i].object = -1; ne[i].cloexec = 0; }
+        if (t->entries) fd_free(t->entries);
+        t->entries = ne;
+        t->cap = ncap;
+    }
+    return t->entries[d];
+}
+static FdEntry& entr(FdTable* t, int d)
+{
+    if (!t || d < 0 || d >= t->cap) { fd_scratch_entry.used = 0; fd_scratch_entry.object = -1; fd_scratch_entry.cloexec = 0; return fd_scratch_entry; }
+    return t->entries[d];
+}
 
 static int string_length(const char* s)
 {
@@ -215,19 +298,22 @@ static int valid_table(int index)
     return index >= 0 && index < FD_PROCESS_TABLES && tables[index].used;
 }
 
+static int find_table_hint = 0;
 static int find_table(int pid)
 {
-    for (int i = 0; i < FD_PROCESS_TABLES; ++i)
-        if (tables[i].used && tables[i].owner_pid == pid) return i;
+    int n = tables.size();
+    if (find_table_hint < n && tables[find_table_hint].used && tables[find_table_hint].owner_pid == pid) return find_table_hint;
+    for (int i = 0; i < n; ++i)
+        if (tables[i].used && tables[i].owner_pid == pid) { find_table_hint = i; return i; }
     return -1;
 }
 
 static void clear_descriptor(FdTable* table, int descriptor)
 {
-    if (!table || descriptor < 0 || descriptor >= FD_MAX_DESCRIPTORS) return;
-    table->entries[descriptor].used = 0;
-    table->entries[descriptor].object = -1;
-    table->entries[descriptor].cloexec = 0;
+    if (!table || descriptor < 0 || descriptor >= table->cap) return;       /* beyond the allocated part: already unused */
+    ent(table, descriptor).used = 0;
+    ent(table, descriptor).object = -1;
+    ent(table, descriptor).cloexec = 0;
 }
 
 static void install_standard_descriptors(FdTable* table)
@@ -235,8 +321,8 @@ static void install_standard_descriptors(FdTable* table)
     if (!table) return;
     for (int i = 0; i < 3; ++i)
     {
-        table->entries[i].used = 1;
-        table->entries[i].object = i;
+        ent(table, i).used = 1;
+        ent(table, i).object = i;
     }
 }
 
@@ -246,15 +332,23 @@ static int create_table(int pid)
     int existing = find_table(pid);
     if (existing >= 0) return existing;
 
-    for (int i = 0; i < FD_PROCESS_TABLES; ++i)
+    for (int attempt = 0; attempt < 2; ++attempt)
     {
-        if (tables[i].used) continue;
-        tables[i].used = 1;
-        tables[i].owner_pid = pid;
-        for (int d = 0; d < FD_MAX_DESCRIPTORS; ++d)
-            clear_descriptor(&tables[i], d);
-        install_standard_descriptors(&tables[i]);
-        return i;
+        for (int i = 0; i < FD_PROCESS_TABLES; ++i)
+        {
+            if (tables[i].used) continue;
+            tables[i].used = 1;
+            tables[i].owner_pid = pid;
+            if (!tables[i].entries) (void)ent(&tables[i], 31);          /* first 32 descriptors */
+            if (!tables[i].entries) { tables[i].used = 0; tables[i].owner_pid = -1; return -1; }
+            for (int d = 0; d < tables[i].cap; ++d)
+                clear_descriptor(&tables[i], d);
+            install_standard_descriptors(&tables[i]);
+            return i;
+        }
+        int first = tables.grow();
+        if (first < 0) return -1;
+        for (int i = first; i < tables.size(); ++i) tables[i].owner_pid = -1;
     }
     return -1;
 }
@@ -267,8 +361,8 @@ static FdTable* current_table()
 static int descriptor_valid_in(FdTable* table, int descriptor)
 {
     if (!table || descriptor < 0 || descriptor >= FD_MAX_DESCRIPTORS ||
-        !table->entries[descriptor].used) return 0;
-    int object = table->entries[descriptor].object;
+        !entr(table, descriptor).used) return 0;
+    int object = entr(table, descriptor).object;
     return object >= 0 && object < FD_OPEN_FILES && open_files[object].used;
 }
 
@@ -284,21 +378,32 @@ static int free_descriptor(FdTable* table, int minimum)
     if (!table) return -1;
     int limit = fd_limit_of(table);
     for (int i = minimum; i < limit; ++i)
-        if (!table->entries[i].used) return i;
+        if (!entr(table, i).used) return i;          /* past the allocated part everything is free */
     return -1;
 }
 
+static void clear_object(int object);
 static int free_object()
 {
-    for (int i = 3; i < FD_OPEN_FILES; ++i)
-        if (!open_files[i].used) return i;
+    for (int attempt = 0; attempt < 2; ++attempt)
+    {
+        for (int i = 3; i < FD_OPEN_FILES; ++i)
+            if (!open_files[i].used) return i;
+        int first = open_files.grow();
+        if (first < 0) return -1;
+        for (int i = first; i < open_files.size(); ++i) clear_object(i);
+    }
     return -1;
 }
 
 static int free_pipe()
 {
-    for (int i = 0; i < FD_PIPE_MAX; ++i)
-        if (!pipes[i].used) return i;
+    for (int attempt = 0; attempt < 2; ++attempt)
+    {
+        for (int i = 0; i < FD_PIPE_MAX; ++i)
+            if (!pipes[i].used) return i;
+        if (pipes.grow() < 0) return -1;
+    }
     return -1;
 }
 
@@ -368,9 +473,9 @@ static void ux_free(int idx)
 
 static int ux_alloc(int type)
 {
-    for (int i = 0; i < UX_MAX; ++i)
     {
-        if (usocks[i].used) continue;
+        int i = pool_free_slot(usocks);
+        if (i < 0) return -1;
         UnixSock* u = &usocks[i];
         u->used = 1; u->type = type; u->state = 0; u->peer = -1; u->peer_closed = 0; u->wr_shut = 0;
         u->attached = 0; u->path[0] = 0; u->rd = u->wr = u->size = 0; u->tot_w = u->tot_r = 0;
@@ -419,7 +524,7 @@ static void close_entry(FdTable* table, int descriptor)
         clear_descriptor(table, descriptor);
         return;
     }
-    int object = table->entries[descriptor].object;
+    int object = entr(table, descriptor).object;
     clear_descriptor(table, descriptor);
     release_object(object);
 }
@@ -430,22 +535,31 @@ static int attach_object(FdTable* table, int object, int minimum)
         return -1;
     int descriptor = free_descriptor(table, minimum);
     if (descriptor < 0) return -24;
-    table->entries[descriptor].used = 1;
-    table->entries[descriptor].object = object;
+    ent(table, descriptor).used = 1;
+    ent(table, descriptor).object = object;
     if (!open_files[object].permanent) ++open_files[object].refs;
     return descriptor;
 }
 
 void fd_init()
 {
+    if (tables.size() == 0) (void)tables.grow();
+    if (open_files.size() == 0) (void)open_files.grow();
+    if (pipes.size() == 0) (void)pipes.grow();
+    if (timerfds.size() == 0) (void)timerfds.grow();
+    if (sigfds.size() == 0) (void)sigfds.grow();
+    if (inos.size() == 0) (void)inos.grow();
+    if (flocks.size() == 0) (void)flocks.grow();
+    if (events.size() == 0) (void)events.grow();
+    if (usocks.size() == 0) (void)usocks.grow();
     for (int i = 0; i < FD_PROCESS_TABLES; ++i)
     {
         tables[i].used = 0;
         tables[i].owner_pid = -1;
-        for (int d = 0; d < FD_MAX_DESCRIPTORS; ++d)
+        for (int d = 0; d < tables[i].cap; ++d)
         {
-            tables[i].entries[d].used = 0;
-            tables[i].entries[d].object = -1;
+            ent(&tables[i], d).used = 0;
+            ent(&tables[i], d).object = -1;
         }
     }
     for (int i = 0; i < FD_OPEN_FILES; ++i) clear_object(i);
@@ -500,7 +614,7 @@ void fd_close_all()
 {
     FdTable* table = current_table();
     if (!table) return;
-    for (int i = 0; i < FD_MAX_DESCRIPTORS; ++i)
+    for (int i = 0; i < table->cap; ++i)
         close_entry(table, i);
     install_standard_descriptors(table);
 }
@@ -518,8 +632,11 @@ void fd_release_process(int pid)
     int index = find_table(pid);
     if (index < 0) return;
     FdTable* table = &tables[index];
-    for (int i = 0; i < FD_MAX_DESCRIPTORS; ++i)
+    for (int i = 0; i < table->cap; ++i)
         close_entry(table, i);
+    if (table->entries) fd_free(table->entries);
+    table->entries = 0;
+    table->cap = 0;
     table->used = 0;
     table->owner_pid = -1;
     if (active_table == index)
@@ -579,9 +696,9 @@ int fd_open(const char* path, uint32_t flags, int cwd)
     copy_string(file->path, path, (int)sizeof(file->path));
     if (flags & FD_O_APPEND) file->offset = fs_file_size(id);
 
-    table->entries[descriptor].used = 1;
-    table->entries[descriptor].object = object;
-    table->entries[descriptor].cloexec = want_cloexec;
+    ent(table, descriptor).used = 1;
+    ent(table, descriptor).object = object;
+    ent(table, descriptor).cloexec = want_cloexec;
     if (ino_active) ino_file_event(path, cwd, 0x20U);                           /* IN_OPEN */
     return descriptor;
 }
@@ -598,7 +715,7 @@ int fd_dup(int descriptor)
 {
     FdTable* table = current_table();
     if (!descriptor_valid_in(table, descriptor)) return -9;
-    return attach_object(table, table->entries[descriptor].object, 0);
+    return attach_object(table, entr(table, descriptor).object, 0);
 }
 
 int fd_dup2(int old_descriptor, int new_descriptor)
@@ -609,10 +726,12 @@ int fd_dup2(int old_descriptor, int new_descriptor)
     if (old_descriptor == new_descriptor) return new_descriptor;
     if (new_descriptor >= fd_limit_of(table)) return -9;      /* EBADF: beyond RLIMIT_NOFILE */
 
-    int object = table->entries[old_descriptor].object;
-    if (table->entries[new_descriptor].used) close_entry(table, new_descriptor);
-    table->entries[new_descriptor].used = 1;
-    table->entries[new_descriptor].object = object;
+    int object = entr(table, old_descriptor).object;
+    if (entr(table, new_descriptor).used) close_entry(table, new_descriptor);
+    (void)ent(table, new_descriptor);                         /* grow the table before touching the object's refcount */
+    if (new_descriptor >= table->cap) return -12;             /* ENOMEM */
+    ent(table, new_descriptor).used = 1;
+    ent(table, new_descriptor).object = object;
     if (!open_files[object].permanent) ++open_files[object].refs;
     return new_descriptor;
 }
@@ -625,7 +744,7 @@ int fd_pipe(int descriptors[2])
     if (first < 0) return -24;
     int second = -1;
     for (int i = first + 1; i < fd_limit_of(table); ++i)
-        if (!table->entries[i].used) { second = i; break; }
+        if (!entr(table, i).used) { second = i; break; }
     if (second < 0) return -24;
 
     int pipe_id = free_pipe();
@@ -653,10 +772,10 @@ int fd_pipe(int descriptors[2])
     wr->refs = 1; wr->flags = FD_O_WRONLY; wr->cwd = -1; wr->offset = 0;
     wr->pipe_id = pipe_id; wr->path[0] = '\0';
 
-    table->entries[first].used = 1;
-    table->entries[first].object = read_object;
-    table->entries[second].used = 1;
-    table->entries[second].object = write_object;
+    ent(table, first).used = 1;
+    ent(table, first).object = read_object;
+    ent(table, second).used = 1;
+    ent(table, second).object = write_object;
     descriptors[0] = first;
     descriptors[1] = second;
     return 0;
@@ -687,7 +806,7 @@ static void tf_update(TimerFd* tf)
 int fd_timerfd_create(int flags)
 {
     int idx = -1;
-    for (int i = 0; i < TF_MAX; ++i) if (!timerfds[i].used) { idx = i; break; }
+    idx = pool_free_slot(timerfds);
     if (idx < 0) return -24;
     timerfds[idx].used = 1; timerfds[idx].interval_ms = 0; timerfds[idx].next_ms = 0; timerfds[idx].expirations = 0;
     int d = new_object_fd(FD_KIND_TIMER, FD_O_RDWR | ((flags & SOCK_NONBLOCK_FLAG) ? FD_O_NONBLOCK : 0), idx, -1, (flags & SOCK_CLOEXEC_FLAG) != 0);
@@ -736,7 +855,7 @@ int fd_signalfd(int descriptor, uint32_t mask, int flags)
         return descriptor;
     }
     int idx = -1;
-    for (int i = 0; i < SF_MAX; ++i) if (!sigfds[i].used) { idx = i; break; }
+    idx = pool_free_slot(sigfds);
     if (idx < 0) return -24;
     sigfds[idx].used = 1; sigfds[idx].mask = mask;
     int d = new_object_fd(FD_KIND_SIGNAL, FD_O_RDONLY | ((flags & SOCK_NONBLOCK_FLAG) ? FD_O_NONBLOCK : 0), idx, -1, (flags & SOCK_CLOEXEC_FLAG) != 0);
@@ -755,7 +874,7 @@ static int64_t signalfd_read(OpenFile* entry, void* buffer, uint64_t length)
     uint8_t* out = (uint8_t*)buffer; uint64_t done = 0;
     while (done + 128 <= length)
     {
-        int sig = process_sig_take_set(pid, sigfds[entry->aux].mask);
+        int sig = task_sig_take_set(pid, sigfds[entry->aux].mask);   /* thread-directed signals of the reader count too */
         if (sig <= 0) break;
         int sender = 0, code = 0; uint64_t value = 0;
         (void)process_sig_info_get(pid, sig, &sender, &code, &value);
@@ -841,7 +960,7 @@ static void ino_file_event(const char* path, int cwd, uint32_t mask)
 int fd_inotify_init(int flags)
 {
     int idx = -1;
-    for (int i = 0; i < IN_INST_MAX; ++i) if (!inos[i].used) { idx = i; break; }
+    idx = pool_free_slot(inos);
     if (idx < 0) return -24;
     Ino* in = &inos[idx];
     in->used = 1; in->next_wd = 1; in->qh = in->qn = 0; in->overflow = 0; in->gen = 0;
@@ -926,7 +1045,7 @@ int fd_fstat(int descriptor, FsStat* out)
         case FD_KIND_SOCK_TCP: case FD_KIND_SOCK_UDP: case FD_KIND_UNIX: out->type = 4; out->mode = 0777; break;
         default: out->type = 6; break;
     }
-    out->inode = (uint32_t)(f - open_files) + 1U;
+    out->inode = (uint32_t)(open_files.index_of(f) + 1);
     return 0;
 }
 
@@ -956,7 +1075,7 @@ int fd_flock(int descriptor, int op)
     OpenFile* f = file_of(descriptor);
     if (!f) return -9;
     if (f->kind != FD_KIND_FILE) return -22;
-    int obj = (int)(f - open_files);
+    int obj = open_files.index_of(f);
     int node = fs_resolve(f->path, f->cwd);
     if (node < 0) return -2;
     for (int i = 0; i < FL_MAX; ++i) if (flocks[i].used && flocks[i].obj == obj) flocks[i].used = 0;   /* drop my old lock (convert) */
@@ -964,9 +1083,10 @@ int fd_flock(int descriptor, int op)
     int want_ex = (op == 2);
     for (int i = 0; i < FL_MAX; ++i)
         if (flocks[i].used && flocks[i].node == node && flocks[i].obj != obj && (flocks[i].ex || want_ex)) return -11;
-    for (int i = 0; i < FL_MAX; ++i)
-        if (!flocks[i].used) { flocks[i].used = 1; flocks[i].node = node; flocks[i].ex = want_ex; flocks[i].obj = obj; return 0; }
-    return -37;                                    /* ENOLCK */
+    int slot = pool_free_slot(flocks);
+    if (slot < 0) return -37;                      /* ENOLCK */
+    flocks[slot].used = 1; flocks[slot].node = node; flocks[slot].ex = want_ex; flocks[slot].obj = obj;
+    return 0;
 }
 
 /* ===================== unified descriptors: sockets, eventfd, AF_UNIX, poll ===================== */
@@ -983,9 +1103,9 @@ static int new_object_fd(int kind, uint32_t flags, int aux, int owner, int cloex
     clear_object(object);
     f->used = 1; f->permanent = 0; f->kind = kind; f->refs = 1; f->flags = flags;
     f->aux = aux; f->owner = owner;
-    table->entries[descriptor].used = 1;
-    table->entries[descriptor].object = object;
-    table->entries[descriptor].cloexec = cloexec;
+    ent(table, descriptor).used = 1;
+    ent(table, descriptor).object = object;
+    ent(table, descriptor).cloexec = cloexec;
     return descriptor;
 }
 
@@ -993,14 +1113,14 @@ static OpenFile* file_of(int descriptor)
 {
     FdTable* table = current_table();
     if (!descriptor_valid_in(table, descriptor)) return 0;
-    return &open_files[table->entries[descriptor].object];
+    return &open_files[entr(table, descriptor).object];
 }
 
 static int object_of(int descriptor)
 {
     FdTable* table = current_table();
     if (!descriptor_valid_in(table, descriptor)) return -1;
-    return table->entries[descriptor].object;
+    return entr(table, descriptor).object;
 }
 
 int fd_set_nonblock(int descriptor, int value)
@@ -1271,7 +1391,7 @@ int64_t fd_recvmsg(int descriptor, void* buf, uint64_t cap, int* fds, int* nfds,
 int fd_eventfd(uint64_t initial, int flags)
 {
     int idx = -1;
-    for (int i = 0; i < EV_MAX; ++i) if (!events[i].used) { idx = i; break; }
+    idx = pool_free_slot(events);
     if (idx < 0) return -24;
     events[idx].used = 1; events[idx].counter = initial; events[idx].semaphore = flags & 1;
     int d = new_object_fd(FD_KIND_EVENT, FD_O_RDWR | ((flags & SOCK_NONBLOCK_FLAG) ? FD_O_NONBLOCK : 0), idx, -1,
@@ -1504,7 +1624,7 @@ int fd_poll_mask(int descriptor)
         {
             if (f->aux < 0 || f->aux >= SF_MAX || !sigfds[f->aux].used) return POLL_ERR;
             FdTable* t = current_table();
-            return t && (process_sig_pending_raw(t->owner_pid) & sigfds[f->aux].mask) ? POLL_IN : 0;
+            return t && (task_sig_pending_raw(t->owner_pid) & sigfds[f->aux].mask) ? POLL_IN : 0;
         }
         case FD_KIND_INOTIFY: return f->aux >= 0 && f->aux < IN_INST_MAX && inos[f->aux].used && inos[f->aux].qn ? POLL_IN : 0;
         case FD_KIND_UNIX:
@@ -1559,7 +1679,7 @@ int64_t fd_read(int descriptor, void* buffer, uint64_t length)
     if (length == 0) return 0;
     if (!buffer) return -14;
 
-    OpenFile* entry = &open_files[table->entries[descriptor].object];
+    OpenFile* entry = &open_files[entr(table, descriptor).object];
     if (!can_read(entry->flags)) return -9;
 
     if (entry->kind == FD_KIND_STDIN)
@@ -1633,7 +1753,7 @@ int64_t fd_write(int descriptor, const void* buffer, uint64_t length)
     if (length == 0) return 0;
     if (!buffer) return -14;
 
-    OpenFile* entry = &open_files[table->entries[descriptor].object];
+    OpenFile* entry = &open_files[entr(table, descriptor).object];
     if (!can_write(entry->flags)) return -9;
 
     if (entry->kind == FD_KIND_STDOUT || entry->kind == FD_KIND_STDERR)
@@ -1713,7 +1833,7 @@ int64_t fd_seek(int descriptor, int64_t offset, int whence)
 {
     FdTable* table = current_table();
     if (!descriptor_valid_in(table, descriptor)) return -9;
-    OpenFile* entry = &open_files[table->entries[descriptor].object];
+    OpenFile* entry = &open_files[entr(table, descriptor).object];
     if (entry->kind != FD_KIND_FILE) return -29;
 
     int id = fs_resolve(entry->path, entry->cwd);
@@ -1741,10 +1861,10 @@ void fd_list()
     FdTable* table = current_table();
     uart_puts("FD   TYPE       MODE       OFFSET  PATH\r\n");
     if (!table) { uart_puts("(no descriptor table)\r\n"); return; }
-    for (int i = 0; i < FD_MAX_DESCRIPTORS; ++i)
+    for (int i = 0; i < table->cap; ++i)
     {
         if (!descriptor_valid_in(table, i)) continue;
-        OpenFile* entry = &open_files[table->entries[i].object];
+        OpenFile* entry = &open_files[entr(table, i).object];
         print_u64((uint64_t)i); uart_puts("    ");
         switch (entry->kind)
         {
@@ -1789,15 +1909,15 @@ int fd_clone_table(int src_pid, int dst_pid)
     if (dst < 0) return -24;
     FdTable* a = &tables[src];
     FdTable* b = &tables[dst];
-    for (int d = 0; d < FD_MAX_DESCRIPTORS; ++d) close_entry(b, d);
-    for (int d = 0; d < FD_MAX_DESCRIPTORS; ++d)
+    for (int d = 0; d < b->cap; ++d) close_entry(b, d);
+    for (int d = 0; d < a->cap; ++d)
     {
         clear_descriptor(b, d);
         if (!descriptor_valid_in(a, d)) continue;
-        int object = a->entries[d].object;
-        b->entries[d].used = 1;
-        b->entries[d].object = object;
-        b->entries[d].cloexec = a->entries[d].cloexec;
+        int object = entr(a, d).object;
+        ent(b, d).used = 1;
+        ent(b, d).object = object;
+        ent(b, d).cloexec = entr(a, d).cloexec;
         if (!open_files[object].permanent) ++open_files[object].refs;
     }
     return 0;
@@ -1812,9 +1932,9 @@ int fd_redirect(int dst_pid, int dst_fd, int src_pid, int src_fd)
     if (s < 0 || d < 0 || dst_fd < 0 || dst_fd >= FD_MAX_DESCRIPTORS) return -9;
     if (!descriptor_valid_in(&tables[s], src_fd)) return -9;
     close_entry(&tables[d], dst_fd);
-    int object = tables[s].entries[src_fd].object;
-    tables[d].entries[dst_fd].used = 1;
-    tables[d].entries[dst_fd].object = object;
+    int object = entr(&tables[s], src_fd).object;
+    ent(&tables[d], dst_fd).used = 1;
+    ent(&tables[d], dst_fd).object = object;
     if (!open_files[object].permanent) ++open_files[object].refs;
     return 0;
 }
@@ -1831,7 +1951,7 @@ int fd_is_pipe(int descriptor)
 {
     FdTable* table = current_table();
     if (!descriptor_valid_in(table, descriptor)) return 0;
-    int k = open_files[table->entries[descriptor].object].kind;
+    int k = open_files[entr(table, descriptor).object].kind;
     return k == FD_KIND_PIPE_READ || k == FD_KIND_PIPE_WRITE;
 }
 
@@ -1840,21 +1960,21 @@ int fd_get_cloexec(int descriptor)
 {
     FdTable* table = current_table();
     if (!descriptor_valid_in(table, descriptor)) return -9;
-    return table->entries[descriptor].cloexec ? 1 : 0;
+    return entr(table, descriptor).cloexec ? 1 : 0;
 }
 int fd_set_cloexec(int descriptor, int value)
 {
     FdTable* table = current_table();
     if (!descriptor_valid_in(table, descriptor)) return -9;
-    table->entries[descriptor].cloexec = value ? 1 : 0;
+    ent(table, descriptor).cloexec = value ? 1 : 0;
     return 0;
 }
 void fd_close_on_exec(int pid)
 {
     int t = find_table(pid);
     if (t < 0) return;
-    for (int d = 0; d < FD_MAX_DESCRIPTORS; ++d)
-        if (tables[t].entries[d].used && tables[t].entries[d].cloexec) close_entry(&tables[t], d);
+    for (int d = 0; d < tables[t].cap; ++d)
+        if (entr(&tables[t], d).used && entr(&tables[t], d).cloexec) close_entry(&tables[t], d);
 }
 
 /* Path, directory and open flags of a regular-file descriptor (for MAP_SHARED write-back). */
@@ -1862,7 +1982,7 @@ int fd_file_info(int descriptor, char* path, int cap, int* cwd, uint32_t* flags)
 {
     FdTable* table = current_table();
     if (!descriptor_valid_in(table, descriptor)) return -9;
-    OpenFile* entry = &open_files[table->entries[descriptor].object];
+    OpenFile* entry = &open_files[entr(table, descriptor).object];
     if (entry->kind != FD_KIND_FILE) return -19;   /* ENODEV */
     copy_string(path, entry->path, cap);
     if (cwd) *cwd = entry->cwd;

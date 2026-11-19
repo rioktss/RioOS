@@ -87,7 +87,7 @@ static void user_execute_inner(const char* path, const char* args)
         uart_puts("PID: "); put_u((uint64_t)pid);
         uart_puts("\r\nEntry point: 0x");
         for (int i = 15; i >= 0; --i) uart_putc(hex[(entry >> (i * 4)) & 15]);
-        uart_puts("\r\nAddress space: isolated; stack: 64 KiB + guard; preemptive (100 Hz)\r\n");
+        uart_puts("\r\nAddress space: isolated; stack: 8 MiB demand-paged + guard; ASLR; preemptive (100 Hz)\r\n");
     }
 
     int code = task_wait_foreground(pid, 1);

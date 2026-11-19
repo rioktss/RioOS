@@ -27,7 +27,15 @@
 
 extern "C" {
 
-int errno = 0;
+__thread int errno = 0;
+extern void __rio_tls_init(void);
+int* __errno_location(void) { return &errno; }   /* for shared objects: errno is per thread */
+extern void __rio_fork_prepare(void);
+extern void __rio_fork_parent(void);
+extern void __rio_fork_child(void);
+extern void __rio_stdio_fork_prepare(void);
+extern void __rio_stdio_fork_parent(void);
+extern void __rio_stdio_fork_child(void);
 
 #define SYS_FORK 37
 #define SYS_EXEC 38
@@ -58,7 +66,7 @@ int errno = 0;
 static long ret(uint64_t v)
 {
     long r = (long)v;
-    if (r < 0 && r > -4096) { errno = (int)-r; return -1; }
+    if (r < 0 && r > -4096) { errno = (int)-r; if (errno == EINTR) __rio_cancel_eintr(); return -1; }
     return r;
 }
 
@@ -114,7 +122,15 @@ int toupper(int c) { return islower(c) ? c - 32 : c; }
 int tolower(int c) { return isupper(c) ? c + 32 : c; }
 
 /* ---- syscalls ---------------------------------------------------------- */
-pid_t fork(void) { pid_t r = (pid_t)ret(user_syscall0(SYS_FORK)); if (r == 0 && __rio_threads_started) __rio_thread_after_fork(); return r; }
+pid_t fork(void)
+{
+    __rio_fork_prepare();
+    long r = (long)user_syscall0(SYS_FORK);
+    int e = (r < 0 && r > -4096) ? (int)-r : 0;
+    if (r == 0) __rio_fork_child(); else __rio_fork_parent();
+    if (e) { errno = e; return -1; }
+    return (pid_t)r;
+}
 int execv_args(const char* path, const char* args) { return (int)ret(user_syscall2(SYS_EXEC, (uint64_t)path, (uint64_t)args)); }
 pid_t waitpid(pid_t pid, int* st, int opt)
 {
@@ -141,7 +157,7 @@ int link(const char* target, const char* linkpath) { long r = ret(user_syscall2(
 long readlink(const char* path, char* buf, size_t cap) { long r = ret(user_syscall3(SYS_FS_READLINK, (uint64_t)path, (uint64_t)buf, cap)); return r < 0 ? -1 : r; }
 char* realpath(const char* path, char* out)
 {
-    static char sbuf[256]; char* dst = out ? out : sbuf;
+    static __thread char sbuf[256]; char* dst = out ? out : sbuf;
     long r = ret(user_syscall3(SYS_FS_REALPATH, (uint64_t)path, (uint64_t)dst, 256));
     return r < 0 ? 0 : dst;
 }
@@ -165,20 +181,22 @@ int setuid(unsigned uid, unsigned gid) { return (int)ret(user_syscall2(SYS_SETUI
 pid_t spawn(const char* path, const char* args, int bg) { return (pid_t)ret(user_syscall3(SYS_SPAWN, (uint64_t)path, (uint64_t)args, (uint64_t)bg)); }
 pid_t spawn_fd(const char* path, const char* args, int in_fd, int out_fd)
 { return (pid_t)ret(user_syscall4(SYS_SPAWN_FD, (uint64_t)path, (uint64_t)args, (uint64_t)(long)in_fd, (uint64_t)(long)out_fd)); }
-void sched_yield(void) { if (__rio_threads_started && __rio_thread_yield()) return; (void)user_syscall0(SYS_YIELD); }
+void sched_yield(void) { (void)user_syscall0(SYS_YIELD); }
 unsigned sleep_ms(unsigned ms)   /* returns the milliseconds left when a signal interrupted the sleep */
 {
-    if (__rio_threads_started) { unsigned r = __rio_thread_sleep(ms); if (r != 0xFFFFFFFFU) return r; }
-    while (ms > 10000) { long left = (long)user_sleep_ms(10000); if (left > 0) return (unsigned)left + (ms - 10000); ms -= 10000; }
+    __rio_cancel_point();
+    while (ms > 10000) { long left = (long)user_sleep_ms(10000); if (left > 0) { __rio_cancel_point(); return (unsigned)left + (ms - 10000); } ms -= 10000; }
     long left = (long)user_sleep_ms(ms);
+    if (left > 0) __rio_cancel_point();
     return left > 0 ? (unsigned)left : 0;
 }
 unsigned long clock_ms(void) { return (unsigned long)user_time_ms(); }
 int open(const char* p, int f) { return (int)ret((uint64_t)user_fd_open(p, (uint64_t)f)); }
 int close(int fd) { __rio_sockopt_close(fd); return (int)ret((uint64_t)user_fd_close(fd)); }
-int __rio_sa_restart = 0;   /* set by the signal dispatcher when a SA_RESTART handler ran */
+__thread int __rio_sa_restart = 0;   /* set by the signal dispatcher when a SA_RESTART handler ran */
 ssize_t read(int fd, void* b, size_t n)
 {
+    __rio_cancel_point();
     if (n > 4096) n = 4096;      /* kernel transfers are bounded: a short read is normal POSIX behaviour */
     if (__rio_ep_active) __rio_epoll_rearm(fd);
     for (;;) { ssize_t r = ret((uint64_t)user_fd_read(fd, b, n)); if (r < 0 && errno == EINTR && __rio_sa_restart) { __rio_sa_restart = 0; continue; } return r; }
@@ -186,6 +204,7 @@ ssize_t read(int fd, void* b, size_t n)
 ssize_t write(int fd, const void* b, size_t n)
 {
     size_t done = 0;
+    __rio_cancel_point();
     if (__rio_ep_active) __rio_epoll_rearm(fd);
     do {
         size_t chunk = n - done; if (chunk > 4096) chunk = 4096;
@@ -202,7 +221,7 @@ int dup2(int a, int b) { return (int)ret((uint64_t)user_fd_dup2(a, b)); }
 int pipe(int fds[2]) { return (int)ret((uint64_t)user_fd_pipe(fds)); }
 const char* getargs(void)
 {
-    static char buf[1100];
+    static __thread char buf[1100];
     buf[0] = 0;
     (void)user_syscall2(USER_SYS_GETARG, (uint64_t)buf, sizeof(buf));
     for (char* p = buf; *p; ++p) if (*p == 1) { *p = 0; break; }     /* environment follows after \x01 */
@@ -210,14 +229,17 @@ const char* getargs(void)
 }
 
 static unsigned long brk_cur = 0;
+static struct __rio_lock heap_lock;                 /* the heap lock: malloc, free, realloc, sbrk, brk */
 int brk(void* addr)
 {
+    __rio_lock_acquire(&heap_lock);
     unsigned long r = (unsigned long)user_syscall1(SYS_BRK, (unsigned long)addr);
-    if ((long)r < 0 && (long)r > -4096) { errno = ENOMEM; return -1; }
+    if ((long)r < 0 && (long)r > -4096) { errno = ENOMEM; __rio_lock_release(&heap_lock); return -1; }
     brk_cur = r;
+    __rio_lock_release(&heap_lock);
     return 0;
 }
-void* sbrk(long inc)
+static void* sbrk_nolock(long inc)
 {
     if (!brk_cur) { unsigned long r = (unsigned long)user_syscall1(SYS_BRK, 0); if ((long)r < 0) { errno = ENOMEM; return (void*)-1; } brk_cur = r; }
     unsigned long old = brk_cur;
@@ -227,6 +249,7 @@ void* sbrk(long inc)
     brk_cur = r;
     return (void*)old;
 }
+void* sbrk(long inc) { __rio_lock_acquire(&heap_lock); void* r = sbrk_nolock(inc); __rio_lock_release(&heap_lock); return r; }
 void* mmap(void* addr, size_t len, int prot, int flags, int fd, long off)
 {
     (void)addr;
@@ -244,7 +267,7 @@ struct MBlock { size_t size; size_t flags; MBlock* next; MBlock* prev; };   /* 3
 static MBlock* mhead = 0;
 static MBlock* mtail = 0;
 
-void* malloc(size_t n)
+static void* malloc_nolock(size_t n)
 {
     if (!n) return 0;
     n = (n + 15) & ~(size_t)15;
@@ -269,18 +292,18 @@ void* malloc(size_t n)
             b->flags = 0;
             return b + 1;
         }
-    MBlock* b = (MBlock*)sbrk((long)(n + sizeof(MBlock)));
+    MBlock* b = (MBlock*)sbrk_nolock((long)(n + sizeof(MBlock)));
     if (b == (MBlock*)-1) return 0;
     b->size = n; b->flags = 0; b->next = 0; b->prev = mtail;
     if (mtail) mtail->next = b; else mhead = b;
     mtail = b;
     return b + 1;
 }
-void free(void* p)
+static void free_nolock(void* p)
 {
     if (!p) return;
     MBlock* b = (MBlock*)p - 1;
-    if (b->flags & 4) { free(b->next); return; }          /* aligned_alloc wrapper header */
+    if (b->flags & 4) { free_nolock(b->next); return; }          /* aligned_alloc wrapper header */
     if (b->flags & MB_MMAP) { munmap(b, b->size + sizeof(MBlock)); return; }
     b->flags = MB_FREE;
     if (b->next && (b->next->flags & MB_FREE) && (char*)(b + 1) + b->size == (char*)b->next)
@@ -294,14 +317,23 @@ void free(void* p)
         if (b->next) b->next->prev = a; else mtail = a;
     }
 }
-void* calloc(size_t c, size_t n) { size_t t = c * n; void* p = malloc(t); if (p) memset(p, 0, t); return p; }
-size_t malloc_usable_size(void* p) { if (!p) return 0; MBlock* b = (MBlock*)p - 1; if (b->flags & 4) return 0; return b->size; }
-void* realloc(void* p, size_t n)
+void* malloc(size_t n) { __rio_lock_acquire(&heap_lock); void* p = malloc_nolock(n); __rio_lock_release(&heap_lock); return p; }
+void free(void* p) { if (!p) return; __rio_lock_acquire(&heap_lock); free_nolock(p); __rio_lock_release(&heap_lock); }
+void* calloc(size_t c, size_t n)
 {
-    if (!p) return malloc(n);
-    if (!n) { free(p); return 0; }
+    size_t t = c * n;
+    if (c && t / c != n) { errno = ENOMEM; return 0; }
+    void* p = malloc(t);
+    if (p) memset(p, 0, t);          /* fresh mmap memory is zero already, but a recycled block is not */
+    return p;
+}
+size_t malloc_usable_size(void* p) { if (!p) return 0; MBlock* b = (MBlock*)p - 1; if (b->flags & 4) return 0; return b->size; }
+static void* realloc_nolock(void* p, size_t n)
+{
+    if (!p) return malloc_nolock(n);
+    if (!n) { free_nolock(p); return 0; }
     MBlock* b = (MBlock*)p - 1;
-    if (b->flags & 4) { void* q = malloc(n); if (q) { memcpy(q, p, n); free(p); } return q; }
+    if (b->flags & 4) { void* q = malloc_nolock(n); if (q) { memcpy(q, p, n); free_nolock(p); } return q; }
     size_t need = (n + 15) & ~(size_t)15;
     if (!(b->flags & MB_MMAP))
     {
@@ -334,10 +366,11 @@ void* realloc(void* p, size_t n)
         }
     }
     else if (b->size >= need) return p;
-    void* q = malloc(n);
-    if (q) { memcpy(q, p, b->size < n ? b->size : n); free(p); }
+    void* q = malloc_nolock(n);
+    if (q) { memcpy(q, p, b->size < n ? b->size : n); free_nolock(p); }
     return q;
 }
+void* realloc(void* p, size_t n) { __rio_lock_acquire(&heap_lock); void* q = realloc_nolock(p, n); __rio_lock_release(&heap_lock); return q; }
 
 int abs(int v) { return v < 0 ? -v : v; }
 unsigned long strtoul(const char* s, char** end, int base)
@@ -366,23 +399,72 @@ long strtol(const char* s, char** end, int base)
 int atoi(const char* s) { return (int)strtol(s, 0, 10); }
 
 static void swap_bytes(char* a, char* b, size_t n) { while (n--) { char t = *a; *a++ = *b; *b++ = t; } }
+/* heapsort: in place, no allocation, no recursion, O(n log n) worst case (the old insertion sort was O(n^2)) */
+static void qs_sift(char* b, size_t sz, size_t root, size_t n, int (*cmp)(const void*, const void*))
+{
+    for (;;)
+    {
+        size_t child = 2 * root + 1;
+        if (child >= n) return;
+        if (child + 1 < n && cmp(b + child * sz, b + (child + 1) * sz) < 0) ++child;
+        if (cmp(b + root * sz, b + child * sz) >= 0) return;
+        swap_bytes(b + root * sz, b + child * sz, sz);
+        root = child;
+    }
+}
 void qsort(void* base, size_t n, size_t sz, int (*cmp)(const void*, const void*))
 {
+    if (n < 2 || sz == 0) return;
     char* b = (char*)base;
-    for (size_t i = 1; i < n; ++i)
-        for (size_t j = i; j > 0 && cmp(b + (j - 1) * sz, b + j * sz) > 0; --j)
-            swap_bytes(b + (j - 1) * sz, b + j * sz, sz);
+    for (size_t i = n / 2; i-- > 0;) qs_sift(b, sz, i, n, cmp);
+    for (size_t end = n - 1; end > 0; --end)
+    {
+        swap_bytes(b, b + end * sz, sz);
+        qs_sift(b, sz, 0, end, cmp);
+    }
 }
 static unsigned rng = 12345;
-int rand(void) { rng = rng * 1103515245u + 12345u; return (int)((rng >> 16) & 0x7FFF); }
-void srand(unsigned s) { rng = s; }
+static struct __rio_lock rng_lock;
+int rand(void) { __rio_lock_acquire(&rng_lock); rng = rng * 1103515245u + 12345u; int v = (int)((rng >> 16) & 0x7FFF); __rio_lock_release(&rng_lock); return v; }
+void srand(unsigned s) { __rio_lock_acquire(&rng_lock); rng = s; __rio_lock_release(&rng_lock); }
 
-static void (*exit_hooks[32])(void);
+static void (**exit_hooks)(void) = 0;
 int __rio_exit_status = 0;
-static int exit_hook_n = 0;
-int atexit(void (*fn)(void)) { if (exit_hook_n >= 32) return -1; exit_hooks[exit_hook_n++] = fn; return 0; }
+static int exit_hook_n = 0, exit_hook_cap = 0;
+static struct __rio_lock exit_lock;
+static int exit_started = 0, exit_owner = 0;
+int atexit(void (*fn)(void))
+{
+    int rc = 0;
+    __rio_lock_acquire(&exit_lock);
+    if (exit_hook_n == exit_hook_cap)
+    {
+        int nc = exit_hook_cap ? exit_hook_cap * 2 : 32;
+        void (**nh)(void) = (void (**)(void))realloc((void*)exit_hooks, (size_t)nc * sizeof(void (*)(void)));
+        if (!nh) rc = -1; else { exit_hooks = nh; exit_hook_cap = nc; }
+    }
+    if (!rc) exit_hooks[exit_hook_n++] = fn;
+    __rio_lock_release(&exit_lock);
+    return rc;
+}
 void _exit(int code) { (void)user_syscall1(USER_SYS_EXIT, (uint64_t)(long)code); for (;;) {} }
-void exit(int code) { __rio_exit_status = code; while (exit_hook_n > 0) exit_hooks[--exit_hook_n](); _exit(code); }
+void exit(int code)
+{
+    int me = gettid();
+    if (__atomic_exchange_n(&exit_started, 1, __ATOMIC_ACQ_REL) && exit_owner != me)
+        for (;;) (void)user_sleep_ms(1000);                /* another thread is already exiting and will end the process */
+    exit_owner = me;
+    __rio_exit_status = code;
+    for (;;)
+    {
+        __rio_lock_acquire(&exit_lock);
+        void (*fn)(void) = exit_hook_n > 0 ? exit_hooks[--exit_hook_n] : 0;
+        __rio_lock_release(&exit_lock);
+        if (!fn) break;
+        fn();
+    }
+    _exit(code);
+}
 void abort(void) { _exit(134); }
 
 /* ---- printf ------------------------------------------------------------ */
@@ -505,6 +587,7 @@ char* fgets_fd(int fd, char* buf, int cap)
 /* ---- program start ----------------------------------------------------- */
 void __libc_start(void)
 {
+    __rio_tls_init();                      /* TLS block + thread descriptor: must precede any use of errno */
     static char argbuf[1100];
     static char* argv[66];
     int argc = 0;
@@ -546,5 +629,12 @@ void __libc_start(void)
     argv[argc] = 0;
     exit(main(argc, argv));
 }
+
+
+/* fork: no other thread may hold a libc lock the child would inherit locked (stdio locks first, the heap lock last) */
+extern void __rio_env_fork(int phase);
+void __rio_libc_fork_prepare(void) { __rio_stdio_fork_prepare(); __rio_env_fork(0); __rio_lock_acquire(&heap_lock); }
+void __rio_libc_fork_parent(void) { __rio_lock_release(&heap_lock); __rio_env_fork(1); __rio_stdio_fork_parent(); }
+void __rio_libc_fork_child(void) { heap_lock.v = 0; exit_lock.v = 0; rng_lock.v = 0; __rio_env_fork(2); __rio_stdio_fork_child(); }
 
 } /* extern "C" */

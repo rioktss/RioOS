@@ -81,11 +81,13 @@ void tls_random(uint8_t* o, uint32_t n) { for (uint32_t i = 0; i < n; ++i) o[i] 
 int fs_set_mtime_path(const char*, int, uint64_t) { return 0; }
 uint32_t net_tcp_gen(int, int) { return 0; }
 uint32_t net_udp_gen(int, int) { return 0; }
-uint64_t process_rlimit_cur(int, int) { return ~0ULL; }
+uint64_t process_rlimit_cur(int, int r) { return r == 7 ? (uint64_t)FD_DEFAULT_LIMIT : ~0ULL; }   /* 7 = RLIMIT_NOFILE */
 int process_sig_raise(int, int) { return 0; }
 uint32_t process_sig_pending_raw(int) { return 0; }
 uint32_t process_sig_serial(int) { return 0; }
 int process_sig_take_set(int, uint32_t) { return 0; }
+int task_sig_take_set(int, uint32_t) { return 0; }
+uint32_t task_sig_pending_raw(int) { return 0; }
 int process_sig_info_get(int, int, int*, int*, uint64_t*) { return 0; }
 int process_set_in_syscall_dummy;
 void process_set_in_syscall(int, int) {}
@@ -355,7 +357,10 @@ int main()
     CHECK(call(SYS_FD_READ, (uint64_t)descriptor, (uint64_t)kback, 0, 1) == ERR(9));
     CHECK(call(SYS_FD_CLOSE, 7, 0, 0) == 0);
     CHECK(call(SYS_FD_DUP, 99, 0, 0) == ERR(9));
-    CHECK(call(SYS_FD_DUP2, 0, 99, 0) == ERR(9));
+    CHECK(call(SYS_FD_DUP2, 0, 70000, 0) == ERR(9));
+    CHECK(call(SYS_FD_DUP2, 0, 1024, 0) == ERR(9));           /* default RLIMIT_NOFILE */
+    CHECK(call(SYS_FD_DUP2, 0, 1000, 0) == 1000);             /* far beyond the old fixed 24 */
+    CHECK(call(SYS_FD_CLOSE, 1000, 0, 0) == 0);
 
     /* The generic non-blocking kernel pipe is available through the syscall ABI. */
     int pipefd[2] = {-1, -1};

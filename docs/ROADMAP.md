@@ -13,7 +13,7 @@ Implemented in this source baseline:
 - PCB support to save and restore the 31 general-purpose registers, ELR, SPSR, and EL0 stack pointer at exception boundaries.
 - User mappings and stack backing frames are released when the process finishes or loading fails.
 
-Still deliberately deferred: scheduling a saved EL0 exception frame onto a different per-process kernel stack, safe process-to-process resume from IRQ/syscall exit, and timer preemption. The current `user_execute()` path remains synchronous; since 1.13.0 the timer IRQ stays live while EL0 runs but only counts ticks. P5 therefore provides real memory isolation and context capture, but it must not be described as full concurrent user-process multitasking yet.
+Deferred at the time of P5 (done in 1.14.0, see [MULTITASKING.md](./MULTITASKING.md)): per-task kernel stacks, safe resume from IRQ/syscall exit and timer preemption.
 
 ## Near-term goals
 
@@ -170,3 +170,12 @@ Not implemented: secondary CPU release, per-CPU stacks/state, interrupt routing 
 - Enabled the 100 Hz timer IRQ at boot and while EL0 programs run (`SPSR 0x340`); it only counts ticks - preemptive process switching is still deferred.
 - Still needs a runtime acceptance run on `qemu-system-aarch64`.
 
+
+
+## Preemptive multitasking (v1.14.0)
+
+- Timer-driven preemption of EL0 on every CPU; several ELF programs run concurrently.
+- Scheduler: `SCHED_FIFO`/`SCHED_RR` (1..99, 95 % throttle), weighted-vruntime `SCHED_OTHER`/`SCHED_BATCH`, `SCHED_IDLE`, nice, per-task CPU affinity, priority inheritance.
+- 1:1 threads with per-task 32 KiB kernel stacks and guard pages, TLS, futex (PI, robust, requeue, bitset), pthread/semaphore library, cancellation.
+- Fixed-size tables (processes, run queue, descriptors, pipes, sockets, ...) replaced by dynamic ones; `poll`/`qsort` limits removed.
+- Remaining architectural limits: big kernel lock, <= 8 CPUs, 128 MiB RAM, QEMU-only testing. Details: [MULTITASKING.md](./MULTITASKING.md).

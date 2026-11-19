@@ -44,8 +44,8 @@
 #define K_SOCKINFO 94
 #define K_PIPE2 95
 
-extern int __rio_sa_restart;
-static long sret(uint64_t v) { long r = (long)v; if (r < 0 && r > -4096) { errno = (int)-r; return -1; } return r; }
+extern __thread int __rio_sa_restart;
+static long sret(uint64_t v) { long r = (long)v; if (r < 0 && r > -4096) { errno = (int)-r; if (errno == EINTR) __rio_cancel_eintr(); return -1; } return r; }
 
 /* ---- byte order / address text --------------------------------------------------------------------------------- */
 uint16_t htons(uint16_t v) { return (uint16_t)((v >> 8) | (v << 8)); }
@@ -72,7 +72,7 @@ static int parse_v4(const char* s, uint32_t* host_order)
 }
 int inet_aton(const char* s, struct in_addr* out) { uint32_t h; if (!parse_v4(s, &h)) return 0; if (out) out->s_addr = htonl(h); return 1; }
 in_addr_t inet_addr(const char* s) { struct in_addr a; return inet_aton(s, &a) ? a.s_addr : INADDR_NONE; }
-static char ntoa_buf[16];
+static __thread char ntoa_buf[16];
 static void fmt_v4(uint32_t host, char* out)
 {
     int n = 0;
@@ -394,19 +394,8 @@ ssize_t writev(int fd, const struct iovec* iov, int cnt)
 /* ---- poll / select ---------------------------------------------------------------------------------------------- */
 int poll(struct pollfd* fds, nfds_t n, int timeout_ms)
 {
-    if (n > 64) { errno = EINVAL; return -1; }
-    if (!__rio_threads_started)
-        return (int)sret(user_syscall3(K_POLL, (uint64_t)fds, (uint64_t)n, (uint64_t)(long)timeout_ms));
-    /* other green threads must keep running while this one waits: poll without blocking, sleep in between */
-    unsigned long deadline = timeout_ms > 0 ? clock_ms() + (unsigned long)timeout_ms : 0;
-    for (;;)
-    {
-        long r = sret(user_syscall3(K_POLL, (uint64_t)fds, (uint64_t)n, 0));
-        if (r != 0) return (int)r;
-        if (timeout_ms == 0) return 0;
-        if (timeout_ms > 0 && clock_ms() >= deadline) return 0;
-        usleep(1000);
-    }
+    __rio_cancel_point();
+    return (int)sret(user_syscall3(K_POLL, (uint64_t)fds, (uint64_t)n, (uint64_t)(long)timeout_ms));
 }
 int ppoll(struct pollfd* fds, nfds_t n, const struct timespec* timeout, const void* sigmask)
 {
@@ -518,7 +507,7 @@ const char* gai_strerror(int code)
 }
 struct hostent* gethostbyname(const char* name)
 {
-    static struct hostent he; static char* addrs[2]; static char* aliases[1]; static struct in_addr a; static char hname[256];
+    static __thread struct hostent he; static __thread char* addrs[2]; static __thread char* aliases[1]; static __thread struct in_addr a; static __thread char hname[256];
     uint32_t host; if (!name || resolve_v4(name, &host) != 0) return 0;
     a.s_addr = htonl(host); addrs[0] = (char*)&a; addrs[1] = 0; aliases[0] = 0;
     strncpy(hname, name, sizeof hname - 1); hname[sizeof hname - 1] = 0;

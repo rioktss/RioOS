@@ -40,9 +40,18 @@
 int task_spawn(const char* path, const char* args, int parent, int background,
                int parent_in_fd, int parent_out_fd);
 
+/* Scheduling parameters for the next program the shell starts (nice / chrt / taskset prefix commands). Programs started by a
+   user process, and forked children, inherit the starter's policy, priority, nice value and CPU mask instead. */
+struct ThreadParams;
+void task_set_spawn_params(const ThreadParams* params);   /* 0 clears */
+
 int task_fork(ExceptionFrame* frame);
 int task_exec(ExceptionFrame* frame, const char* path, const char* args);
-extern "C" void task_exit_current(int code, int signal);
+extern "C" void task_exit_current(int code, int signal);   /* exit_group: the whole process ends */
+extern "C" void task_thread_die_code(int code);            /* the calling thread ends; the last one finishes the process */
+extern "C" void task_thread_die();
+int task_thread_create(ExceptionFrame* frame, uint64_t stack_top, uint64_t tls, uint64_t clear_tid);   /* new thread id or -errno */
+int task_tgkill(int tgid, uint32_t tid, int signal, int sender);
 int task_wait(int parent, int pid, int* status, int options);
 int task_kill(int pid, int signal);
 int task_kill_info(int pid, int signal, int sender, int code, uint64_t value);   /* sender pid, si_code, si_value */
@@ -50,6 +59,16 @@ int task_deliver_fault(ExceptionFrame* frame, int sig, uint64_t addr);       /* 
 int task_reap(int pid);                 /* destroy a zombie's record */
 int task_reap_orphans(int shell_pid, void (*notify)(int pid, int code, int sig));
 int task_running_count();
+int task_thread_total();
+/* signal state of the calling thread (mask and thread-directed signals) combined with the process-directed ones */
+uint32_t task_sig_mask();
+void task_sig_set_mask(uint32_t mask);
+uint32_t task_sig_pending(int pid);          /* deliverable now */
+uint32_t task_sig_pending_raw(int pid);      /* including blocked */
+int task_sig_take(int pid);
+int task_sig_take_set(int pid, uint32_t set);
+void task_alarm_poke(int pid);           /* sleeping threads of the process re-check their alarm deadline */
+int task_sig_interrupts(int pid);            /* a blocking call must return -EINTR */
 
 extern "C" void task_deliver_signals(ExceptionFrame* frame);
 int task_sigreturn(ExceptionFrame* frame);          /* restores the context saved by a signal frame */

@@ -83,6 +83,7 @@ void bkl_unlock() {}
 int bkl_held() { return 0; }
 void smp_window() {}
 void smp_kick_others() {}
+void smp_kick_cpus(uint32_t) {}
 void smp_enable_scheduling() {}
 void smp_idle_wait() {}
 #endif
@@ -138,6 +139,7 @@ extern void thread_idle_schedule();
 extern void thread_reload_context();
 extern uint64_t thread_next_wake_ms();
 extern "C" void timer_arm_deadline_ms(uint64_t ms);
+extern "C" void interrupt_kick_cpus(uint32_t mask);
 
 static inline uint64_t daif_mask()
 {
@@ -178,6 +180,7 @@ void smp_window()
 }
 
 void smp_kick_others() { if (smp_sched_on) interrupt_kick_others(); }
+void smp_kick_cpus(uint32_t mask) { if (smp_sched_on && mask) interrupt_kick_cpus(mask); }
 
 void smp_idle_wait()
 {

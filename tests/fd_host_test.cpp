@@ -146,7 +146,24 @@ int main()
     CHECK(fd_close(shared_dup) == 0);
     CHECK(fd_close(shared) == 0);
     CHECK(fd_close(7) == 0);
-    CHECK(fd_dup(99) == -9 && fd_dup2(99, 4) == -9 && fd_dup2(0, 99) == -9);
+    CHECK(fd_dup(99) == -9 && fd_dup2(99, 4) == -9 && fd_dup2(0, 70000) == -9 && fd_dup2(0, FD_DEFAULT_LIMIT) == -9);
+
+    /* No fixed system-wide count: far more open files than the old 128 object / 24 descriptor limits, then all released. */
+    {
+        static int many[FD_DEFAULT_LIMIT];
+        int got = 0;
+        for (; got < FD_DEFAULT_LIMIT; ++got)
+        {
+            many[got] = fd_open(path, FD_O_RDONLY, root);
+            if (many[got] < 0) break;
+        }
+        CHECK(got >= FD_DEFAULT_LIMIT - 3);                 /* 0/1/2 are taken */
+        CHECK(fd_open(path, FD_O_RDONLY, root) == -24);       /* EMFILE at RLIMIT_NOFILE, not before */
+        for (int i = 0; i < got; ++i) CHECK(fd_close(many[i]) == 0);
+        int again = fd_open(path, FD_O_RDONLY, root);
+        CHECK(again >= 3);
+        CHECK(fd_close(again) == 0);
+    }
 
     /* Descriptor tables are isolated by owner PID, while each table gets 0/1/2. */
     int owner0_fd = fd_open(path, FD_O_RDONLY, root); CHECK(owner0_fd >= 3);

@@ -1,4 +1,6 @@
-# Timer IRQ (v1.13.0)
+# Timer IRQ (v1.13.0, preemption since v1.14.0)
+
+> **v1.14.0 note:** the tick now preempts EL0 and drives the scheduler; the sections below describe the 1.13.0 step in which it only counted ticks. See [MULTITASKING.md](./MULTITASKING.md).
 
 Up to 1.12.0 the generic-timer interrupt was kept off during normal boot and
 was always masked while an EL0 program ran. From 1.13.0 it is a real system
@@ -14,9 +16,8 @@ tick.
 
 ## What did not change
 
-The scheduler tick only counts ticks (`scheduler_tick()`); there is still no
-preemptive switching between processes, so EL0 programs run to completion from
-the shell. Handlers never print or allocate.
+In 1.13.0 the scheduler tick only counted ticks (`scheduler_tick()`); from
+1.14.0 it preempts (see [MULTITASKING.md](./MULTITASKING.md)). Handlers never print or allocate.
 
 ## Verify on QEMU
 

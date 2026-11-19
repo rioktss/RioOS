@@ -184,13 +184,13 @@ int main(int argc, char** argv)
     /* ---- system information ---- */
     { struct utsname u; chk("uname", uname(&u) == 0 && !strcmp(u.sysname, "RioOS") && !strcmp(u.machine, "aarch64") && u.nodename[0]);
       char hn[64]; chk("gethostname", gethostname(hn, sizeof hn) == 0 && hn[0]);
-      chk("sysconf", sysconf(_SC_PAGESIZE) == 4096 && sysconf(_SC_NPROCESSORS_ONLN) >= 1 && sysconf(_SC_PHYS_PAGES) > 1000 && sysconf(_SC_AVPHYS_PAGES) > 0 && sysconf(_SC_OPEN_MAX) == 24 && sysconf(_SC_CLK_TCK) == 100);
+      chk("sysconf", sysconf(_SC_PAGESIZE) == 4096 && sysconf(_SC_NPROCESSORS_ONLN) >= 1 && sysconf(_SC_PHYS_PAGES) > 1000 && sysconf(_SC_AVPHYS_PAGES) > 0 && sysconf(_SC_OPEN_MAX) == 1024 && sysconf(_SC_CLK_TCK) == 100);
       errno = 0; chk("sysconf-einval", sysconf(9999) == -1 && errno == EINVAL);
       chk("pathconf", pathconf("/", _PC_NAME_MAX) == NAME_MAX && fpathconf(0, _PC_PIPE_BUF) == PIPE_BUF);
-      struct rlimit rl; chk("getrlimit-nofile", getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur == 24);
+      struct rlimit rl; chk("getrlimit-nofile", getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur == 1024);
       struct rlimit nl = {10, 20}; chk("setrlimit-roundtrip", setrlimit(RLIMIT_CPU, &nl) == 0 && getrlimit(RLIMIT_CPU, &rl) == 0 && rl.rlim_cur == 10 && rl.rlim_max == 20);
       struct rusage ru; chk("getrusage", getrusage(RUSAGE_SELF, &ru) == 0);
-      chk("getpagesize", getpagesize() == 4096 && getdtablesize() == 24);
+      chk("getpagesize", getpagesize() == 4096 && getdtablesize() == 1024);
       chk("wait4", ({ pid_t c = fork(); if (c == 0) _exit(7); int st = 0; struct rusage r2; pid_t w = wait4(c, &st, 0, &r2); w == c && ((st >> 8) & 0xFF) == 7; })); }
 
     /* ---- random numbers ---- */
@@ -342,7 +342,7 @@ int main(int argc, char** argv)
     { struct rlimit rl; chk("getrlimit-nofile", getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur == rl.rlim_max && rl.rlim_cur >= 16);
       pid_t c = fork(); if (c == 0) { struct rlimit r2 = {8, 8}; if (setrlimit(RLIMIT_NOFILE, &r2) != 0) _exit(1); int n = 0, e = 0; int fds[32];
         for (; n < 32; ++n) { fds[n] = open("/tmp/pt_a.txt", O_RDONLY); if (fds[n] < 0) { e = errno; break; } }
-        struct rlimit r3 = {64, 64}; errno = 0; int up = setrlimit(RLIMIT_NOFILE, &r3);
+        struct rlimit r3 = {70000, 70000}; errno = 0; int up = setrlimit(RLIMIT_NOFILE, &r3);
         _exit(n == 5 && e == EMFILE && up == -1 ? 0 : 10 + n); }
       int st = 0; waitpid(c, &st, 0); chk("rlimit-nofile-enforced", st == 0 || printf("  status %d\n", (st >> 8) & 0xFF) < 0);
       /* inherited by children */

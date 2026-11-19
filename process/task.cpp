@@ -40,11 +40,15 @@
 #include "string.h"
 #include "security.h"
 #include "mapping.h"
+#include "futex.h"
+#include "memory.h"
 
 #define USER_SPSR_EL0T 0x340ULL   /* EL0t, IRQ unmasked, D/A/F masked */
-#define TASK_EXEC_TMP_BASE 0x10000
+#define TASK_EXEC_TMP_BASE 0x20000000   /* scratch address-space ids sit above every pid */
+#define SIG_UNBLOCKABLE_K ((1U << 9) | (1U << 19))
 
-static int user_task_total = 0;
+static int user_task_total = 0;      /* user processes */
+static int user_thread_total = 0;    /* user threads (what the scheduler cares about) */
 
 static uint64_t irq_save_local()
 {
@@ -82,21 +86,61 @@ static void task_thread_main(void* arg)
     user_resume(&local, thread_stack_top_current());
 }
 
-static void ctx_for_entry(ProcessCpuContext* c, uint64_t entry)
+/* First run of a thread created by task_thread_create: resumes in user mode with a copy of the creator's registers. */
+struct ThreadStart { ProcessCpuContext ctx; };
+static void task_thread_entry(void* arg)
+{
+    ProcessCpuContext local = ((ThreadStart*)arg)->ctx;
+    kfree(arg);
+    user_resume(&local, thread_stack_top_current());
+}
+
+static void ctx_for_entry(ProcessCpuContext* c, uint64_t entry, int pid)
 {
     for (int i = 0; i < 31; ++i) c->x[i] = 0;
     c->elr = entry;
     c->spsr = USER_SPSR_EL0T;
-    c->user_sp = MMU_USER_STACK_TOP - 16ULL;
+    c->user_sp = mmu_user_space_stack_top(pid) - 16ULL;
+}
+
+static ThreadParams spawn_pending;
+static int spawn_pending_valid = 0;
+
+void task_set_spawn_params(const ThreadParams* params)
+{
+    if (params) { spawn_pending = *params; spawn_pending_valid = 1; }
+    else spawn_pending_valid = 0;
 }
 
 static int bind_thread(int pid, const char* name)
 {
-    int t = thread_create_for_pid(name, task_thread_main, (void*)(uint64_t)pid, 1, pid);
+    ThreadParams p;
+    thread_params_default(&p);
+    int cur = thread_current();
+    if (thread_pid(cur) >= 0)
+    {
+        int pol = 0, pr = 0, ni = 0;
+        if (thread_get_sched(cur, &pol, &pr, &ni) == 0) { p.policy = pol; p.rt_prio = pr; p.nice = ni; }
+        p.affinity = thread_get_affinity(cur);
+    }
+    else if (spawn_pending_valid) p = spawn_pending;
+    p.tls = 0;
+    if (thread_pid(cur) >= 0) asm volatile("mrs %0, tpidr_el0" : "=r"(p.tls));   /* fork: the child sees the same thread pointer */
+    int t = thread_create_ex(name, task_thread_main, (void*)(uint64_t)pid, pid, &p);
     if (t < 0) return -11;
+    thread_set_tid(t, (uint32_t)pid);
     (void)process_set_thread(pid, t);
+    if (thread_pid(cur) >= 0)
+    {
+        thread_set_sigmask(t, thread_sigmask_of(cur));              /* fork keeps the caller's mask; a spawn from the shell starts clean */
+        uint64_t asp = 0, asz = 0;
+        thread_altstack_get(cur, &asp, &asz);
+        thread_altstack_set(t, asp, asz);
+    }
+    (void)process_thread_adjust(pid, 1);
     ++user_task_total;
-    thread_set_user_tasks(user_task_total);
+    ++user_thread_total;
+    thread_set_user_tasks(user_thread_total);
     return 0;
 }
 
@@ -156,7 +200,7 @@ int task_spawn(const char* path, const char* args, int parent, int background,
     if (saved_fd_owner >= 0) (void)fd_set_process(saved_fd_owner);
 
     ProcessCpuContext ctx;
-    ctx_for_entry(&ctx, entry);
+    ctx_for_entry(&ctx, entry, pid);
     (void)process_save_context(pid, &ctx);
     if (bind_thread(pid, path) != 0)
     {
@@ -218,6 +262,8 @@ int task_fork(ExceptionFrame* frame)
     return pid;
 }
 
+static void kill_siblings(int pid);
+
 int task_exec(ExceptionFrame* frame, const char* path, const char* args)
 {
     int pid = thread_current_pid();
@@ -226,12 +272,26 @@ int task_exec(ExceptionFrame* frame, const char* path, const char* args)
     int tmp = pid + TASK_EXEC_TMP_BASE;
     uint64_t entry = 0;
     int rc = elf_load_for_process(path, &entry, tmp);
-    /* The loader leaves the kernel address space active; restore ours on failure. */
+    /* The loader builds the new image in a separate address space; ours stays active until it is swapped in. */
     if (rc != 0 || entry < MMU_USER_BASE || entry >= MMU_USER_LIMIT || (entry & 3ULL) != 0)
     {
         if (mmu_user_space_exists(tmp)) (void)mmu_user_space_destroy(tmp);
         (void)mmu_user_space_activate(pid);
         return -2;
+    }
+    /* Point of no return: every other thread of the process ends, and this one becomes the process's only (main) thread. */
+    {
+        int me = thread_current();
+        if (process_thread_count(pid) > 1)
+        {
+            kill_siblings(pid);
+            while (process_thread_count(pid) > 1) thread_wait_ms(1);
+        }
+        thread_set_tid(me, (uint32_t)pid);
+        (void)process_set_thread(pid, me);
+        thread_set_clear_tid(me, 0);
+        thread_set_robust(me, 0);
+        thread_altstack_set(me, 0, 0);
     }
     if (mmu_user_space_replace(pid, tmp) != 0)
     {
@@ -250,18 +310,77 @@ int task_exec(ExceptionFrame* frame, const char* path, const char* args)
     for (int i = 0; i < 31; ++i) frame->x[i] = 0;
     frame->elr = entry;
     frame->spsr = USER_SPSR_EL0T;
-    uint64_t sp = MMU_USER_STACK_TOP - 16ULL;
+    uint64_t sp = mmu_user_space_stack_top(pid) - 16ULL;
     asm volatile("msr sp_el0, %0" :: "r"(sp));
     thread_fp_reset_live();
+    thread_set_tls_live(0);                    /* the new image sets up its own thread pointer */
     return 0;
 }
 
-extern "C" void task_exit_current(int code, int signal)
+/* ---- thread-aware signal state: every thread has its own mask and thread-directed pending set; the process holds the
+        process-directed pending set and the handlers ---- */
+uint32_t task_sig_mask() { return thread_sigmask_of(thread_current()); }
+void task_sig_set_mask(uint32_t mask) { thread_set_sigmask(thread_current(), mask & ~SIG_UNBLOCKABLE_K); }
+static int lowest_signal(uint32_t bits)
 {
-    int pid = thread_current_pid();
-    if (pid < 0) return;
+    for (int i = 1; i < 32; ++i) if (bits & (1U << i)) return i;
+    return 0;
+}
+uint32_t task_sig_pending(int pid)
+{
+    int th = thread_current();
+    uint32_t m = thread_sigmask_of(th);
+    return (thread_sigpending_of(th) & (~m | SIG_UNBLOCKABLE_K)) | process_sig_pending_mask(pid, m);
+}
+uint32_t task_sig_pending_raw(int pid) { return thread_sigpending_of(thread_current()) | process_sig_pending_raw(pid); }
+int task_sig_take(int pid)
+{
+    int th = thread_current();
+    uint32_t m = thread_sigmask_of(th);
+    int sig = lowest_signal(thread_sigpending_of(th) & (~m | SIG_UNBLOCKABLE_K));
+    if (sig) { thread_sigpending_clear(th, 1U << sig); return sig; }
+    return process_sig_take_mask(pid, m);
+}
+/* sigwait / sigtimedwait / signalfd: the lowest pending signal in `set`, blocked or not; thread-directed ones first */
+int task_sig_take_set(int pid, uint32_t set)
+{
+    int th = thread_current();
+    int sig = lowest_signal(thread_sigpending_of(th) & set);
+    if (sig) { thread_sigpending_clear(th, 1U << sig); return sig; }
+    return process_sig_take_set(pid, set);
+}
+/* A blocking system call must return -EINTR: a deliverable signal (other than SIGCHLD/SIGCONT, which default to ignored),
+   or the thread has been told to go (exit_group, exec in another thread). */
+int task_sig_interrupts(int pid)
+{
+    if (thread_is_dying(thread_current())) return 1;
+    return (task_sig_pending(pid) & ~((1U << SIG_CHLD) | (1U << SIG_CONT))) != 0;
+}
 
-    (void)irq_save_local();                    /* stays masked until the thread is gone */
+/* An alarm was (re)armed: threads of the process that sleep re-evaluate how long they may sleep. */
+void task_alarm_poke(int pid)
+{
+    int me = thread_current();
+    for (int th = thread_group_next(pid, -1); th >= 0; th = thread_group_next(pid, th))
+        if (th != me && thread_is_blocked(th)) (void)thread_wake(th, THREAD_WAKE_SIGNAL);
+}
+
+/* Wake one thread (or `target`) that sleeps in a blocking call and could take `sig`, so it returns -EINTR. */
+static void signal_wakeup(int pid, int sig, int target)
+{
+    for (int th = thread_group_next(pid, -1); th >= 0; th = thread_group_next(pid, th))
+    {
+        if (target >= 0 && th != target) continue;
+        if (!thread_is_blocked(th)) continue;
+        if (!(SIG_UNBLOCKABLE_K & (1U << sig)) && (thread_sigmask_of(th) & (1U << sig))) continue;
+        (void)thread_wake(th, THREAD_WAKE_SIGNAL);
+        if (target < 0) break;
+    }
+}
+
+/* ---- ending threads and processes ---- */
+static void process_teardown(int pid, int code, int signal)
+{
     int parent = process_parent(pid);
 
     net_udp_close_all_for(pid);
@@ -280,11 +399,88 @@ extern "C" void task_exit_current(int code, int signal)
     (void)process_mark_exit(pid, code);
     (void)process_set_thread(pid, -1);
     if (parent >= 0) (void)process_sig_raise(parent, SIG_CHLD);
-    smp_kick_others();                         /* a boot-CPU shell waiting in wfi notices the exit at once */
+    thread_event_notify();                     /* a parent waiting in waitpid() retries now */
+    smp_kick_cpus(1U);                         /* a boot-CPU shell waiting in wfi notices the exit at once */
+}
 
-    --user_task_total;
-    thread_set_user_tasks(user_task_total);
+/* The calling thread ends. The last thread of a process finishes the process (zombie, descriptors, address space). */
+extern "C" void task_thread_die_code(int code)
+{
+    int pid = thread_current_pid();
+    int th = thread_current();
+    (void)irq_save_local();                    /* stays masked until the thread is gone */
+    if (pid >= 0)
+    {
+        futex_thread_exit(pid, th);            /* clear_child_tid + robust mutexes: joiners and lock waiters wake up */
+        int left = process_thread_adjust(pid, -1);
+        --user_thread_total;
+        thread_set_user_tasks(user_thread_total);
+        if (left <= 0)
+        {
+            int c = code, sg = 0;
+            if (process_is_exiting(pid)) (void)process_exit_pending(pid, &c, &sg);
+            process_teardown(pid, c, sg);
+            --user_task_total;
+        }
+    }
     thread_exit();
+}
+extern "C" void task_thread_die() { task_thread_die_code(0); }
+
+/* Mark every other thread of `pid` as dying and wake the ones that sleep. */
+static void kill_siblings(int pid)
+{
+    int me = thread_current();
+    for (int th = thread_group_next(pid, -1); th >= 0; th = thread_group_next(pid, th))
+        if (th != me) { thread_set_dying(th, 1); (void)thread_wake(th, THREAD_WAKE_SIGNAL); }
+    smp_kick_others();
+}
+
+/* exit_group / fatal signal: the whole process goes, whichever thread asks. */
+extern "C" void task_exit_current(int code, int signal)
+{
+    int pid = thread_current_pid();
+    if (pid < 0) return;
+
+    (void)irq_save_local();
+    if (process_begin_exit(pid, code, signal)) kill_siblings(pid);
+    thread_set_dying(thread_current(), 1);
+    task_thread_die();
+}
+
+int task_thread_create(ExceptionFrame* frame, uint64_t stack_top, uint64_t tls, uint64_t clear_tid)
+{
+    int pid = thread_current_pid();
+    if (pid < 0 || !frame) return -1;
+    if (process_is_exiting(pid)) return -11;
+    if ((stack_top & 15ULL) != 0 || stack_top < MMU_USER_BASE + 4096ULL || stack_top > MMU_USER_LIMIT) return -22;
+    if (clear_tid && ((clear_tid & 3ULL) != 0 || !mmu_user_pointer_ok(clear_tid, 4, 1))) return -14;
+    ThreadStart* ts = (ThreadStart*)kmalloc(sizeof(ThreadStart));
+    if (!ts) return -11;
+    for (int i = 0; i < 31; ++i) ts->ctx.x[i] = frame->x[i];
+    ts->ctx.x[0] = 0;                          /* the new thread sees thread_create() return 0 */
+    ts->ctx.elr = frame->elr;
+    ts->ctx.spsr = frame->spsr;
+    ts->ctx.user_sp = stack_top;
+
+    ThreadParams p;
+    thread_params_default(&p);
+    int cur = thread_current();
+    int pol = 0, pr = 0, ni = 0;
+    if (thread_get_sched(cur, &pol, &pr, &ni) == 0) { p.policy = pol; p.rt_prio = pr; p.nice = ni; }
+    p.affinity = thread_get_affinity(cur);
+    p.tls = tls;
+    int t = thread_create_ex(process_name(pid), task_thread_entry, ts, pid, &p);
+    if (t < 0) { kfree(ts); return -11; }
+    uint32_t tid = thread_alloc_tid();
+    while (thread_find_tid(tid) >= 0) tid = thread_alloc_tid();
+    thread_set_tid(t, tid);
+    thread_set_sigmask(t, thread_sigmask_of(cur));
+    thread_set_clear_tid(t, clear_tid);
+    (void)process_thread_adjust(pid, 1);
+    ++user_thread_total;
+    thread_set_user_tasks(user_thread_total);
+    return (int)tid;
 }
 
 int task_kill_info(int pid, int sig, int sender, int code, uint64_t value)
@@ -295,9 +491,27 @@ int task_kill_info(int pid, int sig, int sender, int code, uint64_t value)
     if (sig == 0) return 0;                    /* existence check */
     if (sig < 0 || sig >= 32) return -22;
     if (sig == SIG_CONT) (void)process_set_stopped(pid, 0);
-    return process_sig_raise_info(pid, sig, sender, code, value);
+    int rc = process_sig_raise_info(pid, sig, sender, code, value);
+    if (rc == 0) signal_wakeup(pid, sig, -1);
+    return rc;
 }
 int task_kill(int pid, int sig) { return task_kill_info(pid, sig, 0, 0, 0); }
+
+/* tgkill: a signal for one particular thread of `tgid`. Stop/continue/kill act on the whole process regardless. */
+int task_tgkill(int tgid, uint32_t tid, int sig, int sender)
+{
+    int th = thread_find_tid(tid);
+    if (th < 0 || thread_pid(th) != tgid || tgid <= 1 || !process_is_user(tgid)) return -3;
+    if (sig == 0) return 0;
+    if (sig < 0 || sig >= 32) return -22;
+    if (sig == SIG_KILL || sig == SIG_STOP || sig == SIG_TSTP || sig == SIG_CONT) return task_kill_info(tgid, sig, sender, 0, 0);
+    uint64_t h = process_sig_handler(tgid, sig, 0, 0);
+    if (h == 1) return 0;                      /* ignored signals are discarded */
+    process_sig_note(tgid, sig, sender, 0, 0);
+    thread_sigpending_or(th, 1U << sig);
+    signal_wakeup(tgid, sig, th);
+    return 0;
+}
 
 int task_reap(int pid)
 {
@@ -310,6 +524,7 @@ int task_wait(int parent, int pid, int* status, int options)
 {
     for (;;)
     {
+        uint32_t evg = thread_event_gen();
         int z = process_find_zombie_child(parent, pid > 0 ? pid : -1);
         if (z >= 0)
         {
@@ -323,8 +538,8 @@ int task_wait(int parent, int pid, int* status, int options)
             return -10;                         /* ECHILD */
         if (options & TASK_WNOHANG) return 0;
         process_alarm_check(parent, timer_millis());
-        if (process_sig_pending(parent) & ~((1U << SIG_CHLD) | (1U << SIG_CONT))) return -4;   /* EINTR */
-        thread_wait_ms(2);
+        if (task_sig_interrupts(parent)) return -4;   /* EINTR */
+        thread_event_wait(evg, 2);
     }
 }
 
@@ -344,6 +559,7 @@ int task_reap_orphans(int shell_pid, void (*notify)(int pid, int code, int sig))
 }
 
 int task_running_count() { return user_task_total; }
+int task_thread_total() { return user_thread_total; }
 
 /* Frame pushed on the user stack when a caught signal is delivered. The handler is called as
    handler(sig, &info, &uc) so SA_SIGINFO handlers work; plain handlers just ignore x1/x2. */
@@ -370,13 +586,14 @@ static int push_signal_frame(ExceptionFrame* frame, int pid, int sig, uint64_t h
     asm volatile("mrs %0, sp_el0" : "=r"(sp));
     uint64_t base = sp;
     uint64_t asp = 0, asz = 0;
-    if ((flags & SA_ONSTACK_FLAG) && process_altstack_get(pid, &asp, &asz) == 0 && asp && asz)
+    thread_altstack_get(thread_current(), &asp, &asz);
+    if ((flags & SA_ONSTACK_FLAG) && asp && asz)
         if (!(sp >= asp && sp < asp + asz)) base = asp + asz;        /* switch to the alternate stack unless already on it */
     uint64_t nsp = (base - (base == sp ? 128ULL : 0ULL) - sizeof(SigFrame)) & ~15ULL;
     if (!mmu_user_pointer_ok(nsp, sizeof(SigFrame), 1)) return -1;
     SigFrame* sf = (SigFrame*)nsp;
     sf->magic = SIGFRAME_MAGIC;
-    sf->old_mask = process_sig_mask(pid);
+    sf->old_mask = task_sig_mask();
     sf->sig = (uint32_t)sig;
     int sender = 0, code = 0; uint64_t value = 0;
     (void)process_sig_info_get(pid, sig, &sender, &code, &value);
@@ -386,7 +603,7 @@ static int push_signal_frame(ExceptionFrame* frame, int pid, int sig, uint64_t h
     fp_save(&sf->fp);
     uint32_t nm = sf->old_mask | amask;
     if (!(flags & 0x40000000U)) nm |= (1U << sig);          /* SA_NODEFER not set */
-    (void)process_sig_set_mask(pid, nm);
+    task_sig_set_mask(nm);
     if (flags & 0x80000000U) { uint64_t o; (void)process_sig_set_action(pid, sig, 0, 0, 0, 0, &o); }   /* SA_RESETHAND */
     uint64_t rest = process_sig_restorer(pid);
     for (int i = 0; i < 31; ++i) frame->x[i] = 0;
@@ -407,10 +624,10 @@ int task_deliver_fault(ExceptionFrame* frame, int sig, uint64_t addr)
     if (pid < 0 || !frame) return -1;
     uint64_t h = process_sig_handler(pid, sig, 0, 0);
     if (h <= 1) return -1;
-    if (process_sig_mask(pid) & (1U << sig)) return -1;     /* fault inside its own handler: terminate */
+    if (task_sig_mask() & (1U << sig)) return -1;     /* fault inside its own handler: terminate */
     (void)process_sig_info_get(pid, sig, 0, 0, 0);
     (void)process_sig_raise_info(pid, sig, 0, 1 /* SEGV_MAPERR */, 0);
-    (void)process_sig_take(pid);                           /* consume the pending bit we just set */
+    (void)process_sig_take_set(pid, 1U << sig);            /* consume the pending bit we just set */
     return push_signal_frame(frame, pid, sig, h, addr);
 }
 
@@ -427,7 +644,7 @@ int task_sigreturn(ExceptionFrame* frame)
     frame->spsr = (frame->spsr & ~0xF0000000ULL) | (sf->spsr & 0xF0000000ULL);   /* only the condition flags come back */
     fp_restore(&sf->fp);
     uint32_t om = sf->old_mask; uint64_t nsp = sf->sp;
-    (void)process_sig_set_mask(pid, om);
+    task_sig_set_mask(om);
     asm volatile("msr sp_el0, %0" :: "r"(nsp));
     return 0;
 }
@@ -436,9 +653,19 @@ extern "C" void task_deliver_signals(ExceptionFrame* frame)
 {
     int pid = thread_current_pid();
     if (pid < 0) return;
+    int me = thread_current();
+    if (thread_is_dying(me)) task_thread_die();                 /* exit_group / exec asked this thread to go */
     process_alarm_check(pid, timer_millis());
+    /* A stopped process stops every thread: they wait here, at their next return to user mode. */
+    while (process_is_stopped(pid))
+    {
+        if (thread_is_dying(me)) task_thread_die();
+        uint32_t wake = (1U << SIG_KILL) | (1U << SIG_TERM) | (1U << SIG_CONT);
+        if (task_sig_pending(pid) & wake) break;
+        thread_wait_ms(5);
+    }
     int sig;
-    while ((sig = process_sig_take(pid)) != 0)
+    while ((sig = task_sig_take(pid)) != 0)
     {
         uint64_t handler = process_sig_handler(pid, sig, 0, 0);
         if (handler == 1) continue;                      /* ignored */
@@ -458,9 +685,10 @@ extern "C" void task_deliver_signals(ExceptionFrame* frame)
                 (void)process_set_stopped(pid, 1);
                 while (process_is_stopped(pid))
                 {
-                    if (process_sig_pending(pid) & ((1U << SIG_KILL) | (1U << SIG_TERM) | (1U << SIG_CONT)))
+                    if (thread_is_dying(me)) task_thread_die();
+                    if (task_sig_pending(pid) & ((1U << SIG_KILL) | (1U << SIG_TERM) | (1U << SIG_CONT)))
                     {
-                        if (process_sig_pending(pid) & (1U << SIG_CONT)) { (void)process_sig_take(pid); (void)process_set_stopped(pid, 0); break; }
+                        if (task_sig_pending(pid) & (1U << SIG_CONT)) { (void)task_sig_take_set(pid, 1U << SIG_CONT); (void)process_set_stopped(pid, 0); break; }
                         break;
                     }
                     thread_wait_ms(5);

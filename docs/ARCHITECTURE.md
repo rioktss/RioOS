@@ -329,3 +329,8 @@ The framebuffer driver is a bounded software RAM surface at the address reserved
 `drivers/fb.cpp` only owns the 1024x768 XRGB8888 surface and its QEMU `ramfb` hand-off through `fw_cfg` DMA. `drivers/console.cpp` is a VT100-subset text terminal with a 2000-line scrollback ring and a lazy cell-diff renderer; `uart_putc()` mirrors every byte into it once active, so the QEMU window shows exactly what the serial shell shows. Mouse-wheel/PageUp events from the VirtIO input driver call `console_scroll_lines()`. There is no GUI layer. See [TERMINAL.md](./TERMINAL.md).
 
 The generic timer runs as a 100 Hz periodic system tick from boot; EL0 is entered with the I-bit clear and the lower-EL IRQ vector saves/restores a full frame. See [TIMER_IRQ.md](./TIMER_IRQ.md).
+
+
+## Preemptive multitasking (v1.14.0)
+
+Timer IRQ preempts EL0; every task (process main thread or user thread) owns a 32 KiB kernel stack and is switched by `thread.cpp` under the big kernel lock; `process/sched_policy.cpp` implements the real-time/fair/idle classes (host-testable) and `process/scheduler.cpp` the per-CPU run queues with affinity and IPI kicks. See [MULTITASKING.md](./MULTITASKING.md).

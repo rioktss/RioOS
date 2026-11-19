@@ -37,7 +37,7 @@
 
 extern "C" {
 
-static long rret(uint64_t v) { long r = (long)v; if (r < 0 && r > -4096) { errno = (int)-r; return -1; } return r; }
+static long rret(uint64_t v) { long r = (long)v; if (r < 0 && r > -4096) { errno = (int)-r; if (errno == EINTR) __rio_cancel_eintr(); return -1; } return r; }
 
 /* ---- signals ---------------------------------------------------------- */
 #define RS_SIGQUEUE 74
@@ -47,7 +47,7 @@ static long rret(uint64_t v) { long r = (long)v; if (r < 0 && r > -4096) { errno
 #define RS_HTTP_GET 78
 #define RS_SHA256 79
 #define RS_ED25519 112
-extern int __rio_sa_restart;
+extern __thread int __rio_sa_restart;
 void __rio_sigreturn(void);
 __asm__(".text\n.global __rio_sigreturn\n__rio_sigreturn:\n mov x8, #67\n svc #0\n 1: b 1b\n");
 
@@ -466,7 +466,7 @@ static int run_pipeline(Cmd* cmds, int n, int bg, int* last)
 static int sh_status = 0;
 static int sh_run(char* line, int* exited)
 {
-    static char wbuf[40][256];
+    static __thread char wbuf[40][256];
     char* p = line; int last = sh_status; int nextop = 0;   /* 0 always, 1 &&, 2 || */
     while (*p)
     {
@@ -536,16 +536,18 @@ int system(const char* cmd)
     return (st & 0xFF) << 8;           /* wait()-style status */
 }
 
-static pid_t popen_pid[8]; static FILE* popen_fp[8];
+struct PopenRec { PopenRec* next; FILE* fp; pid_t pid; };
+static PopenRec* popen_list = 0;
+static struct __rio_lock popen_lock;
 FILE* popen(const char* cmd, const char* mode)
 {
     int rd = mode && mode[0] == 'r';
     if (!mode || (mode[0] != 'r' && mode[0] != 'w')) { errno = EINVAL; return 0; }
-    int slot = -1; for (int i = 0; i < 8; ++i) if (!popen_fp[i]) { slot = i; break; }
-    if (slot < 0) { errno = EMFILE; return 0; }
-    int pf[2]; if (pipe(pf) != 0) return 0;
+    PopenRec* rec = (PopenRec*)malloc(sizeof(PopenRec));
+    if (!rec) { errno = ENOMEM; return 0; }
+    int pf[2]; if (pipe(pf) != 0) { free(rec); return 0; }
     pid_t pid = fork();
-    if (pid < 0) { close(pf[0]); close(pf[1]); return 0; }
+    if (pid < 0) { close(pf[0]); close(pf[1]); free(rec); return 0; }
     if (pid == 0)
     {
         if (rd) { dup2(pf[1], 1); } else { dup2(pf[0], 0); }
@@ -559,15 +561,20 @@ FILE* popen(const char* cmd, const char* mode)
     }
     FILE* f;
     if (rd) { close(pf[1]); f = fdopen(pf[0], "r"); } else { close(pf[0]); f = fdopen(pf[1], "w"); }
-    if (!f) { kill(pid, SIGKILL); return 0; }
-    popen_pid[slot] = pid; popen_fp[slot] = f;
+    if (!f) { kill(pid, SIGKILL); free(rec); return 0; }
+    rec->fp = f; rec->pid = pid;
+    __rio_lock_acquire(&popen_lock); rec->next = popen_list; popen_list = rec; __rio_lock_release(&popen_lock);
     return f;
 }
 int pclose(FILE* f)
 {
-    int slot = -1; for (int i = 0; i < 8; ++i) if (popen_fp[i] == f) { slot = i; break; }
-    if (slot < 0) { errno = EINVAL; return -1; }
-    pid_t pid = popen_pid[slot]; popen_fp[slot] = 0;
+    PopenRec* rec = 0;
+    __rio_lock_acquire(&popen_lock);
+    for (PopenRec** pp = &popen_list; *pp; pp = &(*pp)->next)
+        if ((*pp)->fp == f) { rec = *pp; *pp = rec->next; break; }
+    __rio_lock_release(&popen_lock);
+    if (!rec) { errno = EINVAL; return -1; }
+    pid_t pid = rec->pid; free(rec);
     fclose(f);
     int st = 0;
     if (waitpid(pid, &st, 0) < 0) return -1;

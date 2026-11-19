@@ -39,7 +39,7 @@ static inline double u2d(unsigned long long r) { double d; __builtin_memcpy(&d, 
 
 /* ===================== exact double -> decimal ===================== */
 #define DBUF 1700
-static char dig_buf[DBUF];     /* all exact decimal digits: integer part then fraction */
+static __thread char dig_buf[DBUF];     /* all exact decimal digits: integer part then fraction */
 
 /* Produces the exact decimal expansion of |v| (finite). *int_len = number of integer digits (>=1). Returns total length. */
 static int exact_digits(double v, int* int_len)
@@ -50,7 +50,7 @@ static int exact_digits(double v, int* int_len)
     if (e) m |= 1ULL << 52; else e = 1;
     int e2 = e - 1075;
     int n = 0;
-    static unsigned int limb[40];
+    static __thread unsigned int limb[40];
     if (e2 >= 0)
     {
         int nl = 0; for (int i = 0; i < 40; ++i) limb[i] = 0;
@@ -154,7 +154,7 @@ int rio_fmt_double(char* out, int cap, double v, char conv, int prec, int plus, 
         if (!is_zero)
         {
             /* exponent after rounding to P significant digits */
-            static char tmpd[DBUF]; for (int i = 0; i < len; ++i) tmpd[i] = d[i];
+            static __thread char tmpd[DBUF]; for (int i = 0; i < len; ++i) tmpd[i] = d[i];
             int carry = round_digits(tmpd + first, len - first, P);
             if (carry) ++x;
         }
@@ -196,7 +196,7 @@ int rio_fmt_double(char* out, int cap, double v, char conv, int prec, int plus, 
     }
     if (lc == 'f')
     {
-        static char tmp[DBUF + 4];
+        static __thread char tmp[DBUF + 4];
         tmp[0] = '0'; for (int i = 0; i < len; ++i) tmp[i + 1] = d[i];
         int tl = len + 1, il = ilen + 1;
         round_digits(tmp, tl, il + prec);
@@ -207,7 +207,7 @@ int rio_fmt_double(char* out, int cap, double v, char conv, int prec, int plus, 
     }
     else   /* e */
     {
-        static char tmp[DBUF + 4];
+        static __thread char tmp[DBUF + 4];
         int tl = is_zero ? 1 : len - first;
         tmp[0] = '0'; for (int i = 0; i < tl; ++i) tmp[i + 1] = is_zero ? '0' : d[first + i];
         ++tl;
@@ -531,47 +531,81 @@ void* mempcpy(void* d, const void* s, size_t n) { memcpy(d, s, n); return (char*
 unsigned usleep(unsigned us) { sleep_ms((us + 999) / 1000); return 0; }
 unsigned sleep(unsigned s) { sleep_ms(s * 1000); return 0; }
 
-/* ===================== environment (process-local) ===================== */
-#define ENV_MAX 64
-static char* env_tab[ENV_MAX + 1];
-char** environ = env_tab;
+/* ===================== environment (process-local, any number of variables, thread safe) =====================
+   Replaced arrays and removed strings are never freed once threads exist: a pointer from getenv() or environ may still be in use. */
+static char* env_init[17];
+static char** env_tab = env_init;
+static size_t env_cap = 16;                      /* slots excluding the terminator */
+char** environ = env_init;
+static struct __rio_lock env_lock;
+void __rio_env_fork(int phase) { if (phase == 0) __rio_lock_acquire(&env_lock); else if (phase == 1) __rio_lock_release(&env_lock); else env_lock.v = 0; }
+static void env_drop(void* p) { if (!__rio_threads_started && p != (void*)env_init) free(p); }
 char* getenv(const char* name)
 {
+    if (!name) return 0;
     size_t l = strlen(name);
-    for (int i = 0; env_tab[i]; ++i) if (!strncmp(env_tab[i], name, l) && env_tab[i][l] == '=') return env_tab[i] + l + 1;
-    return 0;
+    char* r = 0;
+    __rio_lock_acquire(&env_lock);
+    for (int i = 0; env_tab[i]; ++i) if (!strncmp(env_tab[i], name, l) && env_tab[i][l] == '=') { r = env_tab[i] + l + 1; break; }
+    __rio_lock_release(&env_lock);
+    return r;
 }
 int setenv(const char* name, const char* value, int overwrite)
 {
-    if (!name || !*name || strchr(name, '=')) { errno = EINVAL; return -1; }
+    if (!name || !*name || strchr(name, '=') || !value) { errno = EINVAL; return -1; }
     size_t l = strlen(name);
-    for (int i = 0; env_tab[i]; ++i)
-        if (!strncmp(env_tab[i], name, l) && env_tab[i][l] == '=')
-        {
-            if (!overwrite) return 0;
-            char* e = (char*)malloc(l + strlen(value) + 2); if (!e) return -1;
-            strcpy(e, name); e[l] = '='; strcpy(e + l + 1, value);
-            free(env_tab[i]); env_tab[i] = e; return 0;
-        }
-    int n = 0; while (env_tab[n]) ++n;
-    if (n >= ENV_MAX) { errno = ENOMEM; return -1; }
-    char* e = (char*)malloc(l + strlen(value) + 2); if (!e) return -1;
+    char* e = (char*)malloc(l + strlen(value) + 2);
+    if (!e) return -1;
     strcpy(e, name); e[l] = '='; strcpy(e + l + 1, value);
-    env_tab[n] = e; env_tab[n + 1] = 0; return 0;
+    int rc = 0;
+    __rio_lock_acquire(&env_lock);
+    int n = 0, found = -1;
+    for (; env_tab[n]; ++n) if (found < 0 && !strncmp(env_tab[n], name, l) && env_tab[n][l] == '=') found = n;
+    if (found >= 0)
+    {
+        if (overwrite) { char* old = env_tab[found]; env_tab[found] = e; env_drop(old); e = 0; }
+    }
+    else
+    {
+        if ((size_t)n >= env_cap)
+        {
+            size_t nc = env_cap * 2;
+            char** nt = (char**)malloc((nc + 1) * sizeof(char*));
+            if (!nt) { errno = ENOMEM; rc = -1; }
+            else
+            {
+                for (int i = 0; i <= n; ++i) nt[i] = env_tab[i];
+                char** old = env_tab; env_tab = nt; env_cap = nc; environ = nt;
+                env_drop(old);
+            }
+        }
+        if (rc == 0) { env_tab[n] = e; env_tab[n + 1] = 0; e = 0; }
+    }
+    __rio_lock_release(&env_lock);
+    if (e) free(e);
+    return rc;
 }
 int unsetenv(const char* name)
 {
+    if (!name || !*name || strchr(name, '=')) { errno = EINVAL; return -1; }
     size_t l = strlen(name);
+    __rio_lock_acquire(&env_lock);
     for (int i = 0; env_tab[i]; ++i)
         if (!strncmp(env_tab[i], name, l) && env_tab[i][l] == '=')
-        { free(env_tab[i]); for (int j = i; env_tab[j]; ++j) env_tab[j] = env_tab[j + 1]; return 0; }
+        { char* old = env_tab[i]; for (int j = i; env_tab[j]; ++j) env_tab[j] = env_tab[j + 1]; env_drop(old); break; }
+    __rio_lock_release(&env_lock);
     return 0;
 }
 int putenv(char* s)
 {
     char* eq = strchr(s, '='); if (!eq) return unsetenv(s);
-    char name[64]; size_t l = (size_t)(eq - s); if (l >= sizeof(name)) { errno = EINVAL; return -1; }
-    memcpy(name, s, l); name[l] = 0; return setenv(name, eq + 1, 1);
+    size_t l = (size_t)(eq - s);
+    char* name = (char*)malloc(l + 1);
+    if (!name) return -1;
+    memcpy(name, s, l); name[l] = 0;
+    int rc = setenv(name, eq + 1, 1);
+    free(name);
+    return rc;
 }
 
 /* ===================== time ===================== */
@@ -580,7 +614,7 @@ clock_t clock(void) { return (clock_t)clock_ms() * (CLOCKS_PER_SEC / 1000); }
 double difftime(time_t a, time_t b) { return (double)(a - b); }
 static int is_leap(long y) { return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0; }
 static const int mdays[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
-static struct tm tm_buf;
+static __thread struct tm tm_buf;
 struct tm* gmtime_r(const time_t* t, struct tm* r)
 {
     long long v = (long long)*t; long long days = v / 86400, rem = v % 86400;

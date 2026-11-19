@@ -226,10 +226,39 @@ int main(int argc, char** argv)
       close(s1); close(d);
       errno = 0; chk("socket-op-on-file-enotsock", ({ int f = open("/etc/passwd", 0); int rr = f < 0 ? -2 : listen(f, 1); if (f >= 0) close(f); rr == -1 || rr == -2; })); }
 
-    /* ---- fd exhaustion cleans up ---- */
-    { int fdsx[30]; int n = 0; for (; n < 30; ++n) { fdsx[n] = socket(AF_UNIX, SOCK_STREAM, 0); if (fdsx[n] < 0) break; }
-      chk("fd-table-full-emfile", n < 30 && errno == EMFILE);
-      for (int i = 0; i < n; ++i) close(fdsx[i]);
+    /* ---- poll() over far more than 64 descriptors; qsort on a large array ---- */
+    { enum { NP = 150 };
+      static int pp[NP][2]; static struct pollfd pf[NP * 2];
+      int made = 0; for (; made < NP; ++made) if (pipe(pp[made]) != 0) break;
+      chk("poll-many-pipes-created", made == NP);
+      for (int i = 0; i < made; ++i) { pf[2 * i].fd = pp[i][0]; pf[2 * i].events = POLLIN; pf[2 * i].revents = 0; pf[2 * i + 1].fd = pp[i][1]; pf[2 * i + 1].events = POLLOUT; pf[2 * i + 1].revents = 0; }
+      int r = poll(pf, (nfds_t)(made * 2), 0);
+      chk("poll-300-writable", r == made);                      /* every write end is writable, no read end readable yet */
+      (void)!write(pp[made - 1][1], "x", 1);
+      r = poll(pf, (nfds_t)(made * 2), 1000);
+      chk("poll-300-readable-last", r == made + 1 && (pf[2 * (made - 1)].revents & POLLIN) && !(pf[0].revents & POLLIN));
+      for (int i = 0; i < made; ++i) { close(pp[i][0]); close(pp[i][1]); }
+      static int arr[20000]; unsigned x = 7;
+      for (int i = 0; i < 20000; ++i) { x = x * 1103515245u + 12345u; arr[i] = (int)((x >> 8) % 100000); }
+      qsort(arr, 20000, sizeof(int), [](const void* a, const void* b) { int u = *(const int*)a, v = *(const int*)b; return (u > v) - (u < v); });
+      int sorted = 1; for (int i = 1; i < 20000; ++i) if (arr[i - 1] > arr[i]) sorted = 0;
+      chk("qsort-20000-sorted", sorted); }
+
+    /* ---- fd exhaustion cleans up (limit lowered in a child: the default is 1024 descriptors) ---- */
+    { pid_t c = fork();
+      if (c == 0)
+      {
+          struct rlimit rl = {24, 24};
+          if (setrlimit(RLIMIT_NOFILE, &rl) != 0) _exit(1);
+          int fdsx[40]; for (int i = 0; i < 40; ++i) fdsx[i] = -1;
+          int n = 0; for (; n < 40; ++n) { fdsx[n] = socket(AF_UNIX, SOCK_STREAM, 0); if (fdsx[n] < 0) break; }
+          int e = errno;
+          for (int i = 0; i < n; ++i) close(fdsx[i]);
+          int again = socket(AF_UNIX, SOCK_STREAM, 0);
+          _exit(n < 40 && n >= 20 && e == EMFILE && again >= 0 ? 0 : 2);
+      }
+      int st = 0; waitpid(c, &st, 0);
+      chk("fd-table-full-emfile", WIFEXITED(st) && WEXITSTATUS(st) == 0);
       int again = socket(AF_UNIX, SOCK_STREAM, 0); chk("fd-reusable-after-close", again >= 0); close(again); }
 
     printf("ipctest done fails=%d\n", fails);

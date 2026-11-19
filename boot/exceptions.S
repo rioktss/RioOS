@@ -111,6 +111,7 @@ sync_el0_entry:
     bl bkl_enter_user
     mov x0, sp
     bl exception_sync_el0
+    bl thread_user_preempt
     mov x0, sp
     bl task_deliver_signals
     mov x0, sp

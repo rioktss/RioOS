@@ -27,7 +27,7 @@
 
 #include "types.h"
 
-#define USER_FD_MAX_DESCRIPTORS 24
+#define USER_FD_MAX_DESCRIPTORS 1024   /* default RLIMIT_NOFILE (the kernel accepts up to 65536) */
 #define USER_FD_O_RDONLY 0x000U
 #define USER_FD_O_WRONLY 0x001U
 #define USER_FD_O_RDWR   0x002U

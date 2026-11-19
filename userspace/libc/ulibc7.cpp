@@ -52,8 +52,9 @@
 #define K_SIGNALFD 116
 #define K_INOTIFY 117
 #define K_RUSAGE 118
+#define K_SCHED 119
 
-static long kret(uint64_t v) { long r = (long)v; if (r < 0 && r > -4096) { errno = (int)-r; return -1; } return r; }
+static long kret(uint64_t v) { long r = (long)v; if (r < 0 && r > -4096) { errno = (int)-r; if (errno == EINTR) __rio_cancel_eintr(); return -1; } return r; }
 static void copy_str(char* d, const char* s, size_t cap) { size_t i = 0; if (!cap) return; while (s[i] && i + 1 < cap) { d[i] = s[i]; ++i; } d[i] = 0; }
 
 /* ---- futex -------------------------------------------------------------------------------------------------------- */
@@ -604,7 +605,7 @@ static int pw_r(const char* name, int by_uid, uid_t uid, struct passwd* pw, char
 }
 int getpwnam_r(const char* n, struct passwd* pw, char* buf, size_t cap, struct passwd** res) { return pw_r(n, 0, 0, pw, buf, cap, res); }
 int getpwuid_r(uid_t u, struct passwd* pw, char* buf, size_t cap, struct passwd** res) { return pw_r(0, 1, u, pw, buf, cap, res); }
-static struct passwd g_pw; static char g_pwbuf[PW_NEED];
+static __thread struct passwd g_pw; static __thread char g_pwbuf[PW_NEED];
 struct passwd* getpwnam(const char* n) { struct passwd* r; int e = getpwnam_r(n, &g_pw, g_pwbuf, sizeof(g_pwbuf), &r); if (e) errno = e; return r; }
 struct passwd* getpwuid(uid_t u) { struct passwd* r; int e = getpwuid_r(u, &g_pw, g_pwbuf, sizeof(g_pwbuf), &r); if (e) errno = e; return r; }
 static int pw_iter;
@@ -616,7 +617,7 @@ struct passwd* getpwent(void)
 void setpwent(void) { pw_iter = 0; }
 void endpwent(void) { pw_iter = 0; }
 
-static struct group g_gr; static char g_grname[20]; static char* g_grmem[1];
+static __thread struct group g_gr; static __thread char g_grname[20]; static __thread char* g_grmem[1];
 static struct group* gr_from(const Account* a) { copy_str(g_grname, a->name, sizeof(g_grname)); g_grmem[0] = 0; g_gr.gr_name = g_grname; g_gr.gr_passwd = g_grname + strlen(g_grname); g_gr.gr_gid = a->gid; g_gr.gr_mem = g_grmem; return &g_gr; }
 struct group* getgrgid(gid_t g)
 {
@@ -1028,10 +1029,11 @@ int sched_getcpu(void)
     uint64_t si[5]; if (kret(user_syscall1(K_SYSINFO, (uint64_t)si)) < 0) return -1;
     return (int)si[4];
 }
+enum { SO_SETSCHED = 0, SO_GETSCHED = 1, SO_SETNICE = 2, SO_GETNICE = 3, SO_PRIO_MIN = 4, SO_PRIO_MAX = 5, SO_RR = 6, SO_SETAFF = 7, SO_GETAFF = 8, SO_INFO = 9 };
 int sched_getaffinity(pid_t pid, size_t size, cpu_set_t* set)
 {
     if (!set || size < sizeof(cpu_set_t)) { errno = EINVAL; return -1; }
-    long m = kret(user_syscall3(K_AFFINITY, 0, (uint64_t)pid, 0));
+    long m = kret(user_syscall4(K_SCHED, SO_GETAFF, (uint64_t)pid, 0, 0));
     if (m < 0) return -1;
     set->bits[0] = (unsigned long)m;
     return 0;
@@ -1039,7 +1041,70 @@ int sched_getaffinity(pid_t pid, size_t size, cpu_set_t* set)
 int sched_setaffinity(pid_t pid, size_t size, const cpu_set_t* set)
 {
     if (!set || size < sizeof(cpu_set_t)) { errno = EINVAL; return -1; }
-    return kret(user_syscall3(K_AFFINITY, 1, (uint64_t)pid, (uint64_t)set->bits[0])) < 0 ? -1 : 0;
+    return kret(user_syscall4(K_SCHED, SO_SETAFF, (uint64_t)pid, (uint64_t)set->bits[0], 0)) < 0 ? -1 : 0;
+}
+int sched_setscheduler(pid_t pid, int policy, const struct sched_param* param)
+{
+    if (!param) { errno = EINVAL; return -1; }
+    return kret(user_syscall4(K_SCHED, SO_SETSCHED, (uint64_t)pid, (uint64_t)(int64_t)policy, (uint64_t)(int64_t)param->sched_priority)) < 0 ? -1 : 0;
+}
+int sched_getscheduler(pid_t pid)
+{
+    long r = kret(user_syscall4(K_SCHED, SO_GETSCHED, (uint64_t)pid, 0, 0));
+    return r < 0 ? -1 : (int)(r & 0xFF);
+}
+int sched_getparam(pid_t pid, struct sched_param* param)
+{
+    if (!param) { errno = EINVAL; return -1; }
+    long r = kret(user_syscall4(K_SCHED, SO_GETSCHED, (uint64_t)pid, 0, 0));
+    if (r < 0) return -1;
+    param->sched_priority = (int)((r >> 8) & 0xFF);
+    return 0;
+}
+int sched_setparam(pid_t pid, const struct sched_param* param)
+{
+    if (!param) { errno = EINVAL; return -1; }
+    int pol = sched_getscheduler(pid);
+    if (pol < 0) return -1;
+    return sched_setscheduler(pid, pol, param);
+}
+int sched_get_priority_min(int policy) { long r = kret(user_syscall4(K_SCHED, SO_PRIO_MIN, 0, (uint64_t)(int64_t)policy, 0)); return r < 0 ? -1 : (int)r; }
+int sched_get_priority_max(int policy) { long r = kret(user_syscall4(K_SCHED, SO_PRIO_MAX, 0, (uint64_t)(int64_t)policy, 0)); return r < 0 ? -1 : (int)r; }
+int sched_rr_get_interval(pid_t pid, struct timespec* ts)
+{
+    if (!ts) { errno = EFAULT; return -1; }
+    long r = kret(user_syscall4(K_SCHED, SO_RR, (uint64_t)pid, 0, 0));
+    if (r < 0) return -1;
+    ts->tv_sec = r / 1000; ts->tv_nsec = (r % 1000) * 1000000L;
+    return 0;
+}
+int getpriority(int which, id_t who)
+{
+    if (which != PRIO_PROCESS) { errno = EINVAL; return -1; }
+    long r = kret(user_syscall4(K_SCHED, SO_GETNICE, (uint64_t)who, 0, 0));
+    if (r < 0) return -1;
+    errno = 0;
+    return (int)r - 20;
+}
+int setpriority(int which, id_t who, int prio)
+{
+    if (which != PRIO_PROCESS) { errno = EINVAL; return -1; }
+    return kret(user_syscall4(K_SCHED, SO_SETNICE, (uint64_t)who, (uint64_t)(int64_t)prio, 0)) < 0 ? -1 : 0;
+}
+int nice(int inc)
+{
+    long cur = kret(user_syscall4(K_SCHED, SO_GETNICE, 0, 0, 0));
+    if (cur < 0) return -1;
+    int n = (int)cur - 20 + inc;
+    if (n < -20) n = -20;
+    if (n > 19) n = 19;
+    if (kret(user_syscall4(K_SCHED, SO_SETNICE, 0, (uint64_t)(int64_t)n, 0)) < 0) { if (errno == EACCES) errno = EPERM; return -1; }
+    errno = 0;
+    return n;
+}
+int __rio_sched_info(pid_t tid, unsigned long long out[8])
+{
+    return kret(user_syscall4(K_SCHED, SO_INFO, (uint64_t)tid, (uint64_t)out, 0)) < 0 ? -1 : 0;
 }
 
 /* ---- signalfd / inotify ---------------------------------------------------------------------------------------------------------- */

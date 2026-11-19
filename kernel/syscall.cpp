@@ -23,6 +23,9 @@
  */
 
 #include "syscall.h"
+#ifdef HOST_TEST
+#include <stdlib.h>
+#endif
 #include "uart.h"
 #include "keyboard.h"
 #include "timer.h"
@@ -43,6 +46,7 @@
 #include "process.h"
 #include "thread.h"
 #include "task.h"
+#include "futex.h"
 #include "elf.h"
 #include "rtc.h"
 #include "sha256.h"
@@ -140,8 +144,8 @@ static int block_step(int from_user)
 {
     int me = user_current_pid();
     if (me >= 0) process_alarm_check(me, timer_millis());
-    if (me >= 0 && (process_sig_pending(me) & ~((1U << SIG_CHLD) | (1U << SIG_CONT))) != 0) return -4;
-    thread_wait_ms(1);
+    if (me >= 0 && task_sig_interrupts(me)) return -4;
+    thread_event_wait(thread_event_gen(), 1);
     (void)select_fd_owner(from_user);
     return 0;
 }
@@ -177,13 +181,13 @@ static void exec_path_fix(int from_user, char* path)
 #endif
 
 
-/* ---- futex: waiters are keyed by the physical address of the word, so shared mappings work across processes ---- */
-#define FUTEX_MAX 64
-struct FutexWaiter { int used; uint64_t key; int woken; };
-static FutexWaiter futex_waiters[FUTEX_MAX];
-
+/* Anonymous mappings are demand-paged, so only the address space and RLIMIT_AS bound them; file-backed mappings are filled
+   eagerly and so are bounded by what RAM can hold. */
+#define MMAP_MAX_BYTES (64ULL << 30)
+#define MMAP_FILE_MAX_BYTES (32ULL << 20)
 struct PollFdK { int32_t fd; short events; short revents; };
-#define SYS_POLL_MAX 64
+#define SYS_POLL_STACK 64            /* poll sets up to this size use the kernel stack, larger ones a heap copy */
+#define SYS_POLL_MAX FD_MAX_DESCRIPTORS
 
 static void syscall_dispatch_inner(ExceptionFrame* frame, int from_user);
 /* RLIMIT_AS / RLIMIT_DATA: the dynamic part of the address space (heap + mmap area) may not grow past the limit */
@@ -353,20 +357,29 @@ static void syscall_dispatch_inner(ExceptionFrame* frame, int from_user)
 #ifndef HOST_TEST
             if (from_user)
             {
-                /* other tasks run meanwhile; a deliverable signal ends the sleep early (result = ms left) */
+                /* other tasks run meanwhile; a deliverable signal ends the sleep early (result = ms left). The thread blocks once until
+                   the end of the sleep or the process's next alarm: waking in small slices would round every slice up to a timer tick. */
                 int me = user_current_pid();
-                uint64_t left = frame->x[0];
-                while (left > 0)
+                uint64_t end = timer_millis() + frame->x[0];
+                for (;;)
                 {
-                    uint64_t slice = left > 5 ? 5 : left;
-                    thread_wait_ms(slice); left -= slice;
+                    uint64_t now = timer_millis();
+                    if (now >= end) break;
+                    uint64_t slice = end - now;
+                    if (me >= 0)
+                    {
+                        uint64_t at = process_alarm_deadline(me);
+                        if (at) slice = at <= now ? 1 : (at - now < slice ? at - now : slice);
+                    }
+                    thread_wait_ms(slice);
                     if (me >= 0)
                     {
                         process_alarm_check(me, timer_millis());
-                        if ((process_sig_pending(me) & ~((1U << SIG_CHLD) | (1U << SIG_CONT))) != 0) break;
+                        if (task_sig_interrupts(me)) break;
                     }
                 }
-                result = left;
+                uint64_t after = timer_millis();
+                result = after >= end ? 0 : end - after;
                 break;
             }
             else
@@ -536,7 +549,12 @@ static void syscall_dispatch_inner(ExceptionFrame* frame, int from_user)
             if (frame->x[0] >= FD_MAX_DESCRIPTORS)
                 result = (uint64_t)-9;
             else
+            {
                 result = (uint64_t)(int64_t)fd_close((int)frame->x[0]);
+#ifndef HOST_TEST
+                thread_event_notify();               /* EOF / EPIPE for the other end of a pipe */
+#endif
+            }
             break;
         }
 
@@ -556,17 +574,22 @@ static void syscall_dispatch_inner(ExceptionFrame* frame, int from_user)
                 result = (uint64_t)-14;
                 break;
             }
+#ifndef HOST_TEST
+            uint32_t evg = thread_event_gen();
+#endif
             result = (uint64_t)fd_read(descriptor, buffer, length);
 #ifndef HOST_TEST
             while (from_user && (int64_t)result == -11 && fd_is_blocking(descriptor))
             {
                 int me = user_current_pid();
                 if (me >= 0) process_alarm_check(me, timer_millis());
-                if (me >= 0 && (process_sig_pending(me) & ~((1U << SIG_CHLD) | (1U << SIG_CONT))) != 0) { result = (uint64_t)-4; break; }
-                thread_wait_ms(1);
+                if (me >= 0 && task_sig_interrupts(me)) { result = (uint64_t)-4; break; }
+                thread_event_wait(evg, 1);
                 (void)select_fd_owner(from_user);
+                evg = thread_event_gen();
                 result = (uint64_t)fd_read(descriptor, buffer, length);
             }
+            if ((int64_t)result > 0) thread_event_notify();      /* a blocked writer may continue */
 #endif
             break;
         }
@@ -587,8 +610,12 @@ static void syscall_dispatch_inner(ExceptionFrame* frame, int from_user)
                 result = (uint64_t)-14;
                 break;
             }
+#ifndef HOST_TEST
+            uint32_t wg = thread_event_gen();
+#endif
             result = (uint64_t)fd_write(descriptor, buffer, length);
 #ifndef HOST_TEST
+            if ((int64_t)result > 0) thread_event_notify();      /* a blocked reader may continue */
             if (from_user && (int64_t)result == -32)
             {
                 int me = user_current_pid();
@@ -603,13 +630,15 @@ static void syscall_dispatch_inner(ExceptionFrame* frame, int from_user)
                 {
                     int me = user_current_pid();
                     if (me >= 0) process_alarm_check(me, timer_millis());
-                    if (me >= 0 && (process_sig_pending(me) & ~((1U << SIG_CHLD) | (1U << SIG_CONT))) != 0) break;
-                    thread_wait_ms(1);
+                    if (me >= 0 && task_sig_interrupts(me)) break;
+                    thread_event_wait(wg, 1);
                     (void)select_fd_owner(from_user);
+                    wg = thread_event_gen();
                     int64_t w = fd_write(descriptor, (const char*)buffer + done, length - done);
                     if (w == -11) continue;
                     if (w < 0) { if (done == 0) done = (uint64_t)w; break; }
                     done += (uint64_t)w;
+                    thread_event_notify();
                 }
                 result = done;
             }
@@ -1327,42 +1356,72 @@ static void syscall_dispatch_inner(ExceptionFrame* frame, int from_user)
         case SYS_FUTEX:
         {
             if (!from_user) { result = (uint64_t)-38; break; }
-            int me = user_current_pid();
-            uint64_t addr = frame->x[0];
-            if ((addr & 3ULL) != 0 || !syscall_user_pointer_ok((const void*)addr, 4)) { result = (uint64_t)-14; break; }
-            uint32_t* word = (uint32_t*)mmu_user_space_pointer(me, addr);
-            if (!word) { result = (uint64_t)-14; break; }
-            uint64_t key = (uint64_t)word;
-            if (frame->x[1] == 1)                                   /* WAKE(addr, n) */
-            {
-                uint64_t n = frame->x[2]; int woke = 0;
-                for (int i = 0; i < FUTEX_MAX && (uint64_t)woke < n; ++i)
-                    if (futex_waiters[i].used && futex_waiters[i].key == key && !futex_waiters[i].woken) { futex_waiters[i].woken = 1; ++woke; }
-                result = (uint64_t)(int64_t)woke;
-                break;
-            }
-            if (frame->x[1] != 0) { result = (uint64_t)-22; break; }
-            if (*word != (uint32_t)frame->x[2]) { result = (uint64_t)-11; break; }   /* WAIT(addr, expected, timeout_ms) */
 #ifdef HOST_TEST
-            result = (uint64_t)-11;
+            result = (uint64_t)-38;
 #else
-            int slot = -1;
-            for (int i = 0; i < FUTEX_MAX; ++i) if (!futex_waiters[i].used) { slot = i; break; }
-            if (slot < 0) { result = (uint64_t)-11; break; }
-            futex_waiters[slot].used = 1; futex_waiters[slot].key = key; futex_waiters[slot].woken = 0;
-            uint64_t tmo = frame->x[3]; uint64_t start = timer_millis();
-            int64_t rc = 0;
-            while (!futex_waiters[slot].woken)
-            {
-                if (tmo != ~0ULL && timer_millis() - start >= tmo) { rc = -110; break; }
-                int b = block_step(from_user);
-                if (b < 0) { rc = b; break; }
-            }
-            futex_waiters[slot].used = 0;
-            result = (uint64_t)rc;
+            /* futex(addr, op, val, timeout_ms | ~0, addr2, val3): Linux operation numbers, see futex.h */
+            result = (uint64_t)futex_op(user_current_pid(), frame->x[0], (int)frame->x[1], frame->x[2], frame->x[3], frame->x[4], frame->x[5]);
 #endif
             break;
         }
+
+#ifndef HOST_TEST
+        case SYS_THREAD_CREATE:
+        {
+            /* thread_create(stack_top, tls, clear_child_tid): 1:1 kernel thread in the caller's address space. The new thread
+               resumes after this svc with x0 = 0 on the new stack; the caller gets the new thread id. */
+            if (!from_user) { result = (uint64_t)-38; break; }
+            int me = user_current_pid();
+            uint64_t lim = process_rlimit_cur(me, PROC_RLIMIT_NPROC);
+            if (lim != PROC_RLIM_INF && process_uid(me) != 0 && (uint64_t)process_thread_count(me) >= lim) { result = (uint64_t)-11; break; }
+            int64_t tid = task_thread_create(frame, frame->x[0], frame->x[1], frame->x[2]);
+            /* the id is stored in the thread's clear_child_tid word before the thread can run (the kernel lock is still held) */
+            if (tid > 0 && frame->x[2] != 0) *(volatile uint32_t*)frame->x[2] = (uint32_t)tid;
+            result = (uint64_t)tid;
+            break;
+        }
+
+        case SYS_THREAD_EXIT:
+        {
+            if (!from_user) { result = (uint64_t)-38; break; }
+            task_thread_die_code((int)frame->x[0]);          /* never returns */
+            result = 0;
+            break;
+        }
+
+        case SYS_GETTID:
+            result = from_user ? thread_current_tid() : 0;
+            break;
+
+        case SYS_TGKILL:
+        {
+            if (!from_user) { result = (uint64_t)-38; break; }
+            int me = user_current_pid();
+            int tgid = (int)(int64_t)frame->x[0];
+            if (tgid != me && process_uid(me) != 0 && process_uid(tgid) != process_uid(me)) { result = (uint64_t)-1; break; }
+            result = (uint64_t)(int64_t)task_tgkill(tgid, (uint32_t)frame->x[1], (int)(int64_t)frame->x[2], me);
+            break;
+        }
+
+        case SYS_ROBUST_LIST:
+        {
+            /* robust_list(head): the list a thread's exit walks to mark robust mutexes OWNER_DIED; 0 clears. */
+            if (!from_user) { result = (uint64_t)-38; break; }
+            if (frame->x[0] != 0 && ((frame->x[0] & 7ULL) != 0 || frame->x[0] < MMU_USER_BASE || frame->x[0] >= MMU_USER_LIMIT)) { result = (uint64_t)-14; break; }
+            thread_set_robust(thread_current(), frame->x[0]);
+            result = 0;
+            break;
+        }
+
+        case SYS_SET_TID_ADDRESS:
+        {
+            if (!from_user) { result = (uint64_t)-38; break; }
+            if (frame->x[0] != 0 && ((frame->x[0] & 3ULL) != 0 || !syscall_user_pointer_ok_write((void*)frame->x[0], 4))) { result = (uint64_t)-14; break; }
+            thread_set_clear_tid(thread_current(), frame->x[0]);
+            result = thread_current_tid();
+            break;
+        }
+#endif
 
         case SYS_FSTAT:
         {
@@ -1587,21 +1646,113 @@ static void syscall_dispatch_inner(ExceptionFrame* frame, int from_user)
             if (!from_user) { result = (uint64_t)-38; break; }
             int me = user_current_pid();
             int target = (int)frame->x[1] == 0 ? me : (int)frame->x[1];
-#ifdef HOST_TEST
-            uint32_t ncpu = 1;
-#else
-            uint32_t ncpu = smp_sched_on ? smp_online_cpu_count() : 1U;
-#endif
-            uint32_t all = ncpu >= 32 ? 0xFFFFFFFFU : ((1U << ncpu) - 1U);
             if (!process_is_user(target)) { result = (uint64_t)-3; break; }            /* ESRCH */
-            if (frame->x[0] == 0) { uint32_t m = process_cpu_mask(target); result = m ? (m & all) : all; break; }
+#ifdef HOST_TEST
+            uint32_t all = 1U;
+            if (frame->x[0] == 0) { result = all; break; }
+            if (target != me && process_uid(me) != 0 && process_uid(me) != process_uid(target)) { result = (uint64_t)-1; break; }
+            result = (frame->x[2] & all) ? 0 : (uint64_t)-22;
+            break;
+#else
+            uint64_t all = thread_online_mask();
+            if (frame->x[0] == 0)
+            {
+                int th = thread_group_next(target, -1);
+                uint64_t m = th >= 0 ? thread_get_affinity(th) : 0;
+                result = m ? (m & all) : all;
+                break;
+            }
             if (target != me && process_uid(me) != 0 && process_uid(me) != process_uid(target)) { result = (uint64_t)-1; break; }   /* EPERM */
-            uint32_t want = (uint32_t)frame->x[2] & all;
+            uint64_t want = frame->x[2] & all;
             if (want == 0) { result = (uint64_t)-22; break; }
-            (void)process_set_cpu_mask(target, want == all ? 0U : want);
+            for (int th = thread_group_next(target, -1); th >= 0; th = thread_group_next(target, th))
+                (void)thread_set_affinity(th, want == all ? all : want);
             result = 0;
             break;
+#endif
         }
+
+#ifndef HOST_TEST
+        case SYS_SCHED:
+        {
+            if (!from_user) { result = (uint64_t)-38; break; }
+            int me = user_current_pid();
+            uint64_t op = frame->x[0];
+            if (op == SCHED_OP_PRIO_MIN || op == SCHED_OP_PRIO_MAX)
+            {
+                int pol = (int)frame->x[2];
+                if (sched_policy_is_rt(pol)) result = (uint64_t)(op == SCHED_OP_PRIO_MIN ? SCHED_RT_MIN : SCHED_RT_MAX);
+                else if (pol == SCHED_OTHER || pol == SCHED_BATCH || pol == SCHED_IDLE) result = 0;
+                else result = (uint64_t)-22;
+                break;
+            }
+            if (op == SCHED_OP_RR_INTERVAL) { result = (uint64_t)SCHED_RR_QUANTUM_TICKS * (SCHED_TICK_NS / 1000000ULL); break; }
+            int th = frame->x[1] == 0 ? thread_current() : thread_find_tid((uint32_t)frame->x[1]);
+            int tp = th >= 0 ? thread_pid(th) : -1;
+            if (tp < 0 || !process_is_user(tp)) { result = (uint64_t)-3; break; }     /* ESRCH */
+            int is_root = process_uid(me) == 0;
+            int may_change = tp == me || is_root || process_uid(me) == process_uid(tp);
+            int pol = 0, prio = 0, nice = 0;
+            (void)thread_get_sched(th, &pol, &prio, &nice);
+            switch (op)
+            {
+                case SCHED_OP_GETSCHED: result = (uint64_t)pol | ((uint64_t)prio << 8) | ((uint64_t)(nice + 20) << 16); break;
+                case SCHED_OP_GETNICE: result = (uint64_t)(nice + 20); break;
+                case SCHED_OP_GETAFFINITY:
+                {
+                    uint64_t m = thread_get_affinity(th), all = thread_online_mask();
+                    result = m ? (m & all) : all;
+                    break;
+                }
+                case SCHED_OP_INFO:
+                {
+                    uint64_t* out = (uint64_t*)frame->x[2];
+                    if (!out || !syscall_user_pointer_ok_write(out, 64)) { result = (uint64_t)-14; break; }
+                    out[0] = (uint64_t)(int64_t)thread_cpu_of(th); out[1] = thread_run_ticks_of(th); out[2] = thread_run_count_of(th);
+                    out[3] = (uint64_t)pol; out[4] = (uint64_t)prio; out[5] = (uint64_t)(int64_t)nice;
+                    out[6] = thread_get_affinity(th); out[7] = (uint64_t)thread_effective_prio(th);
+                    result = 0;
+                    break;
+                }
+                case SCHED_OP_SETSCHED:
+                {
+                    if (!may_change) { result = (uint64_t)-1; break; }
+                    int npol = (int)(int64_t)frame->x[2], nprio = (int)(int64_t)frame->x[3];
+                    if (sched_policy_is_rt(npol) && !is_root) { result = (uint64_t)-1; break; }          /* EPERM */
+                    if (pol != npol && sched_policy_is_rt(pol) && !is_root) { result = (uint64_t)-1; break; }   /* a user cannot undo root's real-time grant */
+                    result = (uint64_t)(int64_t)thread_set_sched(th, npol, sched_policy_is_rt(npol) ? nprio : 0, nice);
+                    break;
+                }
+                case SCHED_OP_SETNICE:
+                {
+                    if (!may_change) { result = (uint64_t)-1; break; }
+                    int nn = (int)(int64_t)frame->x[2];
+                    if (nn < SCHED_NICE_MIN) nn = SCHED_NICE_MIN;
+                    if (nn > SCHED_NICE_MAX) nn = SCHED_NICE_MAX;
+                    if (nn < nice && !is_root) { result = (uint64_t)-13; break; }                        /* EACCES: only root may raise priority */
+                    if (sched_policy_is_rt(pol)) { result = 0; break; }                                    /* applies once the thread is time-shared again */
+                    result = (uint64_t)(int64_t)thread_set_sched(th, pol, 0, nn);
+                    break;
+                }
+                case SCHED_OP_SETAFFINITY:
+                case SCHED_OP_SETAFFINITY_PROCESS:
+                {
+                    if (!may_change) { result = (uint64_t)-1; break; }
+                    uint64_t all = thread_online_mask(), want = frame->x[2] & all;
+                    if (want == 0) { result = (uint64_t)-22; break; }
+                    if (op == SCHED_OP_SETAFFINITY) result = (uint64_t)(int64_t)thread_set_affinity(th, want);
+                    else
+                    {
+                        for (int t2 = thread_group_next(tp, -1); t2 >= 0; t2 = thread_group_next(tp, t2)) (void)thread_set_affinity(t2, want);
+                        result = 0;
+                    }
+                    break;
+                }
+                default: result = (uint64_t)-22; break;
+            }
+            break;
+        }
+#endif
 
         case SYS_RUSAGE:
         {
@@ -1642,7 +1793,19 @@ static void syscall_dispatch_inner(ExceptionFrame* frame, int from_user)
             PollFdK* user = (PollFdK*)frame->x[0];
             if (nfds > SYS_POLL_MAX) { result = (uint64_t)-22; break; }
             if (nfds && (!user || (from_user && !syscall_user_pointer_ok_write(user, nfds * sizeof(PollFdK))))) { result = (uint64_t)-14; break; }
-            PollFdK local[SYS_POLL_MAX];
+            PollFdK local_stack[SYS_POLL_STACK];
+            PollFdK* local = local_stack;
+            PollFdK* local_heap = 0;
+            if (nfds > SYS_POLL_STACK)
+            {
+#ifdef HOST_TEST
+                local_heap = (PollFdK*)malloc((size_t)(nfds * sizeof(PollFdK)));
+#else
+                local_heap = (PollFdK*)kmalloc(nfds * sizeof(PollFdK));
+#endif
+                if (!local_heap) { result = (uint64_t)-12; break; }
+                local = local_heap;
+            }
             for (uint64_t i = 0; i < nfds; ++i) local[i] = user[i];
             int count = 0;
 #ifndef HOST_TEST
@@ -1673,6 +1836,14 @@ static void syscall_dispatch_inner(ExceptionFrame* frame, int from_user)
 #endif
             }
             if (count >= 0) for (uint64_t i = 0; i < nfds; ++i) user[i].revents = local[i].revents;
+            if (local_heap)
+            {
+#ifdef HOST_TEST
+                free(local_heap);
+#else
+                kfree(local_heap);
+#endif
+            }
             result = (uint64_t)(int64_t)count;
             break;
         }
@@ -1696,13 +1867,12 @@ static void syscall_dispatch_inner(ExceptionFrame* frame, int from_user)
         case SYS_SIGPROCMASK:
         {
             if (!from_user) { result = (uint64_t)-38; break; }
-            int me = user_current_pid();
-            uint32_t cur = process_sig_mask(me), set = (uint32_t)frame->x[1];
+            uint32_t cur = task_sig_mask(), set = (uint32_t)frame->x[1] & ~(1U << 16);   /* 16 is the kernel's thread-cancellation signal */
             switch (frame->x[0])
             {
-                case 0: (void)process_sig_set_mask(me, cur | set); break;
-                case 1: (void)process_sig_set_mask(me, cur & ~set); break;
-                case 2: (void)process_sig_set_mask(me, set); break;
+                case 0: task_sig_set_mask(cur | set); break;
+                case 1: task_sig_set_mask(cur & ~set); break;
+                case 2: task_sig_set_mask(set); break;
                 case 3: break;
                 default: result = (uint64_t)-22; break;
             }
@@ -1724,6 +1894,9 @@ static void syscall_dispatch_inner(ExceptionFrame* frame, int from_user)
         {
             if (!from_user) { result = (uint64_t)-38; break; }
             result = process_alarm_set(user_current_pid(), frame->x[0], timer_millis());
+#ifndef HOST_TEST
+            task_alarm_poke(user_current_pid());
+#endif
             break;
         }
 
@@ -1734,7 +1907,7 @@ static void syscall_dispatch_inner(ExceptionFrame* frame, int from_user)
             for (;;)
             {
                 process_alarm_check(me, timer_millis());
-                if ((process_sig_pending(me) & ~((1U << SIG_CHLD) | (1U << SIG_CONT))) != 0) break;
+                if (task_sig_interrupts(me)) break;
                 thread_wait_ms(2);
             }
             result = (uint64_t)-4;
@@ -1745,7 +1918,7 @@ static void syscall_dispatch_inner(ExceptionFrame* frame, int from_user)
         {
             if (!from_user) { result = (uint64_t)-38; break; }
             int me = user_current_pid();
-            result = process_sig_pending_raw(me) & process_sig_mask(me);
+            result = task_sig_pending_raw(me) & task_sig_mask();
             break;
         }
 
@@ -1758,7 +1931,7 @@ static void syscall_dispatch_inner(ExceptionFrame* frame, int from_user)
                 if (lim != PROC_RLIM_INF && process_uid(me) != 0)
                 {
                     uint64_t mine = 0;
-                    for (int s = 0; s < 64; ++s) { int q = process_pid_at(s); if (q >= 0 && process_is_user(q) && process_get_state(q) != PROCESS_ZOMBIE && process_uid(q) == process_uid(me)) ++mine; }
+                    for (int s = 0, sc = process_slot_count(); s < sc; ++s) { int q = process_pid_at(s); if (q >= 0 && process_is_user(q) && process_get_state(q) != PROCESS_ZOMBIE && process_uid(q) == process_uid(me)) ++mine; }
                     if (mine >= lim) { result = (uint64_t)-11; break; }       /* EAGAIN */
                 }
             }
@@ -1838,9 +2011,8 @@ static void syscall_dispatch_inner(ExceptionFrame* frame, int from_user)
         case SYS_SIGALTSTACK:
         {
             if (!from_user) { result = (uint64_t)-38; break; }
-            int me = user_current_pid();
             struct StackT { uint64_t sp; int32_t flags; int32_t pad; uint64_t size; };
-            uint64_t osp = 0, osz = 0; (void)process_altstack_get(me, &osp, &osz);
+            uint64_t osp = 0, osz = 0; thread_altstack_get(thread_current(), &osp, &osz);
             if (frame->x[1] != 0)
             {
                 if (!syscall_user_pointer_ok_write((void*)frame->x[1], sizeof(StackT))) { result = (uint64_t)-14; break; }
@@ -1850,9 +2022,9 @@ static void syscall_dispatch_inner(ExceptionFrame* frame, int from_user)
             {
                 if (!syscall_user_pointer_ok((const void*)frame->x[0], sizeof(StackT))) { result = (uint64_t)-14; break; }
                 const StackT* n = (const StackT*)frame->x[0];
-                if (n->flags & 2) (void)process_altstack_set(me, 0, 0);
+                if (n->flags & 2) thread_altstack_set(thread_current(), 0, 0);
                 else if (n->size < 2048 || n->sp < MMU_USER_BASE || n->sp + n->size > MMU_USER_LIMIT) { result = (uint64_t)-22; break; }
-                else (void)process_altstack_set(me, n->sp, n->size);
+                else thread_altstack_set(thread_current(), n->sp, n->size);
             }
             result = 0;
             break;
@@ -1870,9 +2042,9 @@ static void syscall_dispatch_inner(ExceptionFrame* frame, int from_user)
             for (;;)
             {
                 process_alarm_check(me, timer_millis());
-                got = process_sig_take_set(me, set);
+                got = task_sig_take_set(me, set);
                 if (got) break;
-                if ((process_sig_pending(me) & ~set & ~((1U << SIG_CHLD) | (1U << SIG_CONT))) != 0) { result = (uint64_t)-4; break; }
+                if (thread_is_dying(thread_current()) || (task_sig_pending(me) & ~set & ~((1U << SIG_CHLD) | (1U << SIG_CONT))) != 0) { result = (uint64_t)-4; break; }
                 if (deadline != ~0ULL && timer_millis() >= deadline) { result = (uint64_t)-11; break; }
                 thread_wait_ms(2);
             }
@@ -1944,6 +2116,9 @@ static void syscall_dispatch_inner(ExceptionFrame* frame, int from_user)
                 break;
             }
             result = process_itimer_set(user_current_pid(), frame->x[0], frame->x[1], timer_millis());
+#ifndef HOST_TEST
+            task_alarm_poke(user_current_pid());
+#endif
             break;
         }
 
@@ -1978,7 +2153,7 @@ static void syscall_dispatch_inner(ExceptionFrame* frame, int from_user)
             uint32_t prot = (uint32_t)frame->x[1];
             int64_t fdn = (int64_t)frame->x[2];
             uint64_t off = frame->x[3];
-            if (length == 0 || length > (4ULL << 20)) { result = (uint64_t)-22; break; }
+            if (length == 0 || length > MMAP_MAX_BYTES || (fdn >= 0 && length > MMAP_FILE_MAX_BYTES)) { result = (uint64_t)-22; break; }
             if (!as_limit_ok(me, length)) { result = (uint64_t)-12; break; }
             uint64_t base = 0;
             uint32_t map_prot = (fdn >= 0) ? (prot | MMU_USER_WRITE) & ~MMU_USER_EXEC : prot;
@@ -2017,7 +2192,8 @@ static void syscall_dispatch_inner(ExceptionFrame* frame, int from_user)
             uint64_t off = frame->x[3] & 0xFFFFFFFFULL;
             uint32_t mflags = (uint32_t)(frame->x[3] >> 32);
             if (mflags & MAP_FIXED_FLAG) { result = (uint64_t)-22; break; }          /* MAP_FIXED is not supported */
-            if (length == 0 || length > (4ULL << 20) || prot == 0 || (prot & ~7U) != 0) { result = (uint64_t)-22; break; }
+            if (length == 0 || length > MMAP_MAX_BYTES || prot == 0 || (prot & ~7U) != 0) { result = (uint64_t)-22; break; }
+            if (fdn >= 0 && !(mflags & MAP_ANON_FLAG) && length > MMAP_FILE_MAX_BYTES) { result = (uint64_t)-22; break; }
             if ((mflags & MAP_SHARED_FLAG) != 0 && (mflags & MAP_PRIVATE_FLAG) != 0) { result = (uint64_t)-22; break; }
             if (!as_limit_ok(me, length)) { result = (uint64_t)-12; break; }
             if ((mflags & MAP_SHARED_FLAG) == 0)

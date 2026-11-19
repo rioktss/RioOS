@@ -71,6 +71,24 @@ extern "C" void exception_sync_el1(void* raw)
     if (frame == 0) { stop_kernel(); return; }
     uint64_t ec = (frame->esr >> 26) & 0x3FULL;
     if (ec == 0x15ULL) { syscall_dispatch(frame, 0); return; }
+    /* The kernel touched a user address that is not usable right now: a lazily mapped or copy-on-write page it can still
+       resolve, or (a sibling thread unmapped it meanwhile, or the pointer was bad) a reason to end the calling process
+       instead of the whole machine. */
+    if (ec == 0x25ULL && frame->far >= MMU_USER_BASE && frame->far < MMU_USER_LIMIT)
+    {
+        uint64_t fsc = frame->esr & 0x3FULL;
+        int is_write = (int)((frame->esr >> 6) & 1ULL);
+        if (((fsc >> 2) == 1ULL || (fsc >> 2) == 3ULL) && mmu_user_fault_ex(frame->far, is_write, 0))
+            return;
+#ifndef HOST_TEST
+        int upid = user_current_pid();
+        if (upid >= 0 && process_is_user(upid))
+        {
+            uart_puts("[EL1] unusable user address inside a system call; terminating process.\r\n");
+            task_exit_current(-14, SIG_SEGV);        /* never returns */
+        }
+#endif
+    }
     /* Decode and report so a kernel fault is never silent. */
     fault_report(frame->esr, frame->elr, frame->far, frame->spsr);
     interrupt_exception(frame->esr, frame->elr, frame->far, frame->spsr);
@@ -110,7 +128,7 @@ extern "C" void exception_sync_el0(void* raw)
     {
         uint64_t fsc = frame->esr & 0x3FULL;
         int is_write = (ec == 0x24ULL) && ((frame->esr >> 6) & 1ULL);
-        if (((fsc >> 2) == 1ULL || (fsc >> 2) == 3ULL) && mmu_user_fault(frame->far, is_write))
+        if (((fsc >> 2) == 1ULL || (fsc >> 2) == 3ULL) && mmu_user_fault_ex(frame->far, is_write, ec == 0x20ULL))
             return;
     }
 

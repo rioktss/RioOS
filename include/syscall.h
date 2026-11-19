@@ -121,7 +121,7 @@ enum SyscallNumber
     SYS_RECVMSG    = 93,  /* recvmsg(fd, buf, cap, int* fds, maxfds | nfds_out_ptr<<8 not used: x4 = int* nfds) */
     SYS_SOCKINFO   = 94,  /* sockinfo(fd, what 0 SO_ERROR / 1 SO_TYPE) */
     SYS_PIPE2      = 95,  /* pipe2(int fds[2], flags 0x800 NONBLOCK | 0x1000 CLOEXEC) */
-    SYS_FUTEX      = 96,  /* futex(addr, op 0 WAIT / 1 WAKE, val, timeout_ms | ~0 forever) */
+    SYS_FUTEX      = 96,  /* futex(addr, op, val, timeout_ms | ~0 forever, addr2, val3): Linux operation numbers, see futex.h */
     SYS_FSTAT      = 98,  /* fstat(fd, FsStat*) */
     SYS_FS_CHOWN   = 99,  /* chown(path, uid, gid): root only */
     SYS_FS_UTIME   = 100, /* utime(path, mtime_seconds): owner or root */
@@ -141,6 +141,13 @@ enum SyscallNumber
     SYS_AFFINITY   = 115, /* affinity(op 0 get / 1 set, pid (0 = self), mask) -> mask / -errno */
     SYS_SIGNALFD   = 116, /* signalfd(fd or -1, sigmask, flags 0x800 NONBLOCK | 0x1000 CLOEXEC) */
     SYS_INOTIFY    = 117, /* inotify(op 0 init flags / 1 add_watch fd,path,mask / 2 rm_watch fd,wd) */
+    SYS_SCHED      = 119, /* sched(op, tid (0 = calling thread), a, b): policy / priority / nice / affinity of one thread, see SCHED_OP_* */
+    SYS_THREAD_CREATE = 120, /* thread_create(stack_top, tls, clear_child_tid) -> tid in the caller, 0 in the new thread (on its new stack); the tid is stored at clear_child_tid before the thread runs */
+    SYS_THREAD_EXIT = 121,   /* thread_exit(code): ends the calling thread; the last thread out ends the process */
+    SYS_GETTID     = 122, /* gettid() */
+    SYS_TGKILL     = 123, /* tgkill(tgid, tid, signal): signal for one thread */
+    SYS_ROBUST_LIST = 124, /* robust_list(head or 0) */
+    SYS_SET_TID_ADDRESS = 125, /* set_tid_address(addr or 0): cleared and futex-woken when the thread exits; returns the tid */
     SYS_RUSAGE     = 118, /* rusage(who 0 self / 1 children, uint64_t out[4]: user_ms, sys_ms, maxrss_kb, ctx switches) */
     SYS_FDATTR     = 111, /* fdattr(fd, op 0 fchmod(mode) / 1 fchown(uid,gid) / 2 futimens(mtime_seconds)) on regular files */
     SYS_TTY        = 97,  /* tty(op 0 tcgetattr / 1 tcsetattr(action in x2) / 2 winsize, ptr) */
@@ -176,8 +183,21 @@ struct ProcInfo
 };
 
 #define SYSCALL_IO_MAX 4096ULL
-#define SYSCALL_SLEEP_MAX_MS 10000ULL
+#define SYSCALL_SLEEP_MAX_MS (1ULL << 40)   /* ~35 years: only guards against overflow */
 #define SYSCALL_PATH_MAX 128ULL
 #define SYSCALL_FILE_MAX 4096ULL
+
+/* sched() operations (SYS_SCHED). Real-time policies, lowering a nice value and changing another user's thread need root. */
+#define SCHED_OP_SETSCHED    0   /* a = policy, b = real-time priority -> 0 / -errno */
+#define SCHED_OP_GETSCHED    1   /* -> policy | rt_prio << 8 | (nice + 20) << 16 */
+#define SCHED_OP_SETNICE     2   /* a = nice (-20..19, clamped) */
+#define SCHED_OP_GETNICE     3   /* -> nice + 20 */
+#define SCHED_OP_PRIO_MIN    4   /* a = policy */
+#define SCHED_OP_PRIO_MAX    5   /* a = policy */
+#define SCHED_OP_RR_INTERVAL 6   /* -> round-robin quantum in ms */
+#define SCHED_OP_SETAFFINITY 7   /* a = 64-bit CPU mask of the thread */
+#define SCHED_OP_GETAFFINITY 8   /* -> mask (every online CPU when unrestricted) */
+#define SCHED_OP_INFO        9   /* a = uint64_t out[8]: cpu (-1 not running), run_ticks, run_count, policy, rt_prio, nice, affinity, effective_prio */
+#define SCHED_OP_SETAFFINITY_PROCESS 10   /* a = mask applied to every thread of the thread's process */
 
 #endif

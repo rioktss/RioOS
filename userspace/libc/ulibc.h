@@ -46,6 +46,7 @@ typedef int pid_t;
 typedef __builtin_va_list va_list;
 #define va_start(v, l) __builtin_va_start(v, l)
 #define va_end(v) __builtin_va_end(v)
+#define va_copy(d, s) __builtin_va_copy(d, s)
 #define va_arg(v, t) __builtin_va_arg(v, t)
 #define NULL ((void*)0)
 /* Soft-float ABI note: variadic doubles are passed in integer registers, so read them with va_arg_double(), never va_arg(ap, double). */
@@ -54,7 +55,8 @@ typedef __builtin_va_list va_list;
 int main(int argc, char** argv);   /* provided by the program */
 
 /* errno */
-extern int errno;
+extern __thread int errno;
+int* __errno_location(void);
 #define EPERM 1
 #define ENOENT 2
 #define ESRCH 3
@@ -160,6 +162,7 @@ char* fgets_fd(int fd, char* buf, int cap);
 #define SEEK_CUR 1
 #define SEEK_END 2
 #define WNOHANG 1
+#define PROT_NONE 0
 #define PROT_READ 1
 #define PROT_WRITE 2
 #define PROT_EXEC 4
@@ -365,6 +368,11 @@ int fprintf(FILE* f, const char* fmt, ...);
 int vfprintf(FILE* f, const char* fmt, va_list ap);
 int fseek(FILE* f, long off, int whence); long ftell(FILE* f); void rewind(FILE* f);
 int feof(FILE* f); int ferror(FILE* f); void clearerr(FILE* f); int fileno(FILE* f);
+/* stdio is thread safe: every FILE has its own recursive lock */
+void flockfile(FILE* f); void funlockfile(FILE* f); int ftrylockfile(FILE* f);
+int fgetc_unlocked(FILE* f); int getc_unlocked(FILE* f); int fputc_unlocked(int c, FILE* f); int putc_unlocked(int c, FILE* f);
+int getchar_unlocked(void); int putchar_unlocked(int c);
+size_t fread_unlocked(void* buf, size_t sz, size_t n, FILE* f); size_t fwrite_unlocked(const void* buf, size_t sz, size_t n, FILE* f);
 void perror(const char* s);
 int sscanf(const char* s, const char* fmt, ...);
 int vsscanf(const char* s, const char* fmt, va_list ap);
@@ -449,31 +457,55 @@ int rio_gzip_decompress(const uint8_t* in, unsigned long inlen, uint8_t** out, u
 int rio_fmt_double(char* out, int cap, double v, char conv, int prec, int plus, int space, int alt);
 
 
-/* ---- POSIX threads: user-level (M:1) threads inside one process ----------------------------
-   Threads share the address space and descriptors and are scheduled cooperatively: a switch happens at
-   pthread_yield/sched_yield, sleep/usleep/nanosleep, pthread_join, mutex/cond/rwlock/barrier/semaphore waits
-   and thread exit. A thread blocked in a kernel call (read on a pipe, waitpid) blocks the whole process. */
+/* ---- POSIX threads: 1:1 kernel threads ----------------------------------------------------------
+   Every pthread is a kernel thread (own kernel stack, own scheduling policy / priority / CPU affinity / signal mask) in the
+   process's address space; threads run in parallel on different CPUs and are preempted by the timer. All blocking
+   primitives sleep on futexes. TLS (__thread, errno) is per thread. The cancellation signal is signal 16. */
 #ifndef ETIMEDOUT
 #define ETIMEDOUT 110
 #define EBUSY 16
 #define EDEADLK 35
 #endif
+#ifndef EOWNERDEAD
+#define EOWNERDEAD 130
+#define ENOTRECOVERABLE 131
+#endif
+typedef struct { unsigned long bits[1]; } cpu_set_t;
+#define CPU_ZERO(s) ((s)->bits[0] = 0UL)
+#define CPU_SET(c, s) ((s)->bits[0] |= (1UL << (c)))
+#define CPU_ISSET(c, s) (((s)->bits[0] >> (c)) & 1UL)
+#define CPU_COUNT(s) __builtin_popcountl((s)->bits[0])
+struct sched_param;
+#define __SIGCANCEL 16
 typedef unsigned long pthread_t;
-typedef struct { int detachstate; unsigned long stacksize; } pthread_attr_t;
-typedef struct { int type; int lock; int owner; int count; } pthread_mutex_t;
-typedef struct { int type; } pthread_mutexattr_t;
-typedef struct { int dummy; } pthread_condattr_t;
-typedef struct { int seq; } pthread_cond_t;
-typedef struct { int readers; int writer; int waiting_writers; } pthread_rwlock_t;
-typedef struct { unsigned count; unsigned waiting; unsigned phase; } pthread_barrier_t;
+typedef struct { int detachstate; int inheritsched; int schedpolicy; int schedprio; int scope; int affinity_set; unsigned long stacksize; unsigned long guardsize; void* stackaddr; unsigned long long affinity; } pthread_attr_t;
+typedef struct { int type; int lock; int owner; int count; int kind; int state; int ceiling; int saved; void* rnext; } pthread_mutex_t;
+typedef struct { int type; int protocol; int robust; int pshared; int ceiling; } pthread_mutexattr_t;
+typedef struct { int clock; int pshared; } pthread_condattr_t;
+typedef struct { int seq; int clock; int shared; int pad; } pthread_cond_t;
+typedef struct { int state; int waiters; int wwait; int shared; } pthread_rwlock_t;
+typedef struct { int pshared; int kind; } pthread_rwlockattr_t;
+typedef struct { unsigned count; unsigned waiting; unsigned phase; int lock; } pthread_barrier_t;
+typedef struct { int pshared; } pthread_barrierattr_t;
 typedef int pthread_spinlock_t;
 typedef int pthread_once_t;
 typedef unsigned pthread_key_t;
-typedef struct { unsigned value; unsigned shared; } sem_t;
+typedef struct { unsigned value; unsigned shared; unsigned waiters; } sem_t;
 #define PTHREAD_MUTEX_NORMAL 0
 #define PTHREAD_MUTEX_RECURSIVE 1
 #define PTHREAD_MUTEX_ERRORCHECK 2
 #define PTHREAD_MUTEX_DEFAULT 0
+#define PTHREAD_PRIO_NONE 0
+#define PTHREAD_PRIO_INHERIT 1
+#define PTHREAD_PRIO_PROTECT 2
+#define PTHREAD_MUTEX_STALLED 0
+#define PTHREAD_MUTEX_ROBUST 1
+#define PTHREAD_PROCESS_PRIVATE 0
+#define PTHREAD_PROCESS_SHARED 1
+#define PTHREAD_INHERIT_SCHED 0
+#define PTHREAD_EXPLICIT_SCHED 1
+#define PTHREAD_SCOPE_SYSTEM 0
+#define PTHREAD_SCOPE_PROCESS 1
 #define PTHREAD_CREATE_JOINABLE 0
 #define PTHREAD_CREATE_DETACHED 1
 #define PTHREAD_CANCELED ((void*)-1)
@@ -482,14 +514,19 @@ typedef struct { unsigned value; unsigned shared; } sem_t;
 #define PTHREAD_CANCEL_DEFERRED 0
 #define PTHREAD_CANCEL_ASYNCHRONOUS 1
 #define PTHREAD_BARRIER_SERIAL_THREAD (-1)
-#define PTHREAD_MUTEX_INITIALIZER { 0, 0, 0, 0 }
-#define PTHREAD_RECURSIVE_MUTEX_INITIALIZER { 1, 0, 0, 0 }
-#define PTHREAD_ERRORCHECK_MUTEX_INITIALIZER { 2, 0, 0, 0 }
-#define PTHREAD_COND_INITIALIZER { 0 }
-#define PTHREAD_RWLOCK_INITIALIZER { 0, 0, 0 }
+#define PTHREAD_KEYS_MAX 1024
+#define PTHREAD_DESTRUCTOR_ITERATIONS 4
+#define PTHREAD_STACK_MIN 16384
+#define PTHREAD_MUTEX_INITIALIZER { 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+#define PTHREAD_RECURSIVE_MUTEX_INITIALIZER { 1, 0, 0, 0, 0, 0, 0, 0, 0 }
+#define PTHREAD_ERRORCHECK_MUTEX_INITIALIZER { 2, 0, 0, 0, 0, 0, 0, 0, 0 }
+#define PTHREAD_COND_INITIALIZER { 0, 0, 0, 0 }
+#define PTHREAD_RWLOCK_INITIALIZER { 0, 0, 0, 0 }
 #define PTHREAD_ONCE_INIT 0
 int pthread_create(pthread_t* t, const pthread_attr_t* attr, void* (*fn)(void*), void* arg);
 int pthread_join(pthread_t t, void** ret);
+int pthread_tryjoin_np(pthread_t t, void** ret);
+int pthread_timedjoin_np(pthread_t t, void** ret, const struct timespec* abs);
 int pthread_detach(pthread_t t);
 void pthread_exit(void* ret) __attribute__((noreturn));
 pthread_t pthread_self(void);
@@ -502,23 +539,56 @@ void pthread_testcancel(void);
 int pthread_kill(pthread_t t, int sig);
 int pthread_sigmask(int how, const sigset_t* set, sigset_t* old);
 int pthread_once(pthread_once_t* once, void (*fn)(void));
+int pthread_atfork(void (*prepare)(void), void (*parent)(void), void (*child)(void));
+int pthread_setconcurrency(int n); int pthread_getconcurrency(void);
+struct __pthread_cleanup { struct __pthread_cleanup* prev; void (*fn)(void*); void* arg; };
+void __pthread_cleanup_push(struct __pthread_cleanup* c, void (*fn)(void*), void* arg);
+void __pthread_cleanup_pop(struct __pthread_cleanup* c, int execute);
+#define pthread_cleanup_push(f, a) { struct __pthread_cleanup __rio_c; __pthread_cleanup_push(&__rio_c, (void (*)(void*))(f), (a));
+#define pthread_cleanup_pop(e) __pthread_cleanup_pop(&__rio_c, (e)); }
 int pthread_attr_init(pthread_attr_t* a); int pthread_attr_destroy(pthread_attr_t* a);
 int pthread_attr_setdetachstate(pthread_attr_t* a, int s); int pthread_attr_getdetachstate(const pthread_attr_t* a, int* s);
 int pthread_attr_setstacksize(pthread_attr_t* a, unsigned long sz); int pthread_attr_getstacksize(const pthread_attr_t* a, unsigned long* sz);
+int pthread_attr_setstack(pthread_attr_t* a, void* addr, unsigned long sz); int pthread_attr_getstack(const pthread_attr_t* a, void** addr, unsigned long* sz);
+int pthread_attr_setguardsize(pthread_attr_t* a, unsigned long sz); int pthread_attr_getguardsize(const pthread_attr_t* a, unsigned long* sz);
+int pthread_attr_setschedpolicy(pthread_attr_t* a, int p); int pthread_attr_getschedpolicy(const pthread_attr_t* a, int* p);
+int pthread_attr_setschedparam(pthread_attr_t* a, const struct sched_param* p); int pthread_attr_getschedparam(const pthread_attr_t* a, struct sched_param* p);
+int pthread_attr_setinheritsched(pthread_attr_t* a, int i); int pthread_attr_getinheritsched(const pthread_attr_t* a, int* i);
+int pthread_attr_setscope(pthread_attr_t* a, int s); int pthread_attr_getscope(const pthread_attr_t* a, int* s);
+int pthread_attr_setaffinity_np(pthread_attr_t* a, size_t size, const cpu_set_t* set); int pthread_attr_getaffinity_np(const pthread_attr_t* a, size_t size, cpu_set_t* set);
+int pthread_getattr_np(pthread_t t, pthread_attr_t* a);
+int pthread_setschedparam(pthread_t t, int policy, const struct sched_param* p); int pthread_getschedparam(pthread_t t, int* policy, struct sched_param* p);
+int pthread_setschedprio(pthread_t t, int prio);
+int pthread_setaffinity_np(pthread_t t, size_t size, const cpu_set_t* set); int pthread_getaffinity_np(pthread_t t, size_t size, cpu_set_t* set);
+int pthread_setname_np(pthread_t t, const char* name); int pthread_getname_np(pthread_t t, char* name, size_t len);
+int pthread_getcpuclockid(pthread_t t, int* clk);
 int pthread_mutexattr_init(pthread_mutexattr_t* a); int pthread_mutexattr_destroy(pthread_mutexattr_t* a);
 int pthread_mutexattr_settype(pthread_mutexattr_t* a, int t); int pthread_mutexattr_gettype(const pthread_mutexattr_t* a, int* t);
+int pthread_mutexattr_setprotocol(pthread_mutexattr_t* a, int p); int pthread_mutexattr_getprotocol(const pthread_mutexattr_t* a, int* p);
+int pthread_mutexattr_setrobust(pthread_mutexattr_t* a, int r); int pthread_mutexattr_getrobust(const pthread_mutexattr_t* a, int* r);
+int pthread_mutexattr_setpshared(pthread_mutexattr_t* a, int s); int pthread_mutexattr_getpshared(const pthread_mutexattr_t* a, int* s);
+int pthread_mutexattr_setprioceiling(pthread_mutexattr_t* a, int c); int pthread_mutexattr_getprioceiling(const pthread_mutexattr_t* a, int* c);
 int pthread_mutex_init(pthread_mutex_t* m, const pthread_mutexattr_t* a); int pthread_mutex_destroy(pthread_mutex_t* m);
 int pthread_mutex_lock(pthread_mutex_t* m); int pthread_mutex_trylock(pthread_mutex_t* m); int pthread_mutex_unlock(pthread_mutex_t* m);
 int pthread_mutex_timedlock(pthread_mutex_t* m, const struct timespec* abs);
+int pthread_mutex_consistent(pthread_mutex_t* m);
+int pthread_mutex_setprioceiling(pthread_mutex_t* m, int ceiling, int* old); int pthread_mutex_getprioceiling(const pthread_mutex_t* m, int* ceiling);
 int pthread_condattr_init(pthread_condattr_t* a); int pthread_condattr_destroy(pthread_condattr_t* a);
+int pthread_condattr_setclock(pthread_condattr_t* a, int clk); int pthread_condattr_getclock(const pthread_condattr_t* a, int* clk);
+int pthread_condattr_setpshared(pthread_condattr_t* a, int s); int pthread_condattr_getpshared(const pthread_condattr_t* a, int* s);
 int pthread_cond_init(pthread_cond_t* c, const pthread_condattr_t* a); int pthread_cond_destroy(pthread_cond_t* c);
 int pthread_cond_wait(pthread_cond_t* c, pthread_mutex_t* m);
 int pthread_cond_timedwait(pthread_cond_t* c, pthread_mutex_t* m, const struct timespec* abs);
 int pthread_cond_signal(pthread_cond_t* c); int pthread_cond_broadcast(pthread_cond_t* c);
-int pthread_rwlock_init(pthread_rwlock_t* l, const void* a); int pthread_rwlock_destroy(pthread_rwlock_t* l);
+int pthread_rwlockattr_init(pthread_rwlockattr_t* a); int pthread_rwlockattr_destroy(pthread_rwlockattr_t* a);
+int pthread_rwlockattr_setpshared(pthread_rwlockattr_t* a, int s); int pthread_rwlockattr_getpshared(const pthread_rwlockattr_t* a, int* s);
+int pthread_rwlock_init(pthread_rwlock_t* l, const pthread_rwlockattr_t* a); int pthread_rwlock_destroy(pthread_rwlock_t* l);
 int pthread_rwlock_rdlock(pthread_rwlock_t* l); int pthread_rwlock_wrlock(pthread_rwlock_t* l);
 int pthread_rwlock_tryrdlock(pthread_rwlock_t* l); int pthread_rwlock_trywrlock(pthread_rwlock_t* l); int pthread_rwlock_unlock(pthread_rwlock_t* l);
-int pthread_barrier_init(pthread_barrier_t* b, const void* a, unsigned count); int pthread_barrier_destroy(pthread_barrier_t* b);
+int pthread_rwlock_timedrdlock(pthread_rwlock_t* l, const struct timespec* abs); int pthread_rwlock_timedwrlock(pthread_rwlock_t* l, const struct timespec* abs);
+int pthread_barrierattr_init(pthread_barrierattr_t* a); int pthread_barrierattr_destroy(pthread_barrierattr_t* a);
+int pthread_barrierattr_setpshared(pthread_barrierattr_t* a, int s); int pthread_barrierattr_getpshared(const pthread_barrierattr_t* a, int* s);
+int pthread_barrier_init(pthread_barrier_t* b, const pthread_barrierattr_t* a, unsigned count); int pthread_barrier_destroy(pthread_barrier_t* b);
 int pthread_barrier_wait(pthread_barrier_t* b);
 int pthread_spin_init(pthread_spinlock_t* s, int shared); int pthread_spin_destroy(pthread_spinlock_t* s);
 int pthread_spin_lock(pthread_spinlock_t* s); int pthread_spin_trylock(pthread_spinlock_t* s); int pthread_spin_unlock(pthread_spinlock_t* s);
@@ -527,7 +597,25 @@ void* pthread_getspecific(pthread_key_t k); int pthread_setspecific(pthread_key_
 int sem_init(sem_t* s, int pshared, unsigned value); int sem_destroy(sem_t* s);
 int sem_wait(sem_t* s); int sem_trywait(sem_t* s); int sem_post(sem_t* s); int sem_getvalue(sem_t* s, int* v);
 int sem_timedwait(sem_t* s, const struct timespec* abs);
-int pthread_setname_np(pthread_t t, const char* name);
+pid_t gettid(void);
+int tgkill(pid_t tgid, pid_t tid, int sig);
+/* raw futex(2): Linux operation numbers (FUTEX_WAIT 0, WAKE 1, REQUEUE 3, CMP_REQUEUE 4, WAKE_OP 5, LOCK_PI 6, UNLOCK_PI 7, TRYLOCK_PI 8, WAIT_BITSET 9, WAKE_BITSET 10);
+   timeout in ms relative (< 0 = none); returns the result or -1 with errno */
+long futex(volatile uint32_t* addr, int op, uint32_t val, long timeout_ms, volatile uint32_t* addr2, uint32_t val3);
+#define FUTEX_WAIT 0
+#define FUTEX_WAKE 1
+#define FUTEX_REQUEUE 3
+#define FUTEX_CMP_REQUEUE 4
+#define FUTEX_WAKE_OP 5
+#define FUTEX_LOCK_PI 6
+#define FUTEX_UNLOCK_PI 7
+#define FUTEX_TRYLOCK_PI 8
+#define FUTEX_WAIT_BITSET 9
+#define FUTEX_WAKE_BITSET 10
+#define FUTEX_PRIVATE_FLAG 128
+#define FUTEX_WAITERS 0x80000000U
+#define FUTEX_OWNER_DIED 0x40000000U
+#define FUTEX_TID_MASK 0x3FFFFFFFU
 
 /* ===== sockets, poll/select, IPC (descriptor based; see docs/IPC_POSIX.md) ===== */
 #ifndef ENOTSOCK
@@ -892,14 +980,30 @@ double drand48(void); long lrand48(void); long mrand48(void); void srand48(long 
 int futex_wait(volatile uint32_t* addr, uint32_t expected, long timeout_ms);   /* 0 woken, -1 EAGAIN/ETIMEDOUT/EINTR */
 int futex_wake(volatile uint32_t* addr, int n);
 int shm_open(const char* name, int oflag, mode_t mode); int shm_unlink(const char* name);
-typedef struct { unsigned long bits[1]; } cpu_set_t;
-#define CPU_ZERO(s) ((s)->bits[0] = 0UL)
-#define CPU_SET(c, s) ((s)->bits[0] |= (1UL << (c)))
-#define CPU_ISSET(c, s) (((s)->bits[0] >> (c)) & 1UL)
-#define CPU_COUNT(s) __builtin_popcountl((s)->bits[0])
 int sched_getcpu(void);
 int sched_getaffinity(pid_t pid, size_t size, cpu_set_t* set);
-int sched_setaffinity(pid_t pid, size_t size, const cpu_set_t* set);   /* enforced by the SMP scheduler at the next reschedule */
+int sched_setaffinity(pid_t pid, size_t size, const cpu_set_t* set);   /* pid is a thread id (0 = caller); up to 64 CPUs; enforced at the next reschedule */
+/* scheduling policy and priority (per thread; real-time policies, raising priority and other users' threads need root) */
+#define SCHED_OTHER 0
+#define SCHED_FIFO 1
+#define SCHED_RR 2
+#define SCHED_BATCH 3
+#define SCHED_IDLE 5
+struct sched_param { int sched_priority; };
+int sched_setscheduler(pid_t pid, int policy, const struct sched_param* param);
+int sched_getscheduler(pid_t pid);
+int sched_setparam(pid_t pid, const struct sched_param* param);
+int sched_getparam(pid_t pid, struct sched_param* param);
+int sched_get_priority_min(int policy);
+int sched_get_priority_max(int policy);
+int sched_rr_get_interval(pid_t pid, struct timespec* ts);
+#define PRIO_PROCESS 0
+typedef unsigned int id_t;
+int getpriority(int which, id_t who);
+int setpriority(int which, id_t who, int prio);
+int nice(int inc);
+/* info about one thread: fills out[8] = cpu (-1 when not running), run_ticks (10 ms each), run_count, policy, rt_prio, nice, affinity mask, effective rt priority */
+int __rio_sched_info(pid_t tid, unsigned long long out[8]);
 /* signalfd / inotify */
 #define SFD_NONBLOCK 0x800
 #define SFD_CLOEXEC 0x1000
@@ -1025,11 +1129,15 @@ char* strptime(const char* s, const char* fmt, struct tm* tm);
 #define LOG_DAEMON 24
 void openlog(const char* ident, int opt, int facility); void syslog(int prio, const char* fmt, ...); void closelog(void);
 
-/* internal hooks between the thread scheduler and sleep/yield/fork */
-extern int __rio_threads_started;
-unsigned __rio_thread_sleep(unsigned ms);
-int __rio_thread_yield(void);
+/* internal hooks */
 void __rio_thread_after_fork(void);
+void __rio_stdio_fork_prepare(void); void __rio_stdio_fork_parent(void); void __rio_stdio_fork_child(void);
+void __rio_env_fork(int phase);
+void __rio_cancel_point(void);                       /* deferred cancellation point (exits the thread when a cancel is pending) */
+void __rio_cancel_eintr(void);
+extern int __rio_threads_started;
+struct __rio_lock { int v; };                        /* libc-internal futex lock (not recursive) */
+void __rio_lock_acquire(struct __rio_lock* l); void __rio_lock_release(struct __rio_lock* l);
 
 #ifdef __cplusplus
 }

@@ -32,10 +32,12 @@ uint64_t timer_millis() { static uint64_t t = 0; return t += 3; }
 /* process / signal hooks used by signalfd, resource limits and EPOLLET counters */
 uint32_t net_tcp_gen(int, int) { return 0; }
 uint32_t net_udp_gen(int, int) { return 0; }
-uint64_t process_rlimit_cur(int, int) { return ~0ULL; }
+uint64_t process_rlimit_cur(int, int r) { return r == 7 ? 1024ULL : ~0ULL; }   /* 7 = RLIMIT_NOFILE */
 int process_sig_raise(int, int) { return 0; }
 uint32_t process_sig_pending_raw(int) { return 0; }
 uint32_t process_sig_serial(int) { return 0; }
 int process_sig_take_set(int, uint32_t) { return 0; }
+int task_sig_take_set(int, uint32_t) { return 0; }
+uint32_t task_sig_pending_raw(int) { return 0; }
 int process_sig_info_get(int, int, int*, int*, uint64_t*) { return 0; }
 uint32_t process_uid(int) { return 0; }

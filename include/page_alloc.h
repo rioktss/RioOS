@@ -28,7 +28,7 @@
 #include "types.h"
 
 #define PAGE_SIZE_BYTES 4096ULL
-#define PAGE_ALLOC_MAX_PAGES 8192U
+#define PAGE_ALLOC_MAX_PAGES 16384U
 
 /* Result codes for page_free(). */
 #define PAGE_FREE_OK           0
