@@ -30,4 +30,5 @@
 #define MYKERNEL_VERSION_STRING "1.14.0"
 
 void command_version();
+void command_fastfetch(const char* argument);
 #endif

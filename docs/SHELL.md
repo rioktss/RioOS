@@ -53,6 +53,7 @@ never silently truncated.
 | `basename <path>` / `dirname <path>` | Split a path. |
 | `sleep <0-60>` | Wait, using the timer IRQ instead of spinning. |
 | `which <name>` | Reports alias, shell built-in, or not found. |
+| `fastfetch [--no-logo] [--plain]` (alias `neofetch`) | Prints the RioOS logo (from `kernel/version.cpp`) next to system information: OS, kernel, uptime, packages (`/var/lib/pkg`), display, terminal, CPU (read from `MIDR_EL1`) and CPU count, scheduler, memory, heap, root disk, local IP, process count, and the 16 terminal colours. The logo is dropped when the terminal is too narrow; `--plain` removes colours so the output can be piped (`fastfetch -n -p \| grep Kernel`). |
 
 ## Aliases and scripts
 

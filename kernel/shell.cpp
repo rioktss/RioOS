@@ -39,7 +39,7 @@
 #include "string.h"
 
 static const char* command_names[] = {
-    "help","man","clear","version","mem","echo","hello","ls","pwd","cd","mkdir","touch",
+    "help","man","clear","version","fastfetch","neofetch","mem","echo","hello","ls","pwd","cd","mkdir","touch",
     "write","cat","rm","cp","mv","tree","ps","uptime","sched","exec","nano","calc",
     "elf","syscall","user","userdemo","su","logout","exit","level","mmu","disk","diskread",
     "diskwrite","diskflush","apps","uname","whoami","net","ping","selftest","pages","tasks",

@@ -117,6 +117,7 @@ exec "$QEMU" \
     -global virtio-mmio.force-legacy=false \
     -cpu "$CPU" \
     -m "$MEM" \
+    -smp 4 \
     -display "$DISPLAY_BACKEND" \
     -serial stdio \
     -monitor none \

@@ -131,6 +131,14 @@ log = run(C("echo hi > /home/user/r1.txt", "echo more >> /home/user/r1.txt", "ca
 check("shell2", log, "hi\r\nmore", "cat: file not found", "==> /home/user/r1.txt <==", "nest x", "1 2 3", "hello bob", "sum=7", "rc=3", "[FILE] t.txt", "many-ok", "Heap   :")
 log = run(C("ls /tmp", "ls /home/user/r1.txt"))
 check("tmp", log, "VFS: tmpfs mounted on /tmp.")
+log = run(C("fastfetch", "fastfetch --plain", "fastfetch -n -p | grep Kernel", "neofetch -h", "fastfetch --bogus", "man fastfetch", "which neofetch"), wait=3)
+check("fastfetch", log, "\x1b[1;36mOS\x1b[0m: RioOS aarch64", "\x1b[0m@\x1b[1;36mRioOS\x1b[0m", "\x1b[100m   ", ".d$$b", "OS: RioOS aarch64", "Kernel: Mykernel 1.14.0", "CPU: Cortex-A72 (1)",
+      "Memory: ", "Heap: ", "Disk (/): ", "Local IP: ", "Processes: ", "Packages: ", "Scheduler: preemptive, 100 Hz", "usage: fastfetch [--no-logo|-n] [--plain|-p]",
+      "unknown option '--bogus'", "NAME: fastfetch", "neofetch: shell built-in")
+piped = log.split(">>> fastfetch -n -p | grep Kernel", 1)[1].split(">>>", 1)[0] if ">>> fastfetch -n -p | grep Kernel" in log else ""
+total += 1
+if "Kernel: Mykernel" in piped and "Uptime:" not in piped and "OS:" not in piped: print("  PASS  fastfetch: output goes through a pipe")
+else: fails += 1; print("  FAIL  fastfetch: pipe output unexpected: %r" % piped[:200])
 print("== session 6: USB xHCI keyboard + mouse")
 log = run(C("usb", "usb selftest", "@sendkey u;sendkey s;sendkey b;sendkey spc;sendkey s;sendkey e;sendkey l;sendkey f;sendkey t;sendkey e;sendkey s;sendkey t;sendkey ret",
             "@mouse_move 10 5;mouse_button 1", "usb"), extra=["-device", "qemu-xhci,id=x", "-device", "usb-kbd,bus=x.0", "-device", "usb-mouse,bus=x.0"],

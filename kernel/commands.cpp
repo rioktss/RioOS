@@ -1254,6 +1254,7 @@ static const ManualEntry manual_entries[] =
     {"man", "manual page of a command", "man <command>", "shows summary, usage and notes; 'help' lists all commands"},
     {"clear", "clear the screen", "clear", "sends the ANSI clear-screen sequence"},
     {"version", "kernel version and build information", "version", "prints the RioOS version"},
+    {"fastfetch", "system information with the RioOS logo", "fastfetch [--no-logo] [--plain]", "logo on the left, OS/kernel/uptime/packages/display/CPU/memory/disk/network on the right; alias neofetch; --no-logo information only; --plain no colours; the logo is dropped automatically when the terminal is too narrow"},
     {"mem", "memory overview", "mem", "total, used and free RAM; see also free, pages, stats"},
     {"hello", "hello demo (user program)", "hello", "runs /bin/hello.elf in an isolated EL0 process"},
     {"pwd", "print the current directory", "pwd", ""},
@@ -1364,7 +1365,7 @@ static int is_builtin_name_impl(const char* name)
 {
     for (unsigned i = 0; i < sizeof(manual_entries) / sizeof(manual_entries[0]); ++i)
         if (str_equal(name, manual_entries[i].name)) return 1;
-    static const char* extra[] = {"cd", "pwd", "exit", "help", "man", "clear", "su", "logout", "whoami", "export", "jobs", "fg", "bg", "kill", "wait", "sh", "source", "let", "test", "true", "false", "mkdir", "touch", "cat", "echo", "ls"};
+    static const char* extra[] = {"neofetch", "cd", "pwd", "exit", "help", "man", "clear", "su", "logout", "whoami", "export", "jobs", "fg", "bg", "kill", "wait", "sh", "source", "let", "test", "true", "false", "mkdir", "touch", "cat", "echo", "ls"};
     for (unsigned i = 0; i < sizeof(extra) / sizeof(extra[0]); ++i)
         if (str_equal(name, extra[i])) return 1;
     return 0;
@@ -2611,7 +2612,7 @@ static const HelpSection help_sections[] = {
  "  jobs  fg [%n]  bg [%n]  kill [-9] <pid|%n>  wait    job control (Ctrl-C stops, Ctrl-Z suspends)\r\n"
  "  sh <script>  source <script>  sleep <s>  which <cmd>  man <cmd>  clear  exit\r\n"},
 {"system", "SYSTEM & PROCESSES",
- "  version  uname  uptime  date [-u] [+fmt] | date -s 'YYYY-MM-DD HH:MM:SS'\r\n"
+ "  version  fastfetch [--no-logo] [--plain]  uname  uptime  date [-u] [+fmt] | date -s 'YYYY-MM-DD HH:MM:SS'\r\n"
  "  mem  free  pages  stats  ps  tasks  sched  threads  thread-demo  fds  smp  level  mmu\r\n"
  "  exec <elf>  apps  elf  hello  calc [expr]  syscall <t>  user demo  userdemo\r\n"
  "  log [0-3]  irq [status|on|off|oneshot|selftest] [hz]  fbinfo  selftest  jtest <file>\r\n"
@@ -2682,7 +2683,7 @@ static void command_help(const char* argument)
                   "  files    ls cd mkdir cat cp mv rm ln stat chmod find du df tree nano more hexdump ...\r\n"
                   "  text     grep awk sed xargs sort uniq cut tr head tail wc rev tac nl printf expr ...\r\n"
                   "  shell    redirects, pipes, jobs, functions, alias, history, env, scripts\r\n"
-                  "  system   version uname uptime date mem ps tasks sched irq poweroff reboot ...\r\n"
+                  "  system   version fastfetch uname uptime date mem ps tasks sched irq poweroff reboot ...\r\n"
                   "  users    su useradd passwd id quota permissions\r\n"
                   "  storage  disk mount mkfs umount fsck fat nvme sata lspci usb\r\n"
                   "  network  dhcp ping wget curl nc telnet httpd ntpdate fw ping6 udp6 ...\r\n"
@@ -5063,6 +5064,12 @@ static void execute_command_inner(
     if (str_equal(command, "version"))
     {
         command_version();
+        return;
+    }
+
+    if (str_equal(command, "fastfetch") || str_equal(command, "neofetch"))
+    {
+        command_fastfetch(argument);
         return;
     }
 
