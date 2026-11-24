@@ -20,7 +20,8 @@
 [![Status](https://img.shields.io/badge/status-work%20in%20progress-orange)](#project-status)
 
 
-# RioOS Previe
+# RioOS Preview
+
 ![RioOS Preview](docs/img/view.jpg)
 
 *RioOS running on QEMU system aarch64*
