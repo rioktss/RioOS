@@ -73,6 +73,7 @@ int sshkey_format_public(const uint8_t pub[32], const char* comment, char* out, 
     for (int i = 0; pre[i]; ++i) { if (n >= cap - 1) return -1; out[n++] = pre[i]; }
     for (int i = 0; b[i]; ++i) { if (n >= cap - 1) return -1; out[n++] = b[i]; }
     if (comment && comment[0]) { if (n >= cap - 1) return -1; out[n++] = ' '; for (int i = 0; comment[i]; ++i) { if (n >= cap - 2) return -1; out[n++] = comment[i]; } }
+    if (n >= cap - 2) return -1;
     out[n++] = '\n'; out[n] = 0; return n;
 }
 
@@ -112,8 +113,9 @@ int sshkey_format_private(const uint8_t seed[32], const uint8_t pub[32], const c
     char b64[800]; int bl = base64_encode(buf, n, b64, sizeof(b64)); if (bl < 0) return -1;
     int o = 0; const char* head = "-----BEGIN OPENSSH PRIVATE KEY-----\n"; const char* tail = "-----END OPENSSH PRIVATE KEY-----\n";
     for (int i = 0; head[i]; ++i) { if (o >= cap - 1) return -1; out[o++] = head[i]; }
-    for (int i = 0; i < bl; ++i) { if (o >= cap - 2) return -1; out[o++] = b64[i]; if (i % 70 == 69 || i == bl - 1) out[o++] = '\n'; }
+    for (int i = 0; i < bl; ++i) { if (o >= cap - 2) return -1; out[o++] = b64[i]; if (i % 70 == 69 || i == bl - 1) { if (o >= cap - 1) return -1; out[o++] = '\n'; } }
     for (int i = 0; tail[i]; ++i) { if (o >= cap - 1) return -1; out[o++] = tail[i]; }
+    if (o >= cap) return -1;
     out[o] = 0; return o;
 }
 
